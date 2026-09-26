@@ -36,5 +36,6 @@
      (:file "dml")
      (:file "ddl")
      (:file "integrity")
-     (:file "api"))))
+     (:file "api")
+     (:file "vacuum"))))
   :in-order-to ((test-op (test-op "sqlite-pure/test"))))

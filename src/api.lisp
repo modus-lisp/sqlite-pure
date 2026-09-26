@@ -92,6 +92,13 @@
       (:attach (exec-attach db (second st) (third st)) (values nil nil))
       (:detach (exec-detach db (second st)) (values nil nil))
       (:noop (values nil nil))
+      (:vacuum
+       (destructuring-bind (schema into) (cdr st)
+         (let ((target (if schema (schema-db db schema) db)))
+           (if into
+               (vacuum-into target (value-to-text (funcall (compile-expr into (make-scope)) nil)))
+               (vacuum-in-place target))))
+       (values nil nil))
       (:pragma (exec-pragma db st))
       (t
        (unless (write-statement-p st) (sql-error "unsupported statement"))
