@@ -115,7 +115,13 @@
             (rows nil) (cols nil))
         (dolist (s stmts)
           (let ((*json-values* (make-hash-table :test #'eq)))
-            (multiple-value-setq (rows cols) (exec-ast db (car s) (cdr s)))))
+            (unwind-protect
+                 (progn
+                   (lock-shared db)
+                   (multiple-value-setq (rows cols) (exec-ast db (car s) (cdr s))))
+              ;; outside a transaction every statement is its own read transaction
+              (unless (or (db-explicit db) (db-txn db))
+                (unlock-to db :none)))))
         (values rows cols)))))
 
 (defun execute (db sql &rest params)

@@ -56,6 +56,8 @@
   (changes 0)
   (total-changes 0)
   (pending-page-size nil)
+  (lock :none)               ; :none :shared :reserved :exclusive
+  (wal nil)
   (stmt-cache (make-hash-table :test #'equal))
   (closed nil))
 
@@ -121,6 +123,7 @@
   (when (db-readonly db)
     (error 'sqlite-error :code :readonly :message "attempt to write a readonly database"))
   (unless (db-txn db)
+    (lock-reserved db)
     (begin-write db :auto)))
 
 (defun page-for-write (db pgno)
@@ -195,8 +198,8 @@
 
 (defun load-database (db)
   (let ((s (db-stream db)))
-    (when (probe-file (journal-path db))
-      (recover-hot-journal db))
+    ;; A journal left behind is rolled back by LOCK-SHARED, under the
+    ;; locking protocol, not here: it may belong to a live writer.
     (let ((len (file-length s)))
       (cond ((< len 100) (setf (db-page-count db) 0))
             (t
@@ -233,6 +236,7 @@
 (defun close-database (db)
   (unless (db-closed db)
     (when (db-txn db) (rollback-write db))
+    (unlock-to db :none)
     (when (db-stream db) (close (db-stream db)))
     (setf (db-closed db) t))
   nil)
@@ -322,7 +326,8 @@ that opened the transaction commits it."
       (setf (db-page-count db) orig))
     (clrhash (db-dirty db))
     (clrhash (db-journal db))
-    (setf (db-txn db) nil (db-stmt-journal db) nil (db-schema db) nil)))
+    (setf (db-txn db) nil (db-stmt-journal db) nil (db-schema db) nil)
+    (unlock-to db :shared)))
 
 (defun journal-checksum (nonce page)
   (let ((sum nonce))
@@ -369,6 +374,7 @@ that opened the transaction commits it."
         (when s
           (let ((journaled (plusp (hash-table-count (db-journal db)))))
             (when journaled (write-journal db))
+            (lock-exclusive db)
             (let ((pages (sort (loop for k being the hash-keys of (db-dirty db) collect k)
                                #'<))
                   (written 0))
@@ -383,7 +389,8 @@ that opened the transaction commits it."
             (when journaled (delete-journal db))))))
     (clrhash (db-dirty db))
     (clrhash (db-journal db))
-    (setf (db-txn db) nil (db-stmt-journal db) nil))
+    (setf (db-txn db) nil (db-stmt-journal db) nil)
+    (unlock-to db :shared))
   (setf (db-savepoints db) '() (db-savepoint-txn db) nil))
 
 (defun recover-hot-journal (db)
@@ -461,7 +468,7 @@ that opened the transaction commits it."
                           (db-page-count db) commit-size)))))
             ;; Writes go to the main file; mark the database read-only
             ;; rather than silently diverging from the WAL.
-            (setf (db-readonly db) t)))))))
+            (setf (db-readonly db) t (db-wal db) t)))))))
 
 (defun wal-checksum (big b start end s1 s2)
   (loop for i from start below end by 8

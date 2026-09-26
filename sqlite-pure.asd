@@ -7,7 +7,7 @@
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ()
+  :depends-on ((:feature :sbcl (:require :sb-posix)))
   :serial t
   :components
   ((:module "src"
@@ -16,6 +16,7 @@
     ((:file "package")
      (:file "util")
      (:file "pager")
+     (:file "locking")
      (:file "record")
      (:file "btree")
      (:file "values")
