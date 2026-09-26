@@ -4,7 +4,9 @@
 
 (defstruct column
   name type affinity (collation :binary) not-null default pk unique
-  generated hidden)
+  generated stored gen-fn hidden)
+
+(defun column-virtual-p (c) (and (column-generated c) (not (column-stored c))))
 
 (defstruct table
   name root sql
@@ -16,6 +18,7 @@
   autoincrement
   checks                 ; list of (name . expr)
   indexes                ; list of INDEX
+  strict
   view-select            ; SEL, for views
   view-columns
   (unique-constraints '()) ; list of (col-idxs collations conflict) in declaration order
@@ -51,6 +54,10 @@
 (defun rowid-name-p (name)
   (member name '("rowid" "oid" "_rowid_") :test #'name=))
 
+(defun table-virtual-p (table)
+  "True if some column is a VIRTUAL generated column (not in the record)."
+  (some #'column-virtual-p (table-columns table)))
+
 (defun table-column-names (table)
   (map 'list #'column-name (table-columns table)))
 
@@ -65,7 +72,7 @@
     (when (eq (car e) :col) (third e))))
 
 (defun table-from-ast (name ast root sql)
-  (destructuring-bind (&key columns constraints without-rowid &allow-other-keys) (cdr ast)
+  (destructuring-bind (&key columns constraints without-rowid strict &allow-other-keys) (cdr ast)
     (let* ((cols (coerce
                   (loop for cd in columns
                         collect (let ((ty (getf cd :type)))
@@ -79,14 +86,25 @@
                                                :default (getf cd :default)
                                                :pk (getf cd :primary-key)
                                                :unique (getf cd :unique)
-                                               :generated (getf cd :generated))))
+                                               :generated (getf cd :generated)
+                                               :stored (getf cd :stored))))
                   'vector))
            (tb (progn
+                 (when strict
+                   (loop for c across cols
+                         for ty = (string-upcase-ascii (or (column-type c) ""))
+                         do (unless (member ty '("INT" "INTEGER" "REAL" "TEXT" "BLOB" "ANY") :test #'string=)
+                              (sql-error (if (string= ty "")
+                                             "missing datatype for ~a.~a"
+                                             "unknown datatype for ~a.~a: \"~a\"")
+                                         name (column-name c) (column-type c)))
+                            ;; STRICT ANY converts nothing
+                            (when (string= ty "ANY") (setf (column-affinity c) :blob))))
                  (loop for (c . rest) on (coerce cols 'list)
                        do (when (find (column-name c) rest :key #'column-name :test #'name=)
                             (sql-error "duplicate column name: ~a" (column-name c))))
                  (make-table :name name :root root :sql sql :columns cols
-                           :without-rowid without-rowid)))
+                           :without-rowid without-rowid :strict strict)))
            (pk-set nil) (uniques '()))
       (labels ((colidx (nm)
                  (or (position nm cols :key #'column-name :test #'name=)

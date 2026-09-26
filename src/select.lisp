@@ -22,31 +22,36 @@
         (apply-affinity (funcall (compile-expr d (make-scope)) nil) (column-affinity col))
         :null)))
 
+(defun record-column-order (table)
+  "Column indexes in the order the record stores them: the primary key
+first for WITHOUT ROWID tables, and never a VIRTUAL generated column."
+  (let* ((cols (table-columns table))
+         (n (length cols))
+         (all (if (table-without-rowid table)
+                  (append (table-pk table)
+                          (loop for i below n unless (member i (table-pk table)) collect i))
+                  (loop for i below n collect i))))
+    (remove-if (lambda (i) (column-virtual-p (aref cols i))) all)))
+
 (defun table-record-to-row (table rowid vals)
   "Vector of the table's column values in declaration order + rowid."
   (let* ((cols (table-columns table))
          (n (length cols))
-         (row (make-array (1+ n))))
-    (if (table-without-rowid table)
-        (let* ((pk (table-pk table))
-               (rest (loop for i below n unless (member i pk) collect i))
-               (order (append pk rest)))
-          (loop for ci in order
-                do (setf (svref row ci)
-                         (if vals (pop vals) (column-default-value (aref cols ci)))))
-          (setf (svref row n) :null))
-        (progn
-          (dotimes (i n)
-            (let ((v (if vals (pop vals) (column-default-value (aref cols i)))))
-              (setf (svref row i)
-                    (cond ((eql i (table-rowid-alias table)) rowid)
-                          ((and (integerp v) (eq (column-affinity (aref cols i)) :real))
-                           (safe-double v))
-                          (t v)))))
-          (setf (svref row n) rowid)))
+         (row (make-array (1+ n) :initial-element :null)))
+    (dolist (i (record-column-order table))
+      (let ((v (if vals (pop vals) (column-default-value (aref cols i)))))
+        (setf (svref row i)
+              (cond ((eql i (table-rowid-alias table)) rowid)
+                    ((and (integerp v) (eq (column-affinity (aref cols i)) :real))
+                     (safe-double v))
+                    (t v)))))
+    (setf (svref row n) (if (table-without-rowid table) :null rowid))
+    (when (table-virtual-p table)
+      (compute-generated table row :virtual-only t))
     row))
 
 (defun fetch-row (table rowid &optional wanted)
+  (when (table-virtual-p table) (setf wanted nil))
   (let ((payload (table-lookup (table-owner table) (table-root table) rowid)))
     (when payload
       (table-record-to-row table rowid (decode-record payload 0 (length payload) nil wanted)))))
@@ -54,6 +59,7 @@
 (defun map-table-rows (table fn &key start wanted)
   "Call FN on every row of TABLE.  WANTED (a bit vector) limits which
 columns are decoded; the others read as NULL."
+  (when (table-virtual-p table) (setf wanted nil))
   (if (table-without-rowid table)
       (map-index (table-owner table) (table-root table)
                  (lambda (vals) (funcall fn (table-record-to-row table nil vals))))

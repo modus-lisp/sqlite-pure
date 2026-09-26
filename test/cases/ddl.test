@@ -115,3 +115,31 @@ SELECT * FROM w ORDER BY p;
 DELETE FROM w WHERE r = 20;
 SELECT count(*) FROM w;
 PRAGMA integrity_check;
+
+== generated-columns
+CREATE TABLE g(a INTEGER, b AS (a * 2), c TEXT, d AS (a || c) STORED, e);
+INSERT INTO g(a, c, e) VALUES (3, 'x', 99);
+INSERT INTO g VALUES (4, 'y', 100);
+SELECT * FROM g ORDER BY a;
+SELECT b, d FROM g WHERE b > 6;
+UPDATE g SET a = 10 WHERE a = 3;
+SELECT * FROM g ORDER BY a;
+INSERT INTO g(a, b) VALUES (1, 2);
+UPDATE g SET b = 1;
+PRAGMA table_info(g);
+PRAGMA table_xinfo(g);
+CREATE INDEX gb ON g(b);
+SELECT a FROM g WHERE b = 8;
+PRAGMA integrity_check;
+
+== strict-tables
+CREATE TABLE s(i INTEGER, r REAL, t TEXT, b BLOB, a ANY) STRICT;
+INSERT INTO s VALUES (1, 2.5, 'x', x'00', 3);
+INSERT INTO s VALUES ('1', 2, 3, x'00', 'z');
+INSERT INTO s VALUES ('abc', 1, 1, 1, 1);
+INSERT INTO s VALUES (1.5, 1, 1, 1, 1);
+INSERT INTO s VALUES (NULL, NULL, NULL, NULL, NULL);
+SELECT typeof(i), i, typeof(r), r, typeof(t), t, typeof(a), a FROM s ORDER BY rowid;
+UPDATE s SET i = 'nope';
+CREATE TABLE bad(x FOO) STRICT;
+CREATE TABLE bad2(x) STRICT;

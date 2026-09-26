@@ -67,14 +67,43 @@
 
 (defun wr-record (table row)
   "Stored record of a WITHOUT ROWID table: primary key first."
-  (let ((pk (table-pk table)))
-    (append (mapcar (lambda (ci) (svref row ci)) pk)
-            (loop for i below (length (table-columns table))
-                  unless (member i pk) collect (svref row i)))))
+  (mapcar (lambda (ci) (svref row ci)) (record-column-order table)))
 
 (defun table-record (table row)
-  (loop for i below (length (table-columns table))
-        collect (if (eql i (table-rowid-alias table)) :null (svref row i))))
+  (mapcar (lambda (i) (if (eql i (table-rowid-alias table)) :null (svref row i)))
+          (record-column-order table)))
+
+(defun compute-generated (table row &key virtual-only)
+  "Fill ROW's generated columns from their expressions (twice over, so a
+column may use one declared after it)."
+  (let ((cols (table-columns table)))
+    (when (some #'column-generated cols)
+      (dotimes (pass 2)
+        (loop for c across cols
+              for i from 0
+              do (when (and (column-generated c) (or (not virtual-only) (column-virtual-p c)))
+                   (let ((f (or (column-gen-fn c)
+                                (setf (column-gen-fn c)
+                                      (compile-expr (column-generated c)
+                                                    (make-scope :srcs (list (make-table-src table))))))))
+                     (setf (svref row i)
+                           (apply-affinity (funcall f (make-env :rows (vector row)))
+                                           (column-affinity c))))))))))
+
+(defun check-strict (table row)
+  (when (table-strict table)
+    (loop for c across (table-columns table)
+          for i from 0
+          for v = (svref row i)
+          for ty = (string-upcase-ascii (or (column-type c) ""))
+          do (unless (or (eq v :null) (string= ty "ANY")
+                         (cond ((member ty '("INT" "INTEGER") :test #'string=) (integerp v))
+                               ((string= ty "REAL") (floatp v))
+                               ((string= ty "TEXT") (stringp v))
+                               ((string= ty "BLOB") (blobp v))))
+               (conflict-fail :abort "cannot store ~a value in ~a column ~a.~a"
+                              (string-upcase (type-name-of v)) ty
+                              (table-name table) (column-name c))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Low-level row writes (no constraint checks)
@@ -353,6 +382,7 @@
 (defun insert-prepared-row (ctx row)
   "Constraint-check and store ROW.  Return :IGNORE if skipped."
   (let ((table (wc-table ctx)))
+    (check-strict table row)
     (when (eq (check-not-null ctx row) :ignore) (return-from insert-prepared-row :ignore))
     (when (eq (check-checks ctx row) :ignore) (return-from insert-prepared-row :ignore))
     (let ((u (resolve-uniqueness ctx row)))
@@ -406,6 +436,8 @@
          (n (length (table-columns table)))
          (alias (table-rowid-alias table)))
     (apply-row-affinity table new)
+    (compute-generated table new)
+    (check-strict table new)
     (unless (table-without-rowid table)
       (cond (alias
              (let ((v (svref new alias)))
@@ -479,9 +511,12 @@
            (ncols (length (table-columns tb)))
            (targets (if columns
                         (mapcar (lambda (c)
-                                  (or (find-column tb c)
-                                      (and (rowid-name-p c) (not (table-without-rowid tb)) :rowid)
-                                      (sql-error "table ~a has no column named ~a" table c)))
+                                  (let ((ci (or (find-column tb c)
+                                                (and (rowid-name-p c) (not (table-without-rowid tb)) :rowid)
+                                                (sql-error "table ~a has no column named ~a" table c))))
+                                    (when (and (integerp ci) (column-generated (aref (table-columns tb) ci)))
+                                      (sql-error "cannot INSERT into generated column \"~a\"" c))
+                                    ci))
                                 columns)
                         (loop for i below ncols
                               unless (column-generated (aref (table-columns tb) i)) collect i)))
@@ -507,6 +542,7 @@
               (when (eq (svref row i) :unset)
                 (setf (svref row i) (column-default-value (aref (table-columns tb) i)))))
             (apply-row-affinity tb row)
+            (compute-generated tb row)
             (cond
               (view
                (fire-triggers tb :insert :instead-of nil row)
@@ -581,9 +617,12 @@
            (scope (table-scope tb alias))
            (assigns (loop for (cols e) in sets
                           collect (cons (mapcar (lambda (c)
-                                                  (or (find-column tb c)
-                                                      (and (rowid-name-p c) (not (table-without-rowid tb)) :rowid)
-                                                      (sql-error "no such column: ~a" c)))
+                                                  (let ((ci (or (find-column tb c)
+                                                                (and (rowid-name-p c) (not (table-without-rowid tb)) :rowid)
+                                                                (sql-error "no such column: ~a" c))))
+                                                    (when (and (integerp ci) (column-generated (aref (table-columns tb) ci)))
+                                                      (sql-error "cannot UPDATE generated column \"~a\"" c))
+                                                    ci))
                                                 cols)
                                         (compile-expr e scope))))
            (rows (scan-table-rows tb alias where)))

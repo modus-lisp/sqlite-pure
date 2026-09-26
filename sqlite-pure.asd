@@ -28,6 +28,7 @@
      (:file "window")
      (:file "functions")
      (:file "printf")
+     (:file "math")
      (:file "datetime")
      (:file "json")
      (:file "triggers")

@@ -310,15 +310,19 @@ non-local exit.  Nested uses become savepoints."
         (values nil nil)
         (let ((cols (if (table-view-select tb) (view-column-info tb) (table-columns tb))))
           (values
-           (loop for c across cols
+           (loop with cid = -1
+                 for c across cols
                  for i from 0
+                 unless (and (column-generated c) (not xinfo))
                  collect (append
-                          (list i (column-name c) (or (column-type c) "")
+                          (list (incf cid) (column-name c) (or (column-type c) "")
                                 (if (column-not-null c) 1 0)
                                 (if (column-default c) (default-text (column-default c)) :null)
                                 (let ((pos (position i (table-pk tb))))
                                   (if pos (1+ pos) 0)))
-                          (when xinfo (list 0))))
+                          (when xinfo (list (cond ((column-virtual-p c) 2)
+                                                  ((column-generated c) 3)
+                                                  (t 0))))))
            (append '("cid" "name" "type" "notnull" "dflt_value" "pk")
                    (when xinfo '("hidden"))))))))
 

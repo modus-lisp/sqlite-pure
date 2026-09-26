@@ -77,3 +77,9 @@ SELECT (1, 2) = (1, 2), (1, 2) < (1, 3), (1, NULL) = (1, 2), (1, NULL) = (2, 2),
 
 == like-glob-blobs
 SELECT x'616263' GLOB '*a*', x'616263' LIKE '%a%', 'abc' LIKE x'25', glob('*a*', x'61'), like('a', x'61'), x'61' NOT LIKE 'a';
+
+== math-functions
+SELECT sqrt(4), pi(), power(2, 10), ln(1), ceil(1.2), floor(-1.5), mod(7, 3), sin(0), log10(100), log(8), log(2, 8), exp(0), trunc(2.7), degrees(pi());
+SELECT ceil(5), typeof(ceil(5)), floor(-3), trunc(-2.5), sqrt(-1), sqrt('4'), sqrt('x'), log(0), ln(-1), pow(0, -1), acos(2);
+SELECT mod(7.5, 2), mod(-7, 3), mod(7, 0), atan2(1, 1), log2(8), radians(180), sqrt(x'34'), ceil('2.5'), typeof(ceil('2')), exp(1000), typeof(mod(4, 2));
+SELECT round(cos(1), 12), round(tan(0.5), 12), round(asinh(1), 12), round(cosh(1), 12), pow(-8, 1.0/3), pow(-2, 3), sqrt(NULL);
