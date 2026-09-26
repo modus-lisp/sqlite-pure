@@ -11,6 +11,13 @@
 
 (defvar *ctes* '() "alist name -> CTE for the statement being compiled.")
 
+(defvar *order-hint* nil
+  "For the first FROM item: (:rowid dir) or (:index index dir) if iterating
+that way would produce the rows in ORDER BY order.")
+(defvar *order-satisfied* nil
+  "Set by the planner when it adopted *ORDER-HINT*.")
+
+
 (defstruct cte name columns sel (rows nil) (done nil) recursive-rows affinities env)
 
 ;;; ------------------------------------------------------------------
@@ -401,10 +408,90 @@ source[LI].col = expr where expr references only earlier sources."
                                         (funcall fn row))
                                       :start (and start (clamp-i64 start))
                                       :wanted (src-wanted src)))))))))))
-    ;; 4. full scan
-    (lambda (env fn)
-      (declare (ignore env))
-      (map-table-rows table fn :wanted (src-wanted src)))))
+    ;; 4. full scan -- in the order ORDER BY wants, when we can
+    (let ((hint (and (= li 0) *order-hint*)))
+      (cond
+        ((and hint (eq (first hint) :rowid) (not (table-without-rowid table)))
+         (setf *order-satisfied* t)
+         (if (eq (second hint) :desc)
+             (lambda (env fn)
+               (declare (ignore env))
+               (map-table-reverse (table-owner table) (table-root table)
+                                  (lambda (rowid payload)
+                                    (funcall fn (table-record-to-row
+                                                 table rowid
+                                                 (decode-record payload 0 (length payload) nil
+                                                                (and (not (table-virtual-p table))
+                                                                     (src-wanted src))))))))
+             (lambda (env fn)
+               (declare (ignore env))
+               (map-table-rows table fn :wanted (src-wanted src)))))
+        ((and hint (eq (first hint) :index))
+         (setf *order-satisfied* t)
+         (destructuring-bind (idx dir) (rest hint)
+           (let ((owner (table-owner table))
+                 (pk-index (index-pk-index idx)))
+             (lambda (env fn)
+               (declare (ignore env))
+               (funcall (if (eq dir :desc) #'map-index-reverse #'map-index)
+                        owner (index-root idx)
+                        (lambda (vals)
+                          (let ((row (cond (pk-index (table-record-to-row table nil vals))
+                                           ((table-without-rowid table)
+                                            (fetch-wr-row table (last vals (length (table-pk table)))))
+                                           (t (fetch-row table (car (last vals)) (src-wanted src))))))
+                            (when row (funcall fn row)))))))))
+        (t
+         (lambda (env fn)
+           (declare (ignore env))
+           (map-table-rows table fn :wanted (src-wanted src))))))))
+
+(defun order-term-source-column (e rcols scope)
+  "The (depth-0) column of source 0 an ORDER BY term sorts by, or NIL."
+  (let ((e (if (and (eq (car e) :lit) (integerp (second e)) (<= 1 (second e) (length rcols)))
+               (first (nth (1- (second e)) rcols))
+               e)))
+    (when (and (eq (car e) :col) (null (second e)))
+      (let ((a (alias-expr scope (third e))))
+        (when (and a (not (resolve-column scope nil (third e)))) (setf e a))))
+    (case (car e)
+      (:srccol (and (= (second e) 0) (third e)))
+      (:col (multiple-value-bind (depth si ci) (resolve-column scope (second e) (third e))
+              (and depth (= depth 0) (= si 0) ci)))
+      (t nil))))
+
+(defun compute-order-hint (order rcols scope fsrcs)
+  "Can the rows of this single-table query be produced in ORDER BY order?"
+  (let* ((fs (first fsrcs))
+         (table (and fs (null (cdr fsrcs)) (fsrc-table fs))))
+    (when (and table order
+               (every (lambda (o) (null (fourth o))) order))    ; default NULLS placement
+      (let ((cols (mapcar (lambda (o) (order-term-source-column (first o) rcols scope)) order))
+            (colls (mapcar (lambda (o)
+                             (let ((c (third o)))
+                               (if c (collation-keyword c)
+                                   (or (expr-collation (first o) scope) :binary))))
+                           order))
+            (descs (mapcar #'second order)))
+        (when (every #'identity cols)
+          (cond
+            ;; ORDER BY rowid
+            ((and (null (cdr cols))
+                  (not (table-without-rowid table))
+                  (or (eq (first cols) :rowid) (eql (first cols) (table-rowid-alias table))))
+             (list :rowid (if (first descs) :desc :asc)))
+            (t
+             (dolist (idx (table-indexes table) nil)
+               (let ((icols (index-columns idx)))
+                 (when (and (null (index-where idx))
+                            (<= (length cols) (length icols))
+                            (loop for c in cols for coll in colls for (ic icoll) in icols
+                                  always (and (eql c ic) (eq coll icoll))))
+                   (let ((flips (loop for d in descs for (nil nil idesc) in icols
+                                      collect (if (eq (and d t) (and idesc t)) :same :flip))))
+                     (when (or (every (lambda (f) (eq f :same)) flips)
+                               (every (lambda (f) (eq f :flip)) flips))
+                       (return (list :index idx (if (eq (first flips) :same) :asc :desc)))))))))))))))
 
 (defun ceiling* (x strict)
   "Smallest integer > X (STRICT) or >= X."
@@ -421,6 +508,13 @@ source[LI].col = expr where expr references only earlier sources."
          (and (gethash name *aggregates*)
               (not (and (member name '("min" "max") :test #'string=)
                         (/= (length (third e)) 1)))))))
+
+(defun contains-window-p (e)
+  (labels ((walk (x)
+             (and (consp x)
+                  (or (eq (car x) :winfn)
+                      (some #'walk (cdr x))))))
+    (walk e)))
 
 (defun contains-aggregate-p (e)
   (labels ((walk (x)
@@ -631,7 +725,14 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
     (declare (ignore _))
     (when (and having (not group) (not agg-p))
       (sql-error "a GROUP BY clause is required before HAVING"))
-    (multiple-value-bind (levels finals) (build-levels fsrcs cscope (select-core-where core) ons)
+    (multiple-value-bind (levels finals order-done)
+        (let ((*order-hint* (and (not agg-p) (not (select-core-distinct core))
+                                 (not (select-core-windows core))
+                                 (notany (lambda (rc) (contains-window-p (first rc))) rcols)
+                                 (compute-order-hint order rcols cscope fsrcs)))
+              (*order-satisfied* nil))
+          (multiple-value-bind (l f) (build-levels fsrcs cscope (select-core-where core) ons)
+            (values l f *order-satisfied*)))
       (let* ((nsrc (length fsrcs))
              (columns (loop for (e name) in rcols
                             collect (list name (expr-affinity e cscope)
@@ -665,7 +766,8 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                   (results '())
                   (count 0)
                   (seen (and distinct (make-hash-table :test #'equal)))
-                  (sorting (and order-specs t))
+                  (sorting (and order-specs (not order-done)))
+                  (pending 0)
                   (windowed '()))
              (when (and lim (< lim 0)) (setf lim nil))
              (when (< off 0) (setf off 0))
@@ -677,12 +779,21 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                                     (unless (gethash k seen)
                                       (setf (gethash k seen) t))))
                           (if sorting
-                              (push (cons (mapcar (lambda (spec)
-                                                    (let ((f (first spec)))
-                                                      (if (integerp f) (nth f row) (funcall f e))))
-                                                  order-specs)
-                                          row)
-                                    results)
+                              (progn
+                                (push (cons (mapcar (lambda (spec)
+                                                      (let ((f (first spec)))
+                                                        (if (integerp f) (nth f row) (funcall f e))))
+                                                    order-specs)
+                                            row)
+                                      results)
+                                ;; ORDER BY ... LIMIT: keep only the best LIMIT+OFFSET
+                                (when (and lim (> (incf pending) (+ 256 (* 2 (+ lim off)))))
+                                  (let ((keep (+ lim off)))
+                                    (setf results
+                                          (reverse (let ((sorted (sort-rows (nreverse results)
+                                                                            (mapcar #'cdr order-specs))))
+                                                     (subseq sorted 0 (min keep (length sorted)))))
+                                          pending 0))))
                               (progn
                                 (incf count)
                                 (when (> count off) (push row results))

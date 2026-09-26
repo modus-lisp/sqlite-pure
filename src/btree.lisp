@@ -295,6 +295,47 @@ cell-pointer array and the cell content area can take it."
                      (t (corrupt "index page ~d inside a table b-tree" pgno))))))
     (visit root 0)))
 
+(defun map-table-reverse (db root fn)
+  "Call (FN rowid payload) for every row, in descending rowid order."
+  (labels ((visit (pgno depth)
+             (when (> depth 64) (corrupt "b-tree too deep"))
+             (let* ((b (read-page db pgno))
+                    (off (hdr-off pgno))
+                    (type (check-page-type (aref b off) pgno))
+                    (n (page-ncells b off)))
+               (cond ((= type +leaf-table+)
+                      (loop for i from (1- n) downto 0
+                            do (let ((p (cell-ptr b off type i)))
+                                 (multiple-value-bind (psize n1) (get-varint b p)
+                                   (multiple-value-bind (rowid n2) (get-varint-signed b (+ p n1))
+                                     (funcall fn rowid (read-payload db b (+ p n1 n2) psize
+                                                                     (local-size db psize t))))))))
+                     ((= type +interior-table+)
+                      (let ((children (loop for i below n collect (get-u32 b (cell-ptr b off type i)))))
+                        (visit (get-u32 b (+ off 8)) (1+ depth))
+                        (dolist (c (reverse children)) (visit c (1+ depth)))))
+                     (t (corrupt "index page ~d inside a table b-tree" pgno))))))
+    (visit root 0)))
+
+(defun map-index-reverse (db root fn)
+  "Call (FN values) for every index entry, in descending order."
+  (labels ((visit (pgno depth)
+             (when (> depth 64) (corrupt "b-tree too deep"))
+             (let* ((b (read-page db pgno))
+                    (off (hdr-off pgno))
+                    (type (check-page-type (aref b off) pgno))
+                    (n (page-ncells b off)))
+               (cond ((= type +leaf-index+)
+                      (loop for i from (1- n) downto 0
+                            do (funcall fn (raw-index-entry db b off type i))))
+                     ((= type +interior-index+)
+                      (visit (get-u32 b (+ off 8)) (1+ depth))
+                      (loop for i from (1- n) downto 0
+                            do (funcall fn (raw-index-entry db b off type i))
+                               (visit (get-u32 b (cell-ptr b off type i)) (1+ depth))))
+                     (t (corrupt "table page ~d inside an index b-tree" pgno))))))
+    (visit root 0)))
+
 (defun table-lookup (db root rowid)
   "Payload of ROWID, or NIL."
   (let ((pgno root))
