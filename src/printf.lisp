@@ -181,7 +181,7 @@ XTYPE (:float :exp :generic).  Returns the string without width padding."
                                      (if (upper-case-p type) (string-upcase s) s)))
                                   ((#\s #\z)
                                    (let* ((v (next-arg))
-                                          (s (if (eq v :null) "" (value-to-text v))))
+                                          (s (if (eq v :null) "" (c-string (value-to-text v)))))
                                      (if (and precision (< precision (length s))) (subseq s 0 precision) s)))
                                   (#\c
                                    (let* ((v (next-arg))

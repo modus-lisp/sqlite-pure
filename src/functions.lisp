@@ -161,28 +161,34 @@ and may return true when this row became the aggregate's witness (min/max)."
   (with-null-args ((first args) (if (cdr args) (second args) 0))
     (string-right-trim (trim-chars args) (text-of (first args)))))
 
+(defun value-int32 (v)
+  "sqlite3_value_int: the 64-bit integer value truncated to 32 bits."
+  (let ((n (value-to-integer v)))
+    (if (integerp n)
+        (let ((u (ldb (byte 32 0) n))) (if (logbitp 31 u) (- u (expt 2 32)) u))
+        0)))
+
 (defun sql-substr (x start &optional (len nil len-p))
+  "substrFunc from SQLite's func.c, argument quirks included."
   (let* ((blob (blobp x))
-         (s (if blob x (text-of x)))
+         (s (if blob x (c-string (text-of x))))
          (n (length s))
-         (start (value-to-integer start))
-         (len (and len-p (value-to-integer len))))
-    ;; SQLite semantics: 1-based; 0 behaves as "just before the first";
-    ;; negative counts from the end; negative length takes chars before.
-    (let (b e)
-      (cond ((> start 0) (setf b (1- start)))
-            ((< start 0) (setf b (+ n start)))
-            (t (setf b -1)))
-      (if (not len-p)
-          (setf e n)
-          (if (>= len 0)
-              (setf e (+ b len))
-              (setf e b b (+ b len))))
-      (when (and (not len-p) (< b 0)) (setf b 0))
-      (setf b (max 0 b) e (min n (max 0 e)))
-      (if (>= b e)
-          (if blob (make-octets 0) "")
-          (subseq s b e)))))
+         (p1 (value-int32 start))
+         (p2 (if len-p (value-int32 len) 1000000000))
+         (neg nil))
+    (when (and blob (zerop n)) (return-from sql-substr :null))
+    (when (minusp p2) (setf p2 (- p2) neg t))
+    (cond ((minusp p1)
+           (incf p1 n)
+           (when (minusp p1) (incf p2 p1) (when (minusp p2) (setf p2 0)) (setf p1 0)))
+          ((plusp p1) (decf p1))
+          ((plusp p2) (decf p2)))
+    (when neg
+      (decf p1 p2)
+      (when (minusp p1) (incf p2 p1) (setf p1 0)))
+    (let* ((b (min p1 n))
+           (e (min n (+ b (max 0 p2)))))
+      (subseq s b e))))
 
 (defsqlfun "substr" (2 3) (args)
   (if (some (lambda (a) (eq a :null)) args) :null (apply #'sql-substr args)))
@@ -299,7 +305,7 @@ and may return true when this row became the aggregate's witness (min/max)."
 (defsqlfun "unicode" (1 1) (args)
   (let ((v (first args)))
     (with-null-args (v)
-      (let ((s (text-of v))) (if (plusp (length s)) (char-code (char s 0)) :null)))))
+      (let ((s (c-string (text-of v)))) (if (plusp (length s)) (char-code (char s 0)) :null)))))
 
 (defsqlfun "zeroblob" (1 1) (args)
   (let ((n (value-to-integer (first args)))) (make-octets (if (integerp n) (max 0 n) 0))))
@@ -320,12 +326,14 @@ and may return true when this row became the aggregate's witness (min/max)."
     (with-null-args (x digits)
       (let ((n (value-to-real x))
             (d (value-to-integer digits)))
-        (sql-round n (max 0 (min 30 (if (integerp d) d 0))))))))
+        (declare (ignore d))
+        (sql-round n (max 0 (min 30 (value-int32 digits))))))))
 
 (defsqlfun "sign" (1 1) (args)
   (let ((v (first args)))
-    (if (or (eq v :null) (and (not (integerp v)) (not (floatp v))
-                              (null (text-numeric-value (text-of v)))))
+    (if (or (eq v :null) (blobp v)
+            (and (not (integerp v)) (not (floatp v))
+                 (null (text-numeric-value (text-of v)))))
         :null
         (let ((n (if (or (integerp v) (floatp v)) v (text-numeric-value (text-of v)))))
           (cond ((plusp n) 1) ((minusp n) -1) (t 0))))))
@@ -396,6 +404,15 @@ and may return true when this row became the aggregate's witness (min/max)."
               nil)
             (lambda () n))))
 
+(defun sum-operand (v)
+  "sqlite3_value_numeric_type semantics: an INTEGER only if the value is
+one after numeric affinity; anything else is summed as a REAL."
+  (cond ((integerp v) v)
+        ((floatp v) v)
+        ((stringp v) (let ((n (numeric-affinity-value v)))
+                       (if (integerp n) n (value-to-real v))))
+        (t (value-to-real v))))
+
 (defaggregate "sum" (1 1)
   ;; As SQLite 3.40: an exact integer sum until a REAL arrives, and a
   ;; double accumulator of every value alongside.
@@ -404,7 +421,7 @@ and may return true when this row became the aggregate's witness (min/max)."
               (let ((v (first args)))
                 (unless (eq v :null)
                   (setf any t)
-                  (let ((n (value-to-number v)))
+                  (let ((n (sum-operand v)))
                     (setf fsum (+ fsum (float n 1d0)))
                     (if (integerp n)
                         (unless real

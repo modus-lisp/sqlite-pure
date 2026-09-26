@@ -87,9 +87,14 @@
                                       (got (first result))
                                       (cols (second result)))
                                   (cond ((not (compare-rows got want (ordered-statement-p sql)))
-                                         (format nil "rows differ~%      want ~s~%      got  ~s"
-                                                 (subseq want 0 (min 8 (length want)))
-                                                 (subseq got 0 (min 8 (length got)))))
+                                         (let* ((ordered (ordered-statement-p sql))
+                                                (w (if ordered want (sort (copy-list want) #'string< :key #'row-sort-key)))
+                                                (g (if ordered got (sort (copy-list got) #'string< :key #'row-sort-key)))
+                                                (k (or (loop for a in w for b in g for i from 0
+                                                             unless (row= b a) return i)
+                                                       (min (length w) (length g)))))
+                                           (format nil "rows differ (~d vs ~d rows) at row ~d~%      want ~s~%      got  ~s"
+                                                   (length want) (length got) k (nth k w) (nth k g))))
                                         ((not (equal cols (first more)))
                                          (format nil "column names differ: want ~s got ~s"
                                                  (first more) cols)))))))))

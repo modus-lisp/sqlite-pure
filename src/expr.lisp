@@ -153,8 +153,11 @@
                   (t (float-op #'/ x y))))
       (:mod (cond ((and (integerp x) (integerp y))
                    (if (zerop y) :null (rem x y)))
-                  (t (let ((ix (value-to-integer x)) (iy (value-to-integer y)))
-                       (if (zerop iy) :null (float (rem ix iy) 1d0)))))))))
+                  ;; SQLite takes the integer value of each original operand
+                  ;; (text: its integer prefix), then the remainder as REAL
+                  (t (let ((ix (value-to-integer a)) (iy (value-to-integer b)))
+                       (cond ((zerop iy) :null)
+                             (t (float (rem ix (if (= iy -1) 1 iy)) 1d0))))))))))
 
 (defun float-op (fn x y)
   (let ((fx (float x 1d0)) (fy (float y 1d0)))
@@ -492,7 +495,8 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
          (let* ((items (second rhs))
                 (fns (mapcar (lambda (i) (compile-expr i scope)) items))
                 (colls (mapcar (lambda (i) (binary-collation x i scope)) items))
-                (affs (mapcar (lambda (i) (comparison-affinity xaff (expr-affinity i scope))) items)))
+                ;; IN (list) compares with the left operand's affinity only
+                (affs (mapcar (lambda (i) (declare (ignore i)) xaff) items)))
            (lambda (env)
              (let ((v (funcall fx env)))
                (if (eq v :null)
