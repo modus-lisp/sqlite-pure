@@ -26,7 +26,19 @@
   collations             ; simple-vector
   hidden                 ; list of column indexes hidden from unqualified * and lookup
   table                  ; TABLE or NIL
-  (rowid-p t))
+  (rowid-p t)
+  (used nil))            ; bit vector of referenced columns, or :ALL
+
+(defun mark-used (s ci)
+  "Record that compiled code reads column CI of source S."
+  (when (and s (integerp ci))
+    (let ((u (src-used s)))
+      (when (typep u 'simple-bit-vector)
+        (setf (sbit u ci) 1)))))
+
+(defun src-wanted (s)
+  "The columns a scan of S must decode: a bit vector, or NIL for all."
+  (let ((u (src-used s))) (if (eq u :all) nil u)))
 
 (defstruct scope
   srcs parent
@@ -323,8 +335,9 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
     (:lit (let ((v (second e))) (lambda (env) (declare (ignore env)) v)))
     (:param (let ((k (second e))) (lambda (env) (declare (ignore env)) (param-value k))))
     (:col
-     (multiple-value-bind (depth si ci) (resolve-column scope (second e) (third e))
+     (multiple-value-bind (depth si ci s) (resolve-column scope (second e) (third e))
        (cond (depth
+              (mark-used s ci)
               (when (plusp depth) (mark-correlated scope depth))
               (compile-column-access depth si ci))
              ((and (null (second e)) (alias-expr scope (third e)))
@@ -333,7 +346,8 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
              ((and (null (second e)) (stringp (third e)) (eq (fourth e) :quoted))
               (let ((s (third e))) (lambda (env) (declare (ignore env)) s)))
              (t (sql-error "no such column: ~@[~a.~]~a" (second e) (third e))))))
-    (:srccol (compile-column-access 0 (second e) (third e)))
+    (:srccol (mark-used (nth (second e) (scope-srcs scope)) (third e))
+             (compile-column-access 0 (second e) (third e)))
     (:star (sql-error "misuse of *"))
     (:unary (compile-unary e scope))
     (:binary (compile-binary e scope))

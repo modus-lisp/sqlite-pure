@@ -49,9 +49,10 @@
              (octets-subseq b off (+ off n))
              (decode-text b off (+ off n)))))))
 
-(defun decode-record (b &optional (start 0) (end (length b)) limit)
+(defun decode-record (b &optional (start 0) (end (length b)) limit wanted)
   "Decode the record in B[START,END) into a list of values.  With LIMIT,
-decode at most that many columns."
+decode at most that many columns; with WANTED (a bit vector), columns
+whose bit is 0 are skipped and read as NULL."
   (multiple-value-bind (hsize n) (get-varint b start)
     (let ((hp (+ start n))
           (hend (+ start hsize))
@@ -64,7 +65,11 @@ decode at most that many columns."
                  (incf hp k)
                  (let ((len (serial-type-length st)))
                    (when (> (+ dp len) end) (corrupt "record body overflows payload"))
-                   (push (decode-value b dp st) vals)
+                   (push (if (and wanted (or (>= count (length wanted))
+                                             (zerop (sbit wanted count))))
+                             :null
+                             (decode-value b dp st))
+                         vals)
                    (incf dp len)
                    (incf count))))
       (nreverse vals))))

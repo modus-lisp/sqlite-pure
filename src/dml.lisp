@@ -554,7 +554,10 @@
   "All rows of TABLE (vectors) satisfying WHERE."
   (when (table-view-select table)
     (return-from scan-table-rows (scan-view-rows table alias where)))
-  (let* ((fs (make-fsrc :src (make-table-src table alias) :table table :join :first))
+  (let* ((fs (let ((f (make-fsrc :src (make-table-src table alias) :table table :join :first)))
+               ;; DML needs whole rows (indexes, triggers, RETURNING)
+               (setf (src-used (fsrc-src f)) :all)
+               f))
          (scope (make-scope :srcs (list (fsrc-src fs)) :parent *outer-scope*))
          (env (make-env :rows (make-array 1) :parent *outer-env*))
          (out '()))

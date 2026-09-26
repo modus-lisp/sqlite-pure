@@ -372,6 +372,23 @@ the first entry E for which (CMP E PROBE) >= 0."
                      (t (corrupt "table page ~d inside an index b-tree" pgno))))))
     (visit root 0)))
 
+(defun btree-count (db root)
+  "Number of entries in a b-tree, from cell counts alone."
+  (labels ((visit (pgno depth)
+             (when (> depth 64) (corrupt "b-tree too deep"))
+             (let* ((b (read-page db pgno))
+                    (off (hdr-off pgno))
+                    (type (check-page-type (aref b off) pgno))
+                    (n (page-ncells b off)))
+               (case type
+                 (#.+leaf-table+ n)
+                 (#.+leaf-index+ n)
+                 (t (+ (if (= type +interior-index+) n 0)
+                       (loop for i below n
+                             sum (visit (get-u32 b (cell-ptr b off type i)) (1+ depth)))
+                       (visit (get-u32 b (+ off 8)) (1+ depth))))))))
+    (visit root 0)))
+
 (defun map-btree-pages (db root fn)
   "Call FN on every page number of the b-tree rooted at ROOT, overflow
 pages included (children before parents)."

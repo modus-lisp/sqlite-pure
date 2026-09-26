@@ -46,18 +46,21 @@
           (setf (svref row n) rowid)))
     row))
 
-(defun fetch-row (table rowid)
+(defun fetch-row (table rowid &optional wanted)
   (let ((payload (table-lookup *db* (table-root table) rowid)))
     (when payload
-      (table-record-to-row table rowid (decode-record payload)))))
+      (table-record-to-row table rowid (decode-record payload 0 (length payload) nil wanted)))))
 
-(defun map-table-rows (table fn &key start)
+(defun map-table-rows (table fn &key start wanted)
+  "Call FN on every row of TABLE.  WANTED (a bit vector) limits which
+columns are decoded; the others read as NULL."
   (if (table-without-rowid table)
       (map-index *db* (table-root table)
                  (lambda (vals) (funcall fn (table-record-to-row table nil vals))))
       (map-table *db* (table-root table)
                  (lambda (rowid payload)
-                   (funcall fn (table-record-to-row table rowid (decode-record payload))))
+                   (funcall fn (table-record-to-row
+                                table rowid (decode-record payload 0 (length payload) nil wanted))))
                  :start start)))
 
 ;;; ------------------------------------------------------------------
@@ -94,7 +97,8 @@
               :affinities (map 'vector #'column-affinity cols)
               :collations (map 'vector #'column-collation cols)
               :table table
-              :rowid-p (not (table-without-rowid table)))))
+              :rowid-p (not (table-without-rowid table))
+              :used (make-array (length cols) :element-type 'bit :initial-element 0))))
 
 (defun rows-to-vectors (rows)
   (mapcar (lambda (r) (let ((v (make-array (1+ (length r)))))
@@ -291,6 +295,7 @@ source[LI].col = expr where expr references only earlier sources."
 (defun plan-table-access (fs li conjuncts scope)
   "Return an iterate function for a stored table."
   (let* ((table (fsrc-table fs))
+         (src (fsrc-src fs))
          (eqs (equality-candidates conjuncts li scope)))
     ;; 1. rowid equality
     (unless (table-without-rowid table)
@@ -304,7 +309,7 @@ source[LI].col = expr where expr references only earlier sources."
               (lambda (env fn)
                 (let* ((v (funcall f env))
                        (r (and (not (eq v :null)) (rowid-probe v)))
-                       (row (and r (fetch-row table r))))
+                       (row (and r (fetch-row table r (src-wanted src)))))
                   (when row (funcall fn row)))))))))
     ;; 2. index prefix equality
     (let ((best nil) (best-k 0))
@@ -352,7 +357,7 @@ source[LI].col = expr where expr references only earlier sources."
                                    (let ((row (cond (pk-index (table-record-to-row table nil vals))
                                                     ((table-without-rowid table)
                                                      (fetch-wr-row table (last vals (length (table-pk table)))))
-                                                    (t (fetch-row table (car (last vals)))))))
+                                                    (t (fetch-row table (car (last vals)) (src-wanted src))))))
                                      (when row (funcall fn row))))
                                  :probe probe :cmp cmp))))))))))
     ;; 3. rowid range
@@ -389,11 +394,12 @@ source[LI].col = expr where expr references only earlier sources."
                                           (when (and stop (if (eq stop-op :lt) (>= r stop) (> r stop)))
                                             (throw :range-done nil)))
                                         (funcall fn row))
-                                      :start (and start (clamp-i64 start))))))))))))
+                                      :start (and start (clamp-i64 start))
+                                      :wanted (src-wanted src)))))))))))
     ;; 4. full scan
     (lambda (env fn)
       (declare (ignore env))
-      (map-table-rows table fn))))
+      (map-table-rows table fn :wanted (src-wanted src)))))
 
 (defun ceiling* (x strict)
   "Smallest integer > X (STRICT) or >= X."
@@ -601,6 +607,8 @@ Return the per-source ON expressions."
 list of (name affinity collation), fn (lambda (parent-env)) -> rows."
   (when (and (consp core) (eq (car core) :values))
     (return-from compile-core (compile-values-core (second core) scope order limit offset)))
+  (let ((fast (multiple-value-list (count-star-fast-path core order limit offset))))
+    (when (first fast) (return-from compile-core (values-list fast))))
   (let* ((fsrcs (mapcar (lambda (item) (make-fsrc-for item scope))
                         (select-core-from core)))
          (cscope (make-scope :srcs (mapcar #'fsrc-src fsrcs) :parent scope))
@@ -747,6 +755,30 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                  (nreverse results))))
          columns
          cscope)))))
+
+(defun count-star-fast-path (core order limit offset)
+  "SELECT count(*) FROM <table>: count cells without decoding any record."
+  (let ((cols (select-core-cols core))
+        (from (select-core-from core)))
+    (when (and (null order) (null limit) (null offset)
+               (null (select-core-where core)) (null (select-core-group core))
+               (null (select-core-having core)) (null (select-core-windows core))
+               (= (length cols) 1) (eq (car (first cols)) :expr)
+               (equal (butlast (second (first cols)) 0) (second (first cols)))
+               (let ((e (second (first cols))))
+                 (and (eq (car e) :fn) (name= (second e) "count") (fifth e)
+                      (null (sixth e)) (null (third e))))
+               (= (length from) 1)
+               (eq (car (getf (first from) :source)) :table)
+               (null (cdr (assoc (second (getf (first from) :source)) *ctes* :test #'name=))))
+      (let ((table (lookup-table *db* (second (getf (first from) :source)) nil)))
+        (when (and table (not (table-view-select table)))
+          (let ((c (first cols)))
+            (values (lambda (parent-env)
+                      (declare (ignore parent-env))
+                      (list (list (btree-count *db* (table-root table)))))
+                    (list (list (or (third c) (fourth c) "count(*)") nil :binary))
+                    nil)))))))
 
 (defun group-sort-key (g group-fns parent-env)
   (let ((e (make-env :rows (car g) :parent parent-env)))
