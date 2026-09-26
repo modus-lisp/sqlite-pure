@@ -449,7 +449,7 @@ source[LI].col = expr where expr references only earlier sources."
 
 (defun order-term-source-column (e rcols scope)
   "The (depth-0) column of source 0 an ORDER BY term sorts by, or NIL."
-  (let ((e (if (and (eq (car e) :lit) (integerp (second e)) (<= 1 (second e) (length rcols)))
+  (let ((e (if (and (int32-literal-p e) (<= 1 (second e) (length rcols)))
                (first (nth (1- (second e)) rcols))
                e)))
     (when (and (eq (car e) :col) (null (second e)))
@@ -953,9 +953,13 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
   (and aggs (null (cdr aggs))
        (member (agg-name (car aggs)) '("min" "max") :test #'string=)))
 
+(defun int32-literal-p (e)
+  "sqlite3ExprIsInteger: an integer literal that fits in 32 bits."
+  (and (eq (car e) :lit) (integerp (second e)) (<= -2147483648 (second e) 2147483647)))
+
 (defun resolve-group-term (g rcols)
   "GROUP BY accepts result-column numbers."
-  (if (and (eq (car g) :lit) (integerp (second g)))
+  (if (int32-literal-p g)
       (let ((k (second g)))
         (unless (<= 1 k (length rcols))
           (sql-error "GROUP BY term out of range - should be between 1 and ~d" (length rcols)))
@@ -979,7 +983,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
 
 (defun order-term-column (e rcols &optional (k 1))
   "Index of the result column an ORDER BY term names, or NIL."
-  (cond ((and (eq (car e) :lit) (integerp (second e)))
+  (cond ((int32-literal-p e)
          (let ((v (second e)))
            (unless (<= 1 v (length rcols))
              (sql-error "~a ORDER BY term out of range - should be between 1 and ~d"
@@ -1126,7 +1130,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                    (case (first (sel-ops sel)) (:union-all "UNION ALL") (:union "UNION")
                          (:intersect "INTERSECT") (t "EXCEPT")))))
     (let ((order (loop for (e desc coll nulls) in (sel-order sel)
-                       collect (let ((idx (cond ((and (eq (car e) :lit) (integerp (second e)))
+                       collect (let ((idx (cond ((int32-literal-p e)
                                                  (1- (second e)))
                                                 ((eq (car e) :col)
                                                  (position (third e) cols :key #'first :test #'name=))
@@ -1149,19 +1153,19 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                  do (let ((next (funcall (first c) parent-env)))
                       (ecase op
                         (:union-all (setf rows (append rows next)))
-                        (:union (setf rows (dedupe-rows (append rows next) colls)
+                        (:union (setf rows (union-rows rows next colls (and order t))
                                       distinct-sorted t))
                         (:intersect
                          (let ((h (make-hash-table :test #'equal)))
                            (dolist (r next) (setf (gethash (group-key r colls) h) t))
                            (setf rows (dedupe-rows (remove-if-not (lambda (r) (gethash (group-key r colls) h)) rows)
-                                                   colls)
+                                                   colls (if order :first :last))
                                  distinct-sorted t)))
                         (:except
                          (let ((h (make-hash-table :test #'equal)))
                            (dolist (r next) (setf (gethash (group-key r colls) h) t))
                            (setf rows (dedupe-rows (remove-if (lambda (r) (gethash (group-key r colls) h)) rows)
-                                                   colls)
+                                                   colls (if order :first :last))
                                  distinct-sorted t))))))
            (when (and distinct-sorted (null order))
              ;; SQLite's set operators produce rows in key order
@@ -1180,12 +1184,31 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
        cols
        correlated))))
 
-(defun dedupe-rows (rows colls)
-  (let ((h (make-hash-table :test #'equal)))
-    (loop for r in rows
-          for k = (group-key r colls)
-          unless (gethash k h)
-            collect (progn (setf (gethash k h) t) r))))
+(defun dedupe-rows (rows colls &optional (keep :first))
+  "One row per distinct key, in first-appearance order; KEEP says whether
+the :first or :last of a set of equal rows (say 0 and 0.0) survives."
+  (let ((h (make-hash-table :test #'equal)) (order '()))
+    (dolist (r rows)
+      (let ((k (group-key r colls)))
+        (if (nth-value 1 (gethash k h))
+            (when (eq keep :last) (setf (gethash k h) r))
+            (progn (push k order) (setf (gethash k h) r)))))
+    (mapcar (lambda (k) (gethash k h)) (nreverse order))))
+
+(defun union-rows (left right colls merge)
+  "UNION.  With ORDER BY SQLite merges two sorted streams and, for equal
+keys, emits the right operand's (first) row; otherwise it inserts every
+row into an ephemeral index, where the last equal row wins."
+  (if (not merge)
+      (dedupe-rows (append left right) colls :last)
+      (let ((rh (make-hash-table :test #'equal)))
+        (dolist (r (dedupe-rows right colls)) (setf (gethash (group-key r colls) rh) r))
+        (let ((out (mapcar (lambda (r) (or (gethash (group-key r colls) rh) r))
+                           (dedupe-rows left colls)))
+              (seen (make-hash-table :test #'equal)))
+          (dolist (r out) (setf (gethash (group-key r colls) seen) t))
+          (append out (remove-if (lambda (r) (gethash (group-key r colls) seen))
+                                 (dedupe-rows right colls)))))))
 
 (defun select-first-affinity (sel scope)
   (ignore-errors

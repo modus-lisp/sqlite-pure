@@ -27,30 +27,34 @@
 
 (defun run-in-write-txn (db thunk)
   "Run THUNK as one atomic statement (across every attached database)."
-  (cond
-    ((db-explicit db)
-     (let ((ok nil) (started (conn-dbs db)))
-       (dolist (d started) (statement-begin d))
-       (unwind-protect
-            (handler-bind ((sqlite-conflict
-                             (lambda (c)
-                               (case (conflict-action c)
-                                 (:rollback (rollback-all db) (setf (db-explicit db) nil ok t))
-                                 (:fail (setf ok t))))))
-              (multiple-value-prog1 (funcall thunk) (setf ok t)))
-         (dolist (d (conn-dbs db))
-           (if (and (not ok) (member d started)) (statement-rollback d) (statement-end d))))))
-    (t
-     (let ((ok nil) (keep nil))
-       (unwind-protect
-            (handler-bind ((sqlite-conflict
-                             (lambda (c) (when (eq (conflict-action c) :fail) (setf keep t)))))
-              (multiple-value-prog1 (funcall thunk) (setf ok t)))
-         (if (or ok keep)
-             (handler-bind ((error (lambda (c) (declare (ignore c)) (rollback-all db))))
-               (fk-check-deferred db)
-               (commit-all db))
-             (rollback-all db)))))))
+  ;; The flags live in a cons rather than in variables assigned inside
+  ;; HANDLER-BIND: some compilers (modus, as of 2026-09) mis-scope such
+  ;; assignments.
+  (let ((state (list nil nil)))          ; (ok keep)
+    (progn
+      (cond
+        ((db-explicit db)
+         (let ((started (conn-dbs db)))
+           (dolist (d started) (statement-begin d))
+           (unwind-protect
+                (handler-bind ((sqlite-conflict
+                                 (lambda (c)
+                                   (case (conflict-action c)
+                                     (:rollback (rollback-all db) (setf (db-explicit db) nil (first state) t))
+                                     (:fail (setf (first state) t))))))
+                  (multiple-value-prog1 (funcall thunk) (setf (first state) t)))
+             (dolist (d (conn-dbs db))
+               (if (and (not (first state)) (member d started)) (statement-rollback d) (statement-end d))))))
+        (t
+         (unwind-protect
+              (handler-bind ((sqlite-conflict
+                               (lambda (c) (when (eq (conflict-action c) :fail) (setf (second state) t)))))
+                (multiple-value-prog1 (funcall thunk) (setf (first state) t)))
+           (if (or (first state) (second state))
+               (handler-bind ((error (lambda (c) (declare (ignore c)) (rollback-all db))))
+                 (fk-check-deferred db)
+                 (commit-all db))
+               (rollback-all db))))))))
 
 (defun exec-ast (db st text)
   "Execute one parsed statement.  Return (values rows column-names)."

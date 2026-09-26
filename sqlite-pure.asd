@@ -39,3 +39,8 @@
      (:file "api")
      (:file "vacuum"))))
   :in-order-to ((test-op (test-op "sqlite-pure/test"))))
+
+(defsystem "sqlite-pure/test"
+  :depends-on ("sqlite-pure")
+  :components ((:module "test" :components ((:file "differential"))))
+  :perform (test-op (o c) (uiop:symbol-call :sqlite-pure.test :run)))
