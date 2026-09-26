@@ -302,6 +302,10 @@ conversion used for arithmetic on text."
 (defun rtrim-spaces (s) (string-right-trim " " s))
 
 (defun compare-strings (a b collation)
+  (when (user-collation-p collation)
+    (let ((r (funcall (car (user-collation-def collation)) a b)))
+      (return-from compare-strings (cond ((not (realp r)) (if r -1 0))
+                                         ((minusp r) -1) ((plusp r) 1) (t 0)))))
   (when (and (eq collation :binary) (not (eq *encoding* :utf-8)))
     ;; BINARY is memcmp over the database's own encoding; for UTF-16 that
     ;; is not code-point order.
@@ -339,12 +343,31 @@ conversion used for arithmetic on text."
 (defun values-equal-p (a b &optional (collation :binary))
   (= 0 (compare-values a b collation)))
 
+(defstruct (user-collation (:constructor make-user-collation (name)))
+  "A collation named in SQL but not built in: resolved against the
+connection's registry each time it is used, so a schema may mention a
+collation before the program registers it (as in SQLite)."
+  name)
+
 (defun collation-keyword (name)
   (let ((n (string-upcase-ascii name)))
     (cond ((string= n "BINARY") :binary)
           ((string= n "NOCASE") :nocase)
           ((string= n "RTRIM") :rtrim)
-          (t (sql-error "no such collation sequence: ~a" name)))))
+          (t (make-user-collation n)))))
+
+(defun collation= (a b)
+  (or (eq a b)
+      (and (user-collation-p a) (user-collation-p b)
+           (string= (user-collation-name a) (user-collation-name b)))))
+
+(defun collation-name (c)
+  (if (user-collation-p c) (user-collation-name c) (symbol-name c)))
+
+(defun user-collation-def (c)
+  "(compare . key) for user collation C, or an error."
+  (or (and *db* (gethash (user-collation-name c) (db-user-collations (conn *db*))))
+      (sql-error "no such collation sequence: ~a" (user-collation-name c))))
 
 ;;; Keys for hashing (GROUP BY, DISTINCT, IN lists).  Numerically equal
 ;;; integers and reals share a key.
@@ -355,10 +378,15 @@ conversion used for arithmetic on text."
                              (i64-p (truncate v)))
                         (truncate v)
                         v))
-        ((stringp v) (case collation
-                       (:nocase (string-downcase-ascii v))
-                       (:rtrim (rtrim-spaces v))
-                       (t v)))
+        ((stringp v) (cond ((eq collation :nocase) (string-downcase-ascii v))
+                           ((eq collation :rtrim) (rtrim-spaces v))
+                           ((user-collation-p collation)
+                            ;; hashing needs a canonical form; without a KEY
+                            ;; function, equal-under-the-collation strings that
+                            ;; differ as text group separately
+                            (let ((key (cdr (user-collation-def collation))))
+                              (if key (funcall key v) v)))
+                           (t v)))
         ((blobp v) (cons :blob (coerce v 'list)))
         (t v)))
 

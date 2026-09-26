@@ -39,7 +39,7 @@
   (destructuring-bind (name args distinct star filter over) (cdr e)
     (let* ((lname (string-downcase-ascii name))
            (spec (resolve-window-spec over scope))
-           (aggdef (gethash lname *aggregates*))
+           (aggdef (nth-value 1 (find-sql-function lname)))
            (winfn (member lname +window-only-functions+ :test #'string=)))
       (unless (or aggdef winfn)
         (sql-error "~a() may not be used as a window function" name))

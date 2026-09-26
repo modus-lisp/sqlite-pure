@@ -334,7 +334,7 @@ source[LI].col = expr where expr references only earlier sources."
                                  (find-if (lambda (c)
                                             (and (eql (first c) ci)
                                                  (eq (fourth c) :eq)
-                                                 (eq (third c) coll)
+                                                 (collation= (third c) coll)
                                                  (probe-usable-p
                                                   (column-affinity (aref (table-columns table) ci))
                                                   (expr-affinity (second c) scope))))
@@ -525,7 +525,7 @@ narrowest, newest on ties), or NIL."
                  (when (and (null (index-where idx))
                             (<= (length cols) (length icols))
                             (loop for c in cols for coll in colls for (ic icoll) in icols
-                                  always (and (eql c ic) (eq coll icoll))))
+                                  always (and (eql c ic) (collation= coll icoll))))
                    (let ((flips (loop for d in descs for (nil nil idesc) in icols
                                       collect (if (eq (and d t) (and idesc t)) :same :flip))))
                      (when (or (every (lambda (f) (eq f :same)) flips)
@@ -544,7 +544,7 @@ narrowest, newest on ties), or NIL."
 (defun aggregate-call-p (e)
   (and (eq (car e) :fn)
        (let ((name (string-downcase-ascii (second e))))
-         (and (gethash name *aggregates*)
+         (and (nth-value 1 (find-sql-function name))
               (not (and (member name '("min" "max") :test #'string=)
                         (/= (length (third e)) 1)))))))
 

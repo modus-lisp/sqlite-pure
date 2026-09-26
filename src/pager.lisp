@@ -63,6 +63,10 @@
   (conn nil)                 ; the connection (main database), or NIL if this is it
   (attached '())             ; on the main database: alist name -> db, "temp" included
   (foreign-keys nil)         ; PRAGMA foreign_keys (on the connection)
+  ;; user-defined SQL functions, aggregates and collations (on the connection)
+  (user-functions (make-hash-table :test #'equal))   ; name -> (min max fn)
+  (user-aggregates (make-hash-table :test #'equal))  ; name -> (min max ctor)
+  (user-collations (make-hash-table :test #'equal))  ; NAME -> (compare . key)
   (fk-deferred nil)          ; a deferred foreign key was violated in this transaction
   (stmt-cache (make-hash-table :test #'equal))
   (closed nil))

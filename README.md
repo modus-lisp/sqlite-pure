@@ -47,6 +47,22 @@ parse lands 1 ulp away).
 | `with-transaction (db) body` | commit on normal exit, roll back on unwind; nests as a savepoint |
 | `last-insert-rowid`, `changes` | |
 
+**Extending SQL.** Lisp closures can be registered per connection:
+
+```lisp
+(sqlp:define-function db "double" (lambda (x) (* 2 x)) :arity 1)
+(sqlp:define-aggregate db "product" (lambda (acc x) (* acc x)) :initial 1 :arity 1)
+(sqlp:define-collation db "reverse" (lambda (a b) (cond ((string> a b) -1) ((string< a b) 1) (t 0))))
+(sqlp:query db "SELECT product(double(v)) FROM t")
+```
+
+Functions receive and return SQL values as below (`nil` → NULL, `t` → 1);
+they shadow built-ins of the same name (`undefine-function` removes one).
+Aggregates work in `GROUP BY`, with `DISTINCT`/`FILTER`, and as window
+functions. A collation may be named in a schema before it is registered —
+as in SQLite, using it is the error; give `:key` (a canonical form for
+strings equal under the collation) for `GROUP BY`/`DISTINCT` to group by it.
+
 Parameters are `?`, `?NNN`, `:name`, `@name`, `$name` (named parameters are
 numbered in order of first appearance, as SQLite does). Values map as
 **NULL** ↔ `:null` (a Lisp `nil` parameter also binds NULL), **INTEGER** ↔
@@ -124,8 +140,7 @@ plan can only narrow the candidate rows, never change the answer.
 
 Virtual tables (FTS, R-tree, `pragma_*` table-valued functions), writing to
 WAL-mode databases, maintaining `auto_vacuum` pointer maps, window `EXCLUDE`
-clauses, `ORDER BY` inside aggregate calls, recursive triggers, `EXPLAIN`,
-user-defined SQL functions and collations. Durability depends on the Lisp's
+clauses, `ORDER BY` inside aggregate calls, recursive triggers, `EXPLAIN`. Durability depends on the Lisp's
 `finish-output`; there is no portable `fsync`. File locks need SBCL
 (elsewhere they are no-ops, and cache validation still applies).
 
@@ -141,7 +156,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 
 | script | what |
 |---|---|
-| `test/run-tests.sh` (also `(asdf:test-system "sqlite-pure")`) | **differential suite**: `test/cases/*.test` are SQL scripts; `test/gen-expected.py` records SQLite's rows or error for every statement; each is replayed here and compared, error messages included |
+| `test/run-tests.sh` (also `(asdf:test-system "sqlite-pure")`) | the Lisp API tests (`test/api.lisp`), and the **differential suite**: `test/cases/*.test` are SQL scripts; `test/gen-expected.py` records SQLite's rows or error for every statement; each is replayed here and compared, error messages included |
 | `test/run-qfuzz.sh FIRST N Q` | **query fuzzer**: random expressions, joins, subqueries, compounds, windows and CTEs over random mixed-type data, compared statement by statement |
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |

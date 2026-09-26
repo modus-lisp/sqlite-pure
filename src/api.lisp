@@ -189,6 +189,58 @@ the rows of the last statement if it produced any, else its change count."
          ,@body))))
 
 (defun last-insert-rowid (db) (db-last-insert-rowid db))
+
+;;; ------------------------------------------------------------------
+;;; User-defined functions, aggregates and collations
+
+(defun arity-range (arity)
+  (if (or (null arity) (minusp arity)) (values 0 nil) (values arity arity)))
+
+(defun define-function (db name function &key (arity -1))
+  "Make FUNCTION callable from SQL as NAME on DB's connection.  It receives
+the arguments as Lisp values (:null, integer, double-float, string or octet
+vector) and returns one; NIL returns NULL, T returns 1.  ARITY -1 accepts
+any number of arguments.  A user function shadows a built-in of that name."
+  (multiple-value-bind (min max) (arity-range arity)
+    (let ((c (conn db)) (n (string-downcase-ascii name)))
+      (remhash n (db-user-aggregates c))
+      (setf (gethash n (db-user-functions c))
+            (list min max (lambda (args) (lisp-to-sql (apply function args)))))
+      (clrhash (db-stmt-cache c))
+      name)))
+
+(defun define-aggregate (db name step &key (initial nil) (final #'identity) (arity -1))
+  "Define an aggregate NAME: the state starts as INITIAL, each row sets it
+to (STEP state arg...), and the result is (FINAL state).  Rows where STEP's
+arguments are all passed as SQL values (NULLs included)."
+  (multiple-value-bind (min max) (arity-range arity)
+    (let ((c (conn db)) (n (string-downcase-ascii name)))
+      (remhash n (db-user-functions c))
+      (setf (gethash n (db-user-aggregates c))
+            (list min max
+                  (lambda ()
+                    (let ((state (if (functionp initial) (funcall initial) initial)))
+                      (values (lambda (args) (setf state (apply step state args)) nil)
+                              (lambda () (lisp-to-sql (funcall final state))))))))
+      (clrhash (db-stmt-cache c))
+      name)))
+
+(defun define-collation (db name compare &key key)
+  "Define collation NAME.  (COMPARE a b) orders two strings: a negative
+number, zero or a positive number (or a generalized boolean meaning
+\"a is less than b\").  KEY, if given, maps a string to a canonical form
+such that strings equal under COMPARE have EQUAL keys; GROUP BY, DISTINCT
+and UNION use it (without it, grouping falls back to exact text)."
+  (setf (gethash (string-upcase-ascii name) (db-user-collations (conn db)))
+        (cons compare key))
+  name)
+
+(defun undefine-function (db name)
+  (let ((c (conn db)) (n (string-downcase-ascii name)))
+    (remhash n (db-user-functions c))
+    (remhash n (db-user-aggregates c))
+    (clrhash (db-stmt-cache c))
+    nil))
 (defun changes (db) (db-changes db))
 (defun in-transaction-p (db) (db-explicit db))
 
@@ -416,7 +468,7 @@ non-local exit.  Nested uses become savepoints."
                  for i from 0
                  collect (append (list i (if (integerp c) c -2)
                                        (if (integerp c) (column-name (aref (table-columns tb) c)) :null))
-                                 (when xinfo (list (if desc 1 0) (symbol-name coll) 1))))
+                                 (when xinfo (list (if desc 1 0) (collation-name coll) 1))))
            (append '("seqno" "cid" "name") (when xinfo '("desc" "coll" "key"))))))))
 
 (defun pragma-table-list (db)

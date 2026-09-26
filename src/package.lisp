@@ -10,6 +10,8 @@
    ;; statements
    #:execute #:execute-script #:query #:query-row #:query-value #:do-query
    #:last-insert-rowid #:changes
+   ;; extending SQL
+   #:define-function #:define-aggregate #:define-collation #:undefine-function
    ;; transactions
    #:with-transaction #:begin-transaction #:commit #:rollback #:in-transaction-p
    ;; values

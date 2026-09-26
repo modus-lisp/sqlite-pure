@@ -7,7 +7,6 @@
 
 (in-package #:sqlite-pure)
 
-(defvar *db* nil "The database a statement is running against.")
 (defvar *active-triggers* '() "Names of the triggers currently executing.")
 (defvar *params* #() "Bound parameter values, 1-based by position.")
 (defvar *param-names* nil "alist name -> index for named parameters.")

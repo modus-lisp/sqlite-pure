@@ -57,11 +57,21 @@ and may return true when this row became the aggregate's witness (min/max)."
             (funcall (agg-step-fn a) args))))))
   (funcall (agg-final-fn a)))
 
+(defun find-sql-function (lname)
+  "(values scalar-def aggregate-def) for LNAME: a user definition on the
+connection shadows the built-in of that name."
+  (let* ((c (and *db* (conn *db*)))
+         (us (and c (gethash lname (db-user-functions c))))
+         (ua (and c (gethash lname (db-user-aggregates c)))))
+    (cond (us (values us nil))
+          (ua (values nil ua))
+          (t (values (gethash lname *functions*) (gethash lname *aggregates*))))))
+
 (defun compile-function (e scope)
   (destructuring-bind (name args distinct star filter &optional order) (cdr e)
     (let* ((lname (string-downcase-ascii name))
-           (agg (gethash lname *aggregates*))
-           (scalar (gethash lname *functions*))
+           (scalar (nth-value 0 (find-sql-function lname)))
+           (agg (nth-value 1 (find-sql-function lname)))
            (nargs (length args)))
       (when (and star (not (string= lname "count")))
         (sql-error "wrong number of arguments to function ~a()" name))
