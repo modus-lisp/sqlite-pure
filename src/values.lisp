@@ -284,12 +284,15 @@ conversion used for arithmetic on text."
         (:text (value-to-text v))
         (:blob (value-to-blob v))
         (:numeric
+         ;; sqlite3VdbeMemNumerify: integer text stays INTEGER; otherwise the
+         ;; real becomes INTEGER only when integral and below 2^51
          (cond ((integerp v) v)
                ((floatp v) v)
                (t (let* ((s (if (blobp v) (blob-to-text v) v))
                          (n (text-numeric-prefix s)))
                     (if (and (floatp n) (not (float-infinity-p n))
-                             (= n (ftruncate n)) (< (abs n) 9.223372036854775d18))
+                             (or (zerop n)
+                                 (and (= n (ftruncate n)) (< (abs n) 2251799813685248d0))))
                         (truncate n)
                         n))))))))
 

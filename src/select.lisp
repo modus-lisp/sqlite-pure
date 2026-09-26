@@ -445,7 +445,45 @@ source[LI].col = expr where expr references only earlier sources."
         (t
          (lambda (env fn)
            (declare (ignore env))
-           (map-table-rows table fn :wanted (src-wanted src))))))))
+           ;; Like SQLite, scan a covering index instead of the table when
+           ;; one holds every column the query reads (this decides the row
+           ;; order an unordered query, or group_concat, sees).
+           (let ((idx (covering-index table (src-wanted src))))
+             (if idx
+                 (let ((cols (table-columns table))
+                       (n (length (table-columns table))))
+                   (map-index (table-owner table) (index-root idx)
+                              (lambda (vals)
+                                (let ((row (make-array (1+ n) :initial-element :null)))
+                                  (loop for (ci) in (index-columns idx)
+                                        for v in vals
+                                        do (setf (svref row ci)
+                                                 (if (and (integerp v)
+                                                          (eq (column-affinity (aref cols ci)) :real))
+                                                     (safe-double v)
+                                                     v)))
+                                  (let ((rowid (car (last vals))))
+                                    (setf (svref row n) rowid)
+                                    (when (table-rowid-alias table)
+                                      (setf (svref row (table-rowid-alias table)) rowid)))
+                                  (funcall fn row)))))
+                 (map-table-rows table fn :wanted (src-wanted src))))))))))
+
+(defun covering-index (table wanted)
+  "A plain index of a rowid table that contains every WANTED column (the
+narrowest, newest on ties), or NIL."
+  (when (and wanted (not (table-without-rowid table)) (not (table-virtual-p table)))
+    (let ((best nil))
+      (dolist (idx (table-indexes table) best)
+        (let ((cols (mapcar #'first (index-columns idx))))
+          (when (and (null (index-where idx))
+                     (every #'integerp cols)
+                     (loop for i below (length wanted)
+                           always (or (zerop (sbit wanted i))
+                                      (eql i (table-rowid-alias table))
+                                      (member i cols)))
+                     (or (null best) (<= (length cols) (length (index-columns best)))))
+            (setf best idx)))))))
 
 (defun order-term-source-column (e rcols scope)
   "The (depth-0) column of source 0 an ORDER BY term sorts by, or NIL."

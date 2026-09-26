@@ -20,6 +20,12 @@ def lisp_val(v):
         if math.isinf(v): return ':inf' if v > 0 else ':-inf'
         if math.isnan(v): return ':null'
         return '(:f ' + lisp_str(repr(v)) + ')'
+    if isinstance(v, str):
+        try:
+            v.encode('utf-8')
+            return lisp_str(v)
+        except UnicodeEncodeError:   # invalid UTF-8 from SQLite: send the bytes
+            return '(:sx ' + lisp_str(v.encode('utf-8', 'surrogateescape').hex()) + ')'
     if isinstance(v, str): return lisp_str(v)
     if isinstance(v, (bytes, bytearray)): return '(:blob ' + lisp_str(v.hex()) + ')'
     raise TypeError(v)
@@ -48,7 +54,7 @@ def parse_cases(path):
 def run_case(sql):
     con = sqlite3.connect(':memory:', isolation_level=None)
     # invalid UTF-8 in TEXT values reads as U+FFFD, as sqlite-pure decodes it
-    con.text_factory = lambda b: b.decode('utf-8', 'replace')
+    con.text_factory = lambda b: b.decode('utf-8', 'surrogateescape')
     results = []
     for st in split_statements(sql):
         try:

@@ -168,10 +168,18 @@
 ;;; UTF-8 / UTF-16.  Malformed input decodes to U+FFFD rather than
 ;;; signalling: SQLite itself stores whatever bytes it is given.
 
+;;; Invalid UTF-8 in stored text decodes byte by byte to U+DC80..U+DCFF
+;;; ("surrogate escapes"), and those characters encode back to the same
+;;; bytes, so text round-trips exactly as SQLite's does.
+
+(declaim (inline escaped-byte-p))
+(defun escaped-byte-p (code) (<= #xdc80 code #xdcff))
+
 (defun utf8-length (s)
   (loop for c across s
         for code = (char-code c)
         sum (cond ((< code #x80) 1) ((< code #x800) 2)
+                  ((escaped-byte-p code) 1)
                   ((< code #x10000) 3) (t 4))))
 
 (defun utf8-encode-into (s b off)
@@ -182,6 +190,9 @@
                   (setf (aref b off) (logior #xc0 (ash code -6))
                         (aref b (+ off 1)) (logior #x80 (logand code #x3f)))
                   (incf off 2))
+                 ((escaped-byte-p code)
+                  (setf (aref b off) (- code #xdc00))
+                  (incf off 1))
                  ((< code #x10000)
                   (setf (aref b off) (logior #xe0 (ash code -12))
                         (aref b (+ off 1)) (logior #x80 (logand (ash code -6) #x3f))
@@ -242,8 +253,10 @@
                                             (ash (logand (aref b (+ i 2)) #x3f) 6)
                                             (logand (aref b (+ i 3)) #x3f))
                                     4))
-                           (t (values #xfffd 1)))
-                   (setf (char out n) (safe-code-char code))
+                           (t (values (+ #xdc00 c) 1)))
+                   (setf (char out n) (if (and (>= code #xdc80) (<= code #xdcff))
+                                          (or (code-char code) (code-char #xfffd))
+                                          (safe-code-char code)))
                    (incf n)
                    (incf i len)))))
     (if (= n (length out)) out (subseq out 0 n))))

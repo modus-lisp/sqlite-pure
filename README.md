@@ -1,13 +1,24 @@
 # sqlite-pure
 
 A from-scratch **SQLite in pure Common Lisp** — no FFI, no libsqlite3. It
-reads and writes the SQLite 3 file format and runs SQL against it, so a
-database written here opens in the `sqlite3` shell (and passes its
-`PRAGMA integrity_check`), and a database written by SQLite opens here.
+reads and writes the SQLite 3 file format and runs SQL against it: a
+database written here opens in the `sqlite3` shell and passes its
+`PRAGMA integrity_check`; a database written by SQLite opens here; and the
+two can share one file at the same time, using SQLite's own locking
+protocol.
 
-The existing Common Lisp options (cl-sqlite, cl-dbi's driver) are bindings to
-the C library. This one is portable CL with no dependencies, which also means
-it can run where there is no libc to link against.
+The existing Common Lisp options (cl-sqlite, cl-dbi's driver) bind the C
+library. This is portable CL with no dependencies beyond `sb-posix` on
+SBCL (for file locks), which also means it can run where there is no libc
+to link against.
+
+Behaviour is matched against **SQLite 3.40** down to details: type
+affinity, comparison and collation rules, error messages, which of two
+equal rows a `UNION` keeps, which index a scan uses (it decides the order
+`group_concat` sees), and decimal ↔ double conversion (SQLite's parser and
+`printf` work in x87 long double and are not correctly rounded; that is
+reproduced bit for bit — except, measured, about 1 literal in 6 000 whose
+parse lands 1 ulp away).
 
 ## Use
 
@@ -33,7 +44,7 @@ it can run where there is no libc to link against.
 | `execute db sql &rest params` | rows if the last statement returns any, else its change count |
 | `execute-script db sql` | several statements, no parameters |
 | `do-query ((a b) db sql &rest params) body` | iterate rows |
-| `with-transaction (db) body` | commit on normal exit, roll back on unwind |
+| `with-transaction (db) body` | commit on normal exit, roll back on unwind; nests as a savepoint |
 | `last-insert-rowid`, `changes` | |
 
 Parameters are `?`, `?NNN`, `:name`, `@name`, `$name` (named parameters are
@@ -41,107 +52,126 @@ numbered in order of first appearance, as SQLite does). Values map as
 **NULL** ↔ `:null` (a Lisp `nil` parameter also binds NULL), **INTEGER** ↔
 integer, **REAL** ↔ `double-float`, **TEXT** ↔ string, **BLOB** ↔
 `(unsigned-byte 8)` vector. Errors are `sqlp:sqlite-error` (subclasses for
-constraint, parse and corruption errors), with SQLite's own message text.
+constraint, parse and corruption errors) carrying SQLite's own message.
+`sqlp::*busy-timeout*` (seconds, default 5) bounds waiting for a lock.
 
 ## What is implemented
 
-**File format.** Table and index b-trees (interior/leaf, all four page
-types), cell overflow chains, the freelist (trunk and leaf pages), page sizes
-512–65536, UTF-8 and UTF-16 databases, `WITHOUT ROWID` tables, reading
-WAL-mode databases (committed frames of `-wal` are applied; such a database
-opens read-only). Writes use a rollback journal in SQLite's own format, so a
-crash mid-commit leaves a hot journal that both this library and SQLite roll
-back.
+**File format.** Table and index b-trees (all four page types), overflow
+chains, the freelist, page sizes 512–65536, UTF-8 and UTF-16 databases,
+`WITHOUT ROWID` tables, reading WAL-mode databases (committed `-wal` frames
+are applied; such a database opens read-only). Writes go through a rollback
+journal in SQLite's format: a crash mid-commit leaves a hot journal that
+both this library and SQLite roll back. Pages split on insert and merge
+through their parent on delete, keeping every leaf at the same depth.
+`auto_vacuum` databases open read-only (pointer maps are not maintained).
 
-**SQL.** `SELECT` with joins (inner, left, cross, `USING`, `NATURAL`),
-`WHERE`/`GROUP BY`/`HAVING`/`ORDER BY` (`NULLS FIRST/LAST`, `COLLATE`)/
-`LIMIT`/`OFFSET`, `DISTINCT`, aggregates (with `DISTINCT` and `FILTER`),
-subqueries (scalar, `IN`, `EXISTS`, correlated, in `FROM`), `UNION [ALL]`/
-`INTERSECT`/`EXCEPT`, `VALUES`, common table expressions including
-`WITH RECURSIVE`, views, row values. `INSERT` (`VALUES`, `SELECT`,
-`DEFAULT VALUES`, `OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`, upsert
-`ON CONFLICT ... DO UPDATE/NOTHING`, `RETURNING`), `UPDATE`, `DELETE`.
-`CREATE/DROP TABLE` (constraints: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`,
-`CHECK`, `DEFAULT`, `COLLATE`, `AUTOINCREMENT`), `CREATE TABLE ... AS`,
-`CREATE/DROP INDEX` (unique, multi-column, `DESC`, collations, partial,
-expressions), `CREATE/DROP VIEW`, triggers, `ALTER TABLE` (rename table,
-rename/add/drop column), `BEGIN`/`COMMIT`/`ROLLBACK`, and the common
-`PRAGMA`s (`table_info`, `index_list`, `index_info`, `user_version`,
-`integrity_check`, `page_size`, ...).
+**Concurrency.** SQLite's POSIX byte-range locking protocol (SHARED /
+RESERVED / PENDING / EXCLUSIVE, via `sb-posix` on SBCL), a busy timeout,
+hot-journal recovery only under the lock, and page-cache validation against
+the header change counter at every read transaction — so SQLite processes
+and this library can use a file concurrently.
 
-**Semantics.** SQLite's type affinity rules, comparison affinity and
-collation selection (`BINARY`, `NOCASE`, `RTRIM`), three-valued logic,
-64-bit integer arithmetic overflowing to REAL, SQLite's REAL-to-text
-formatting (`%!.15g` with its own digit generation), and the functions:
-`abs changes char coalesce concat concat_ws date datetime format glob hex
-ifnull iif instr julianday last_insert_rowid length like likely lower ltrim
+**SQL.** `SELECT` with every join type (inner, `LEFT`, `RIGHT`, `FULL`,
+cross, `USING`, `NATURAL`), `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY` (`NULLS
+FIRST/LAST`, `COLLATE`)/`LIMIT`/`OFFSET`, `DISTINCT`, aggregates (with
+`DISTINCT` and `FILTER`), **window functions** (`OVER`, `PARTITION BY`,
+`ROWS`/`RANGE`/`GROUPS` frames, named windows), subqueries (scalar, `IN`,
+`EXISTS`, correlated, in `FROM`), `UNION [ALL]`/`INTERSECT`/`EXCEPT`,
+`VALUES`, CTEs including `WITH RECURSIVE`, views, row values, table-valued
+`json_each`/`json_tree` (with lateral references).
+`INSERT` (`VALUES`, `SELECT`, `DEFAULT VALUES`, `OR REPLACE/IGNORE/ABORT/
+FAIL/ROLLBACK`, upsert `ON CONFLICT … DO UPDATE/NOTHING`, `RETURNING`),
+`UPDATE` (including `UPDATE … FROM`), `DELETE`.
+`CREATE/DROP TABLE` (`PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`,
+`DEFAULT`, `COLLATE`, `AUTOINCREMENT`, **generated columns**, **STRICT**,
+**foreign keys** with `ON DELETE/UPDATE` actions and deferred checking),
+`CREATE TABLE … AS`, indexes (unique, multi-column, `DESC`, collations,
+partial, on expressions), views, **triggers** (`BEFORE`/`AFTER`/`INSTEAD
+OF`, `WHEN`, `RAISE`), `ALTER TABLE` (rename table, rename/add/drop column),
+`BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`, **`TEMP`
+tables and `ATTACH`/`DETACH`**, `VACUUM` and `VACUUM INTO`, and the common
+`PRAGMA`s (`table_info`, `table_xinfo`, `index_list`, `index_info`,
+`foreign_key_list`, `foreign_keys`, `user_version`, `application_id`,
+`integrity_check`, `page_size`, `page_count`, `freelist_count`,
+`database_list`, `table_list`, `encoding`, …).
+
+**Functions.** Core: `abs changes char coalesce concat concat_ws format
+glob hex ifnull iif instr last_insert_rowid length like likely lower ltrim
 max min nullif octet_length printf quote random randomblob replace round
-rtrim sign soundex sqlite_version strftime substr substring time
-total_changes trim typeof unhex unicode unixepoch unlikely upper zeroblob`
-and the aggregates `avg count group_concat max min string_agg sum total`.
+rtrim sign soundex sqlite_version substr substring total_changes trim
+typeof unhex unicode unlikely upper zeroblob`. Aggregates: `avg count
+group_concat max min string_agg sum total`. Window: `row_number rank
+dense_rank percent_rank cume_dist ntile lag lead first_value last_value
+nth_value`. Date/time: `date time datetime julianday unixepoch strftime`
+(with SQLite's modifiers). Math: `acos acosh asin asinh atan atan2 atanh
+ceil ceiling cos cosh degrees exp floor ln log log10 log2 mod pi pow power
+radians sin sinh sqrt tan tanh trunc`. JSON: `json json_valid json_quote
+json_array json_object json_extract -> ->> json_type json_array_length
+json_set json_insert json_replace json_remove json_patch json_group_array
+json_group_object json_each json_tree`.
 
 **Query planning.** Each join level uses a rowid lookup, a rowid range, an
-index prefix seek, or a scan, chosen from the `WHERE`/`ON` conjuncts with
+index prefix seek, or a scan, chosen from the `WHERE`/`ON` terms with
 SQLite's rules for when an index may be used under affinity and collation.
-Every conjunct is still evaluated as a filter, so the plan can only narrow
-the candidate rows, never change the answer.
+`ORDER BY` is satisfied from rowid or index order where possible (in either
+direction, stopping early for `LIMIT`); otherwise `ORDER BY … LIMIT` keeps
+only the best rows. Only referenced columns are decoded; `count(*)` comes
+from cell counts. Every `WHERE` term is still evaluated as a filter, so a
+plan can only narrow the candidate rows, never change the answer.
 
 ## Not implemented
 
-Window functions, JSON functions, virtual tables (FTS, R-tree),
-`ATTACH`, `SAVEPOINT`, `TEMP` tables (they are created in the main
-database), foreign key enforcement (SQLite's default is off too), writing to
-WAL-mode databases, file locking (one process at a time), `VACUUM`, and
-`EXPLAIN`. Durability depends on the Lisp's `finish-output`; there is no
-portable `fsync`.
+Virtual tables (FTS, R-tree, `pragma_*` table-valued functions), writing to
+WAL-mode databases, maintaining `auto_vacuum` pointer maps, window `EXCLUDE`
+clauses, `ORDER BY` inside aggregate calls, recursive triggers, `EXPLAIN`,
+user-defined SQL functions and collations. Durability depends on the Lisp's
+`finish-output`; there is no portable `fsync`. File locks need SBCL
+(elsewhere they are no-ops, and cache validation still applies).
+
+## Performance (SBCL, one core)
+
+About 60 000 inserts/s inside a transaction (indexed table), ~1.2 M rows/s
+for a full scan with a filter, microsecond rowid and index lookups, and
+`ORDER BY id DESC LIMIT 10` over 300 000 rows in 2 ms.
 
 ## Testing
 
 Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 
-* **Differential SQL suite** — `test/cases/*.test` hold SQL scripts;
-  `test/gen-expected.py` runs them through SQLite and records every
-  statement's rows or error; `test/differential.lisp` replays them here and
-  compares values, column names and error messages.
-* **File-format fuzzer** — `test/run-fuzz.sh FIRST COUNT` generates random
-  workloads (inserts/updates/deletes/replaces of values from a few bytes to
-  70 KB, index churn, rolled-back transactions, `WITHOUT ROWID`,
-  `AUTOINCREMENT`), runs each through both engines into separate files, and
-  requires that (1) SQLite's `integrity_check` passes on the file written
-  here, (2) both files hold identical contents, and (3) this library reads
-  SQLite's file identically.
-
-```sh
-python3 test/gen-expected.py            # regenerate expectations
-sh test/run-tests.sh                    # differential suite
-sh test/run-fuzz.sh 1 20                # 20 fuzz seeds
-```
+| script | what |
+|---|---|
+| `test/run-tests.sh` (also `(asdf:test-system "sqlite-pure")`) | **differential suite**: `test/cases/*.test` are SQL scripts; `test/gen-expected.py` records SQLite's rows or error for every statement; each is replayed here and compared, error messages included |
+| `test/run-qfuzz.sh FIRST N Q` | **query fuzzer**: random expressions, joins, subqueries, compounds, windows and CTEs over random mixed-type data, compared statement by statement |
+| `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
+| `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
+| `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
+| `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |
 
 ## Layout
 
 ```
 src/
   util       conditions, octets, big-endian ints, varints, UTF-8/16, IEEE doubles
-  pager      pages, header, freelist, transactions, rollback + hot journal, WAL read
-  record     the record format (serial types)
-  btree      table/index b-trees: traversal, insert with splits, delete with collapse
-  values     storage classes, comparison, collation, affinity, CAST
-  lexer      tokens
-  parser     SQL -> AST
-  schema     sqlite_schema -> tables, columns, indexes, triggers
+  pager      pages, header, freelist, transactions, savepoints, journals, WAL read
+  locking    SQLite's file locks and cache validation
+  record     the record format
+  btree      b-trees: traversal (both directions), insert with splits, delete with merges
+  values     storage classes, comparison, collation, affinity, CAST, SQLite's AtoF
+  lexer, parser        SQL -> AST
+  schema     sqlite_schema -> tables, columns, indexes, foreign keys, triggers
   expr       expression compiler (closures)
-  select     query engine: sources, join planning, aggregates, sorting, compounds, CTEs
-  functions  scalar and aggregate functions
-  printf     printf() and SQLite's float formatting
-  datetime   date and time functions (after SQLite's date.c)
+  select     query engine: sources, joins, planning, aggregates, sorting, compounds, CTEs
+  window     window functions
+  functions, printf, math, datetime, json    built-in functions
   triggers   trigger execution
+  fkeys      foreign key enforcement
   dml        INSERT / UPDATE / DELETE, constraints, conflicts, upsert, RETURNING
   ddl        CREATE / DROP / ALTER and sqlite_schema maintenance
   integrity  PRAGMA integrity_check
-  api        public API, statement dispatch, transactions, PRAGMAs
-test/
-  cases/*.test, gen-expected.py, expected.sexp, differential.lisp
-  fuzz.py, fuzz.lisp, run-fuzz.sh
+  api        public API, statements, transactions, ATTACH, PRAGMAs
+  vacuum     VACUUM
+test/        see above
 ```
 
 ## License

@@ -281,7 +281,14 @@ and may return true when this row became the aggregate's witness (min/max)."
 (defsqlfun "unicode" (1 1) (args)
   (let ((v (first args)))
     (with-null-args (v)
-      (let ((s (c-string (text-of v)))) (if (plusp (length s)) (char-code (char s 0)) :null)))))
+      (let ((s (c-string (text-of v))))
+        (if (zerop (length s))
+            :null
+            (let ((code (char-code (char s 0))))
+              ;; an invalid byte, as SQLite's UTF-8 reader sees it
+              (if (<= #xdc80 code #xdcff)
+                  (if (>= (- code #xdc00) #xc0) #xfffd (- code #xdc00))
+                  code)))))))
 
 (defsqlfun "zeroblob" (1 1) (args)
   (let ((n (value-to-integer (first args)))) (make-octets (if (integerp n) (max 0 n) 0))))
