@@ -89,6 +89,37 @@ def main():
         elif k < 0.9:
             lines.append('SELECT a.rowid, b.rowid FROM a JOIN b ON %s ORDER BY 1, 2;'
                          % expr(r, 2, ['a.x', 'a.y', 'a.z', 'a.v', 'b.k', 'b.x']))
+        elif k < 0.93:
+            shape = r.randint(0, 8)
+            e1, e2 = expr(r, 2, COLS_A), expr(r, 2, COLS_A)
+            if shape == 0:
+                lines.append('SELECT a.rowid, b.rowid FROM a LEFT JOIN b ON %s ORDER BY 1, 2;'
+                             % expr(r, 2, ['a.x', 'a.y', 'a.z', 'b.k', 'b.x']))
+            elif shape == 1:
+                lines.append('SELECT rowid FROM a WHERE %s IN (SELECT k FROM b WHERE %s) ORDER BY rowid;'
+                             % (r.choice(COLS_A), expr(r, 1, ['k', 'x'])))
+            elif shape == 2:
+                lines.append('SELECT rowid, (SELECT count(*) FROM b WHERE b.x %s a.x) FROM a ORDER BY rowid;'
+                             % r.choice(['=', '<', '>=', 'IS NOT']))
+            elif shape == 3:
+                op = r.choice(['UNION', 'UNION ALL', 'INTERSECT', 'EXCEPT'])
+                lines.append('SELECT %s FROM a %s SELECT %s FROM b ORDER BY 1;' % (r.choice(COLS_A), op, r.choice(['k', 'x'])))
+            elif shape == 4:
+                w = r.choice(['row_number()', 'rank()', 'dense_rank()', 'sum(x)', 'count(y)', 'max(z)', 'lag(y)', 'first_value(u)'])
+                lines.append('SELECT rowid, %s OVER (PARTITION BY %s ORDER BY %s, rowid) FROM a ORDER BY rowid;'
+                             % (w, r.choice(['NULL', 'x > 0', 'typeof(y)']), r.choice(COLS_A)))
+            elif shape == 5:
+                lines.append('WITH t(p, q) AS (SELECT %s, %s FROM a) SELECT p, q FROM t WHERE %s ORDER BY 1, 2;'
+                             % (e1, e2, expr(r, 1, ['p', 'q'])))
+            elif shape == 6:
+                lines.append('SELECT typeof(%s), count(*) FROM a GROUP BY 1 HAVING count(*) > %d ORDER BY 1;'
+                             % (e1, r.randint(0, 3)))
+            elif shape == 7:
+                lines.append('SELECT rowid FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.%s) ORDER BY rowid;'
+                             % r.choice(COLS_A))
+            else:
+                lines.append('SELECT %s FROM a ORDER BY %s NULLS %s, rowid LIMIT %d OFFSET %d;'
+                             % (e1, e2, r.choice(['FIRST', 'LAST']), r.randint(0, 10), r.randint(0, 5)))
         else:
             c = r.choice(['x', 'y', 'v', 'u'])
             lines.append('SELECT DISTINCT %s FROM a ORDER BY 1;' % c if r.random() < 0.5

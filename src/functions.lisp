@@ -227,13 +227,17 @@ and may return true when this row became the aggregate's witness (min/max)."
   (destructuring-bind (a b) args
     (if (and (not (eq a :null)) (not (eq b :null)) (zerop (compare-values a b))) :null a)))
 
-(defun scalar-minmax (args sign)
+(defun scalar-minmax (args maxp)
+  ;; minmaxFunc: among equal values min() keeps the last, max() the first
   (if (some (lambda (a) (eq a :null)) args)
       :null
-      (reduce (lambda (a b) (if (funcall sign (compare-values b a)) b a)) args)))
+      (reduce (lambda (best v)
+                (let ((c (compare-values best v)))
+                  (if (if maxp (minusp c) (>= c 0)) v best)))
+              args)))
 
-(defsqlfun "max" (1 nil) (args) (scalar-minmax args #'plusp))
-(defsqlfun "min" (1 nil) (args) (scalar-minmax args #'minusp))
+(defsqlfun "max" (1 nil) (args) (scalar-minmax args t))
+(defsqlfun "min" (1 nil) (args) (scalar-minmax args nil))
 
 (defsqlfun "hex" (1 1) (args)
   (let* ((v (first args))
@@ -259,7 +263,7 @@ and may return true when this row became the aggregate's witness (min/max)."
            ;; SQLite 3.40: "%!.15g", or "%!.20e" when that does not read back
            ;; (through SQLite's own AtoF) as the same double
            (let ((s (format-real v)))
-             (if (eql (text-numeric-value s) v)
+             (if (eql (text-numeric-value s) (if (zerop v) 0d0 v))
                  s
                  (sql-float-text v :exp 20 :alt2 t))))
           ((stringp v) (with-output-to-string (o)

@@ -36,7 +36,9 @@
   (prog1 (peek-tok p) (incf (ps-pos p))))
 
 (defun perr (p fmt &rest args)
-  (apply #'parse-error-at (ps-sql p) (tok-pos (peek-tok p)) fmt args))
+  (if (eq (tok-kind (peek-tok p)) :eof)
+      (error 'sqlite-parse-error :message "incomplete input")
+      (apply #'parse-error-at (ps-sql p) (tok-pos (peek-tok p)) fmt args)))
 
 (defun kw-tok-p (tok kw)
   (and (eq (tok-kind tok) :id) (not (tok-quoted tok)) (name= (tok-value tok) kw)))
