@@ -14,10 +14,13 @@
 (defun eval-on-row (fn table row)
   "Evaluate compiled FN (compiled against TABLE-SCOPE) on ROW."
   (declare (ignore table))
-  (funcall fn (make-env :rows (vector row))))
+  (funcall fn (row-env row)))
 
 (defun table-scope (table &optional alias)
-  (make-scope :srcs (list (make-table-src table alias))))
+  (make-scope :srcs (list (make-table-src table alias)) :parent *outer-scope*))
+
+(defun row-env (&rest rows)
+  (make-env :rows (coerce rows 'vector) :parent *outer-env*))
 
 (defvar *index-expr-cache* nil)
 
@@ -357,16 +360,14 @@
             (t
              (write-row table row)
              (unless (table-without-rowid table)
-               (setf (db-last-insert-rowid *db*) (svref row (length (table-columns table))))
-               (when (table-autoincrement table)
-                 (update-sequence table (svref row (length (table-columns table))))))
+               (setf (db-last-insert-rowid *db*) (svref row (length (table-columns table)))))
              (incf (wc-changes ctx))
              (collect-returning ctx row)
              t)))))
 
 (defun collect-returning (ctx row)
   (when (wc-returning-fns ctx)
-    (let ((env (make-env :rows (vector row))))
+    (let ((env (row-env row)))
       (push (mapcar (lambda (f) (funcall f env)) (wc-returning-fns ctx)) (wc-returned ctx)))))
 
 (defun run-upsert (ctx existing clause proposed)
@@ -375,8 +376,8 @@
         :ignore
         (let* ((src (make-table-src table))
                (exsrc (make-table-src table "excluded"))
-               (scope (make-scope :srcs (list src exsrc)))
-               (env (make-env :rows (vector existing proposed)))
+               (scope (make-scope :srcs (list src exsrc) :parent *outer-scope*))
+               (env (row-env existing proposed))
                (where (getf clause :update-where)))
           (setf (src-rowid-p exsrc) nil
                 (src-hidden exsrc) (loop for i below (length (table-columns table)) collect i))
@@ -424,10 +425,20 @@
 ;;; ------------------------------------------------------------------
 ;;; Statements
 
-(defun writable-table (name)
+(defun view-as-table (table)
+  "A TABLE whose columns are the view's result columns."
+  (let ((copy (copy-table table)))
+    (setf (table-columns copy)
+          (map 'vector (lambda (c) (setf (column-affinity c) :blob (column-collation c) :binary) c)
+               (view-column-info table)))
+    copy))
+
+(defun writable-table (name &optional event)
   (let ((table (lookup-table *db* name)))
     (when (table-view-select table)
-      (sql-error "cannot modify ~a because it is a view" name))
+      (if (and event (triggers-for table event :instead-of))
+          (return-from writable-table (view-as-table table))
+          (sql-error "cannot modify ~a because it is a view" name)))
     (when (and (= (table-root table) 1))
       (sql-error "table ~a may not be modified" name))
     table))
@@ -460,7 +471,9 @@
     (let* ((*ctes* *ctes*)
            (tb (progn (when with (register-ctes (make-sel :with (first with)
                                                           :recursive (second with))))
-                      (writable-table table)))
+                      (writable-table table :insert)))
+           (view (table-view-select tb))
+           (triggers (table-has-triggers-p tb))
            (ncols (length (table-columns tb)))
            (targets (if columns
                         (mapcar (lambda (c)
@@ -472,13 +485,13 @@
                               unless (column-generated (aref (table-columns tb) i)) collect i)))
            (rows (cond ((eq source :default) (list '()))
                        (t (let ((sel source))
-                            (multiple-value-bind (fn cols) (compile-select sel (make-scope))
+                            (multiple-value-bind (fn cols) (compile-select sel (root-scope))
                               (unless (= (length cols) (length targets))
                                 (if columns
                                     (sql-error "~d values for ~d columns" (length cols) (length targets))
                                     (sql-error "table ~a has ~d columns but ~d values were supplied"
                                                table (length targets) (length cols))))
-                              (funcall fn nil)))))))
+                              (funcall fn *outer-env*)))))))
       (multiple-value-bind (ctx rnames) (make-ctx-for tb conflict returning alias upsert)
         (dolist (vals rows)
           (let ((row (make-array (1+ ncols) :initial-element :unset)))
@@ -492,17 +505,58 @@
               (when (eq (svref row i) :unset)
                 (setf (svref row i) (column-default-value (aref (table-columns tb) i)))))
             (apply-row-affinity tb row)
-            (finalize-rowid tb row)
-            (insert-prepared-row ctx row)))
+            (cond
+              (view
+               (fire-triggers tb :insert :instead-of nil row)
+               (incf (wc-changes ctx)))
+              ((and triggers
+                    (eq :ignore (fire-triggers tb :insert :before nil (before-insert-image tb row)))))
+              (t
+               (finalize-rowid tb row)
+               ;; SQLite advances the AUTOINCREMENT counter as soon as a rowid
+               ;; is chosen, even if the row is then ignored.
+               (when (table-autoincrement tb)
+                 (update-sequence tb (svref row ncols)))
+               (when (and (eq (insert-prepared-row ctx row) t) triggers)
+                 (fire-triggers tb :insert :after nil row))))))
         (setf (db-changes *db*) (wc-changes ctx))
         (incf (db-total-changes *db*) (wc-changes ctx))
         (values (reverse (wc-returned ctx)) rnames)))))
 
+(defun before-insert-image (table row)
+  "NEW as a BEFORE INSERT trigger sees it: an unassigned rowid reads -1."
+  (let* ((n (length (table-columns table)))
+         (img (copy-seq row))
+         (alias (table-rowid-alias table)))
+    (unless (table-without-rowid table)
+      (let ((v (if alias (svref img alias) (svref img n))))
+        (when (eq v :null)
+          (setf (svref img n) -1)
+          (when alias (setf (svref img alias) -1)))
+        (when (and alias (integerp v)) (setf (svref img n) v))))
+    img))
+
+(defun scan-view-rows (table alias where)
+  "Rows of a view (as vectors) satisfying WHERE."
+  (let* ((fs (let ((*ctes* '()))
+               (select-derived-source (table-view-select table) (or alias (table-name table))
+                                      (make-scope) (table-view-columns table))))
+         (scope (make-scope :srcs (list (fsrc-src fs)) :parent *outer-scope*))
+         (env (make-env :rows (make-array 1) :parent *outer-env*))
+         (out '()))
+    (multiple-value-bind (levels finals) (build-levels (list fs) scope where)
+      (run-levels levels env (lambda ()
+                               (when (all-true finals env)
+                                 (push (svref (env-rows env) 0) out)))))
+    (nreverse out)))
+
 (defun scan-table-rows (table alias where)
   "All rows of TABLE (vectors) satisfying WHERE."
+  (when (table-view-select table)
+    (return-from scan-table-rows (scan-view-rows table alias where)))
   (let* ((fs (make-fsrc :src (make-table-src table alias) :table table :join :first))
-         (scope (make-scope :srcs (list (fsrc-src fs))))
-         (env (make-env :rows (make-array 1)))
+         (scope (make-scope :srcs (list (fsrc-src fs)) :parent *outer-scope*))
+         (env (make-env :rows (make-array 1) :parent *outer-env*))
          (out '()))
     (multiple-value-bind (levels finals) (build-levels (list fs) scope where)
       (run-levels levels env (lambda ()
@@ -515,7 +569,10 @@
     (when from (sql-error "UPDATE ... FROM is not supported"))
     (let* ((*ctes* *ctes*)
            (tb (progn (when with (register-ctes (make-sel :with (first with) :recursive (second with))))
-                      (writable-table table)))
+                      (writable-table table :update)))
+           (view (table-view-select tb))
+           (triggers (table-has-triggers-p tb))
+           (changed (loop for (cols) in sets append cols))
            (scope (table-scope tb alias))
            (assigns (loop for (cols e) in sets
                           collect (cons (mapcar (lambda (c)
@@ -528,17 +585,22 @@
       (multiple-value-bind (ctx rnames) (make-ctx-for tb conflict returning alias)
         (dolist (old rows)
           (let ((new (copy-seq old))
-                (env (make-env :rows (vector old))))
+                (env (row-env old)))
             (dolist (a assigns)
               (let ((v (funcall (cdr a) env)))
                 (dolist (ci (car a))
                   (if (eq ci :rowid)
                       (setf (svref new (length (table-columns tb))) v)
                       (setf (svref new ci) v)))))
-            ;; the row may have been removed by an earlier REPLACE
-            (when (or (table-without-rowid tb)
-                      (table-lookup *db* (table-root tb) (svref old (length (table-columns tb)))))
-              (update-one ctx old new))))
+            (cond
+              (view (fire-triggers tb :update :instead-of old new changed)
+                    (incf (wc-changes ctx)))
+              ;; the row may have been removed by an earlier REPLACE or trigger
+              ((not (or (table-without-rowid tb)
+                        (table-lookup *db* (table-root tb) (svref old (length (table-columns tb)))))))
+              ((and triggers (eq :ignore (fire-triggers tb :update :before old new changed))))
+              (t (when (and (eq (update-one ctx old new) t) triggers)
+                   (fire-triggers tb :update :after old new changed))))))
         (setf (db-changes *db*) (wc-changes ctx))
         (incf (db-total-changes *db*) (wc-changes ctx))
         (values (reverse (wc-returned ctx)) rnames)))))
@@ -547,9 +609,11 @@
   (destructuring-bind (&key with table alias where returning) (cdr st)
     (let* ((*ctes* *ctes*)
            (tb (progn (when with (register-ctes (make-sel :with (first with) :recursive (second with))))
-                      (writable-table table))))
+                      (writable-table table :delete)))
+           (view (table-view-select tb))
+           (triggers (table-has-triggers-p tb)))
       (multiple-value-bind (ctx rnames) (make-ctx-for tb nil returning alias)
-        (if (and (null where) (null returning))
+        (if (and (null where) (null returning) (not triggers) (not view))
             ;; truncate: drop every page but the roots
             (let ((n 0))
               (map-table-rows tb (lambda (row) (declare (ignore row)) (incf n)))
@@ -559,9 +623,16 @@
                   (clear-btree *db* (index-root idx) :keep-root t)))
               (setf (wc-changes ctx) n))
             (dolist (row (scan-table-rows tb alias where))
-              (delete-row tb row)
-              (incf (wc-changes ctx))
-              (collect-returning ctx row)))
+              (cond
+                (view (fire-triggers tb :delete :instead-of row nil)
+                      (incf (wc-changes ctx)))
+                ((and triggers (eq :ignore (fire-triggers tb :delete :before row nil))))
+                ((and triggers (not (table-without-rowid tb))
+                      (not (table-lookup *db* (table-root tb) (svref row (length (table-columns tb)))))))
+                (t (delete-row tb row)
+                   (incf (wc-changes ctx))
+                   (collect-returning ctx row)
+                   (when triggers (fire-triggers tb :delete :after row nil))))))
         (setf (db-changes *db*) (wc-changes ctx))
         (incf (db-total-changes *db*) (wc-changes ctx))
         (values (reverse (wc-returned ctx)) rnames)))))

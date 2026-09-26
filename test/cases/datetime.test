@@ -1,0 +1,14 @@
+== date-basics
+SELECT date('2024-02-29'), time('13:45:10'), datetime('2024-01-15 08:30:00'), julianday('2000-01-01 12:00:00');
+SELECT date('2024-01-31', '+1 month'), date('2024-03-31', '-1 month'), date('2023-02-28', '+1 day'), date('2024-02-28', '+1 day');
+SELECT datetime('2024-01-01 00:00:00', '+90 minutes', '+30 seconds'), datetime('2024-01-01', '-1 hours');
+SELECT date('2024-05-17', 'start of month'), date('2024-05-17', 'start of year'), datetime('2024-05-17 13:14:15', 'start of day');
+SELECT date('2024-05-17', 'weekday 0'), date('2024-05-19', 'weekday 0'), date('2024-05-17', 'weekday 3');
+SELECT datetime(1700000000, 'unixepoch'), unixepoch('2024-01-01'), unixepoch('1970-01-01 00:00:01');
+SELECT date(2460000.5), datetime(2451545.0), julianday('2024-01-01') - julianday('2023-01-01');
+SELECT strftime('%Y/%m/%d %H:%M:%S', '2024-03-05 07:08:09'), strftime('%j %w %W', '2024-12-31'), strftime('%s', '2024-01-01'), strftime('%f', '12:00:01.5');
+SELECT date('2024-13-01'), date('garbage'), date(NULL), date('2024-01-01', 'bogus'), time('25:00');
+SELECT datetime('2024-01-01T10:00:00Z'), datetime('2024-01-01 10:00:00+02:00'), datetime('2024-01-01 10:00:00.123');
+SELECT date('2024-01-31', '+1 year'), date('2024-02-29', '+1 year'), date('2024-02-29', '-4 years'), datetime('2024-01-01', '+1.5 days');
+SELECT datetime('2024-01-01 12:00', '+01:30'), datetime('2024-01-01 12:00', '-00:15:30'), strftime('%J', '2024-01-01 06:00');
+SELECT typeof(date('now')), length(datetime('now')), julianday('now') > 2460000;

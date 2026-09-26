@@ -336,12 +336,12 @@ and may return true when this row became the aggregate's witness (min/max)."
 
 (defsqlfun "glob" (2 2) (args)
   (destructuring-bind (pat s) args
-    (with-null-args (pat s) (bool (glob-match (text-of pat) (text-of s))))))
+    (with-null-args (pat s) (bool (glob-match (c-string (text-of pat)) (c-string (text-of s)))))))
 
 (defsqlfun "like" (2 3) (args)
   (destructuring-bind (pat s &optional esc) args
     (with-null-args (pat s)
-      (bool (like-match (text-of pat) (text-of s)
+      (bool (like-match (c-string (text-of pat)) (c-string (text-of s))
                         (and esc (not (eq esc :null)) (char (text-of esc) 0)))))))
 
 (defsqlfun "concat" (1 nil) (args)

@@ -26,6 +26,8 @@
      (:file "select")
      (:file "functions")
      (:file "printf")
+     (:file "datetime")
+     (:file "triggers")
      (:file "dml")
      (:file "ddl")
      (:file "integrity")

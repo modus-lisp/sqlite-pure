@@ -8,6 +8,7 @@
 (in-package #:sqlite-pure)
 
 (defvar *db* nil "The database a statement is running against.")
+(defvar *active-triggers* '() "Names of the triggers currently executing.")
 (defvar *params* #() "Bound parameter values, 1-based by position.")
 (defvar *param-names* nil "alist name -> index for named parameters.")
 
@@ -188,6 +189,10 @@
 
 ;;; ------------------------------------------------------------------
 ;;; LIKE and GLOB
+
+(defun c-string (s)
+  "S up to its first NUL: SQLite's pattern matchers see C strings."
+  (let ((z (position (code-char 0) s))) (if z (subseq s 0 z) s)))
 
 (defun like-match (pattern string escape)
   "SQL LIKE: % and _, ASCII case-insensitive."
@@ -532,7 +537,7 @@
               (ec (and fe (funcall fe env))))
           (if (or (eq s :null) (eq p :null) (eq ec :null))
               :null
-              (let* ((ss (value-to-text s)) (ps (value-to-text p))
+              (let* ((ss (c-string (value-to-text s))) (ps (c-string (value-to-text p)))
                      (m (if (eq kind :glob)
                             (glob-match ps ss)
                             (let ((escs (and ec (value-to-text ec))))
@@ -564,12 +569,15 @@
   (destructuring-bind (kind msg) (cdr e)
     (let ((k (string-upcase-ascii kind))
           (m (and msg (second msg))))
+      (unless *active-triggers*
+        (sql-error "RAISE() may only be used within a trigger-program"))
       (lambda (env)
         (declare (ignore env))
         (cond ((string= k "IGNORE") (throw :raise-ignore :ignore))
-              (t (error 'sqlite-constraint-error
-                        :message (or m "raise")
-                        :code (if (string= k "ROLLBACK") :rollback :constraint))))))))
+              (t (conflict-fail (cond ((string= k "ROLLBACK") :rollback)
+                                      ((string= k "FAIL") :fail)
+                                      (t :abort))
+                                "~a" (or m "raise"))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Subqueries (the select engine provides COMPILE-SUBSELECT)
