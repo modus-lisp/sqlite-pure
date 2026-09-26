@@ -9,7 +9,12 @@
 
 (defun build-compact-copy (db)
   "A new in-memory database holding DB's schema and contents."
-  (let ((new (%make-db :encoding (db-encoding db) :pending-page-size (db-page-size db)))
+  (let ((new (%make-db :encoding (db-encoding db) :pending-page-size (db-page-size db)
+                       :pending-autovacuum
+                       (let ((p (db-pending-autovacuum db)))
+                         (cond ((member p '(:full :incremental)) p)
+                               ((eq p :none) nil)
+                               ((autovacuum-p db) (if (incremental-p db) :incremental :full))))))
         (rows (schema-rows (db-schema* db))))
     (flet ((run (sql) (let ((*db* new)) (run-sql new sql '()))))
       ;; tables (sqlite_sequence is created by AUTOINCREMENT tables)

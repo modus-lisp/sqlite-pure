@@ -150,6 +150,11 @@
                                      (return)))))))))
                      nrows)))
                (schema-tables schema))))
+          ;; auto-vacuum: pointer-map pages are used, and must be right
+          (when (autovacuum-p db)
+            (loop for pg from 2 to npages
+                  do (when (ptrmap-page-p db pg) (claim pg "pointer map")))
+            (dolist (p (ptrmap-problems db)) (problem "~a" p)))
           ;; every page used exactly once
           (loop for pg from 1 to npages
                 do (unless (or (aref owner pg) (= pg (pending-byte-page db)))

@@ -56,6 +56,7 @@
   (changes 0)
   (total-changes 0)
   (pending-page-size nil)
+  (pending-autovacuum nil)   ; :full or :incremental for a new database (or the next VACUUM)
   (lock :none)               ; :none :shared :reserved :exclusive
   (wal nil)
   ;; several databases per connection (TEMP, ATTACH)
@@ -201,6 +202,9 @@
       (setf (aref b 18) 1 (aref b 19) 1 (aref b 20) 0
             (aref b 21) 64 (aref b 22) 32 (aref b 23) 32)
       (put-u32 b +hdr-schema-format+ 4)
+      (when (member (db-pending-autovacuum db) '(:full :incremental))
+        (put-u32 b 52 1)
+        (put-u32 b 64 (if (eq (db-pending-autovacuum db) :incremental) 1 0)))
       (put-u32 b +hdr-text-encoding+ (ecase (db-encoding db) (:utf-8 1) (:utf-16le 2) (:utf-16be 3)))
       (put-u32 b +hdr-page-count+ 1)
       (init-btree-page b 100 +leaf-table+ ps)
@@ -218,10 +222,6 @@
       (corrupt "bad page size ~d" ps))
     (when (> (aref b 18) 2)
       (sql-error "unsupported file format (write version ~d)" (aref b 18)))
-    (when (plusp (get-u32 b 52))
-      ;; auto_vacuum databases carry pointer-map pages that this writer does
-      ;; not maintain: allow reading only.
-      (setf (db-readonly db) t))
     (setf (db-page-size db) ps
           (db-usable-size db) (- ps (aref b +hdr-reserved+))
           (db-encoding db) (case (get-u32 b +hdr-text-encoding+)
@@ -402,6 +402,8 @@
 (defun commit-write (db)
   (when (db-txn db)
     (when (plusp (hash-table-count (db-dirty db)))
+      (when (and (autovacuum-p db) (not (incremental-p db)))
+        (autovacuum-commit db))
       (let ((h (page-for-write db 1)))
         (let ((cc (ldb (byte 32 0) (1+ (get-u32 h +hdr-change-counter+)))))
           (put-u32 h +hdr-change-counter+ cc)
@@ -427,6 +429,8 @@
                 (file-position s (page-offset db p))
                 (write-sequence (gethash p (db-cache db)) s)))
             (finish-output s)
+            (when (< (db-page-count db) (floor (file-length s) (db-page-size db)))
+              (truncate-file db))
             (when journaled (delete-journal db))))))
     (clrhash (db-dirty db))
     (clrhash (db-journal db))
@@ -491,12 +495,19 @@
       (setf pgno (1+ (db-page-count db)))
       (when (= pgno (pending-byte-page db))
         (incf pgno))
+      ;; auto-vacuum: pointer-map pages sit at fixed places in the file
+      (when (and (autovacuum-p db) (ptrmap-page-p db pgno))
+        (setf (db-page-count db) pgno)
+        (fill (page-for-write db pgno) 0)
+        (incf pgno)
+        (when (= pgno (pending-byte-page db)) (incf pgno)))
       (setf (db-page-count db) pgno))
     (let ((b (page-for-write db pgno)))
       (fill b 0)
       pgno)))
 
 (defun free-page (db pgno)
+  (ptrmap-put db pgno +ptrmap-free+ 0)
   (let* ((trunk (header-u32 db +hdr-freelist-trunk+))
          (max-leaves (- (floor (db-usable-size db) 4) 2)))
     (set-header-u32 db +hdr-freelist-count+

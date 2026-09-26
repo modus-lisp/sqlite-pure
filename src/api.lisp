@@ -315,6 +315,33 @@ non-local exit.  Nested uses become savepoints."
                                           ((memory-db-p db) "memory")
                                           ((db-wal db) "wal")
                                           (t "delete"))))))
+          ((string= n "auto_vacuum")
+           (if value
+               (let* ((v (string-downcase-ascii (value-to-text value)))
+                      (mode (cond ((member v '("1" "full") :test #'string=) :full)
+                                  ((member v '("2" "incremental") :test #'string=) :incremental)
+                                  (t nil))))
+                 ;; takes effect now on a database without tables, else at VACUUM
+                 (setf (db-pending-autovacuum db) (or mode :none))
+                 (when (and (plusp (db-page-count db))
+                            (<= (length (schema-rows (db-schema* db))) 0))
+                   (let ((*db* db))
+                     (run-in-write-txn db (lambda ()
+                                            (let ((h (page-for-write db 1)))
+                                              (put-u32 h 52 (if mode 1 0))
+                                              (put-u32 h 64 (if (eq mode :incremental) 1 0)))))))
+                 (when (eq (db-pending-autovacuum db) :none)
+                   (setf (db-pending-autovacuum db) (if (zerop (db-page-count db)) nil :none)))
+                 (values nil nil))
+               (pragma-rows '("auto_vacuum")
+                            (list (list (cond ((not (autovacuum-p db)) 0)
+                                              ((incremental-p db) 2)
+                                              (t 1)))))))
+          ((string= n "incremental_vacuum")
+           (when (and (autovacuum-p db) (incremental-p db))
+             (let ((*db* db) (k (if value (value-to-integer value) 0)))
+               (run-in-write-txn db (lambda () (incremental-vacuum db (if (integerp k) k 0))))))
+           (values nil nil))
           ((string= n "wal_checkpoint")
            (pragma-rows '("busy" "log" "checkpointed")
                         (list (if (db-wal db)
@@ -329,7 +356,7 @@ non-local exit.  Nested uses become savepoints."
                (pragma-rows '("foreign_keys") (list (list (if (db-foreign-keys (conn db)) 1 0))))))
           ((string= n "foreign_key_list") (pragma-foreign-key-list db value))
           ((member n '("synchronous" "cache_size" "temp_store" "locking_mode"
-                       "busy_timeout" "recursive_triggers" "case_sensitive_like" "auto_vacuum"
+                       "busy_timeout" "recursive_triggers" "case_sensitive_like"
                        "secure_delete" "count_changes" "legacy_file_format" "writable_schema"
                        "ignore_check_constraints" "defer_foreign_keys" "mmap_size" "optimize"
                        "shrink_memory" "automatic_index")

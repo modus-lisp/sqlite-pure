@@ -32,6 +32,7 @@ def make(d):
         ('utf16le', ['PRAGMA encoding="UTF-16le"'], {}),
         ('utf16be', ['PRAGMA encoding="UTF-16be"'], {}),
         ('autovac', ['PRAGMA auto_vacuum=FULL'], {}),
+        ('incrvac', ['PRAGMA auto_vacuum=INCREMENTAL'], {'delete': True}),
         ('freelist', [], {'delete': True}),
         ('wal', ['PRAGMA journal_mode=WAL'], {'wal': True}),
     ]

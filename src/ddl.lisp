@@ -4,6 +4,26 @@
 
 (defun schema-table () (find-table-in *db* "sqlite_schema"))
 
+(defun drop-btrees (roots)
+  "Free whole b-trees.  In an auto-vacuum database roots stay packed: each
+dropped root's slot is filled by the largest root, whose sqlite_schema row
+is repointed; roots are dropped largest first, as SQLite does."
+  (if (autovacuum-p *db*)
+      (dolist (root (sort (copy-list roots) #'>))
+        (clear-btree *db* root)
+        (let ((moved (release-root *db* root)))
+          (when moved (retarget-schema-root moved root))))
+      (dolist (root roots) (clear-btree *db* root))))
+
+(defun retarget-schema-root (old new)
+  (let ((rows '()))
+    (map-table *db* 1 (lambda (rowid payload) (push (cons rowid (decode-record payload)) rows)))
+    (dolist (r rows)
+      (destructuring-bind (rowid type name tbl root sql &rest more) r
+        (declare (ignore more))
+        (when (eql root old)
+          (table-insert *db* 1 rowid (encode-record (list type name tbl new sql))))))))
+
 (defun ddl-target (schema temp)
   "The database a CREATE statement writes to."
   (cond (temp (temp-db *db* t))
@@ -240,9 +260,9 @@
          (when (and (eq kind :table) (name= name "sqlite_sequence"))
            (sql-error "table sqlite_sequence may not be dropped"))
          (unless (table-view-select tb)
-           (dolist (idx (table-indexes tb))
-             (unless (index-pk-index idx) (clear-btree *db* (index-root idx))))
-           (clear-btree *db* (table-root tb))
+           (drop-btrees (cons (table-root tb)
+                              (loop for idx in (table-indexes tb)
+                                    unless (index-pk-index idx) collect (index-root idx))))
            (when (and (table-autoincrement tb) (sequence-table))
              (let ((seq (sequence-table)))
                (dolist (row (scan-table-rows seq nil nil))
@@ -256,7 +276,7 @@
            (if if-exists (return-from exec-drop nil) (sql-error "no such index: ~a" name)))
          (when (index-auto idx)
            (sql-error "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"))
-         (clear-btree *db* (index-root idx))
+         (drop-btrees (list (index-root idx)))
          (delete-schema-rows (lambda (r) (and (equal (second r) "index") (name= (third r) name))))
          (bump-schema-cookie)))
       (:trigger

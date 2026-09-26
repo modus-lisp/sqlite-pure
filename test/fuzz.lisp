@@ -27,6 +27,8 @@
     (s:with-database (db sub)
       (when (uiop:getenv "FUZZ_WAL")        ; the same workload, in WAL mode
         (s:execute db "PRAGMA journal_mode = WAL"))
+      (when (uiop:getenv "FUZZ_AUTOVACUUM") ; ... or with auto_vacuum = full / incremental
+        (s:execute db (format nil "PRAGMA auto_vacuum = ~a" (uiop:getenv "FUZZ_AUTOVACUUM"))))
       (with-open-file (in (format nil "~a/work.sql" dir) :external-format :utf-8)
         (loop for line = (read-line in nil)
               while line

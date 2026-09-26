@@ -80,7 +80,12 @@ format — a crash mid-commit leaves a hot journal that both this library and
 SQLite roll back — or, for **WAL-mode** databases, append checksummed frames
 to `-wal` (see below). `PRAGMA journal_mode = WAL / DELETE` switches modes. Pages split on insert and merge
 through their parent on delete, keeping every leaf at the same depth.
-`auto_vacuum` databases open read-only (pointer maps are not maintained).
+**Auto-vacuum.** `auto_vacuum = FULL` and `INCREMENTAL` databases are read and
+written: pointer-map pages are kept current, table and index roots stay packed
+at the front of the file (a `DROP` moves the last root into the freed slot and
+retargets `sqlite_schema`), FULL mode relocates pages and truncates the file at
+every commit, and `PRAGMA incremental_vacuum(N)` releases free pages on demand.
+`PRAGMA auto_vacuum` sets the mode on a new file, or for the next `VACUUM`.
 
 **Concurrency.** SQLite's POSIX byte-range locking protocol (SHARED /
 RESERVED / PENDING / EXCLUSIVE, via `sb-posix` on SBCL), a busy timeout,
@@ -150,7 +155,7 @@ plan can only narrow the candidate rows, never change the answer.
 ## Not implemented
 
 Virtual tables (FTS, R-tree, `pragma_*` table-valued functions), writing to
-a WAL database while SQLite connections are attached to it, maintaining `auto_vacuum` pointer maps, window `EXCLUDE`
+a WAL database while SQLite connections are attached to it, window `EXCLUDE`
 clauses, `ORDER BY` inside aggregate calls, recursive triggers, `EXPLAIN`. Durability depends on the Lisp's
 `finish-output`; there is no portable `fsync`. File locks need SBCL
 (elsewhere they are no-ops, and cache validation still applies).
@@ -172,7 +177,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
-| `test/run-wal.sh` | WAL writes next to SQLite processes: exclusion both ways, rollback, clean close, crash recovery (a process killed mid-transaction), continuing a log SQLite left, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode |
+| `test/run-wal.sh` | WAL writes next to SQLite processes: exclusion both ways, rollback, clean close, crash recovery (a process killed mid-transaction), continuing a log SQLite left, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
 | `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |
 
 ## Layout

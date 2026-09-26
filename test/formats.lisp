@@ -16,14 +16,14 @@
 
 (defun run-formats-side (dir)
   ;; 1. read every database SQLite made
-  (dolist (name '("ps512" "ps1024" "ps65536" "utf16le" "utf16be" "autovac" "freelist" "wal"))
+  (dolist (name '("ps512" "ps1024" "ps65536" "utf16le" "utf16be" "autovac" "incrvac" "freelist" "wal"))
     (let ((path (format nil "~a/~a.db" dir name)))
       (handler-case
           (s:with-database (db path :readonly t)
             (write-file-text (format nil "~a/~a.lisp.txt" dir name) (dump-to-string db)))
         (error (e) (format t "read ~a: ~a~%" name e)))))
   ;; 2. modify copies of them and let SQLite judge the result
-  (dolist (name '("ps512" "ps1024" "ps65536" "utf16le" "utf16be" "freelist"))
+  (dolist (name '("ps512" "ps1024" "ps65536" "utf16le" "utf16be" "freelist" "autovac" "incrvac"))
     (let ((src (format nil "~a/~a.db" dir name))
           (dst (format nil "~a/w-~a.db" dir name)))
       (copy-file* src dst)
@@ -37,10 +37,12 @@
               (s:execute db "CREATE INDEX a_r ON a(r)"))
             (s:execute db "DELETE FROM w WHERE k < 'k2'"))
         (error (e) (format t "write ~a: ~a~%" name e)))))
-  ;; 3. auto_vacuum must refuse writes
-  (s:with-database (db (format nil "~a/autovac.db" dir))
-    (handler-case (progn (s:execute db "DELETE FROM a") (format t "autovac: write was NOT refused~%"))
-      (s:sqlite-error (e) (format t "autovac refused: ~a~%" (s:sqlite-error-message e)))))
+  ;; 3. auto_vacuum: drop a table (roots re-pack), incremental vacuum
+  (s:with-database (db (format nil "~a/w-autovac.db" dir))
+    (s:execute db "DROP TABLE w"))
+  (s:with-database (db (format nil "~a/w-incrvac.db" dir))
+    (s:execute db "DELETE FROM a WHERE id % 2 = 0")
+    (s:execute db "PRAGMA incremental_vacuum(50)"))
   ;; 4. a crash in the middle of COMMIT leaves a hot journal SQLite rolls back
   (let ((src (format nil "~a/ps1024.db" dir))
         (dst (format nil "~a/w-crash.db" dir)))

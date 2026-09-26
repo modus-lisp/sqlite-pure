@@ -20,6 +20,7 @@
      (:file "wal")
      (:file "record")
      (:file "btree")
+     (:file "autovacuum")
      (:file "values")
      (:file "lexer")
      (:file "parser")

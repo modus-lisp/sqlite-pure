@@ -73,6 +73,7 @@
     (loop for pos from start below (length data) by cap
           do (push (allocate-page db) pages))
     (setf pages (nreverse pages))
+    (ptrmap-note-chain db pages)
     (loop for (pg next) on pages
           for pos from start by cap
           do (let ((b (page-for-write db pg)))
@@ -140,6 +141,7 @@ cell-pointer array and the cell content area can take it."
           (put-u16 b at new-cs))
         (put-u16 b (+ off 3) (1+ n))
         (put-u16 b (+ off 5) new-cs)
+        (ptrmap-note-page db pgno)
         t))))
 
 (defun cell-length (db b p type)
@@ -210,6 +212,7 @@ cell-pointer array and the cell content area can take it."
                  (replace b body :start1 p))
                (put-u16 b (+ off hs (* 2 i)) content))
       (put-u16 b (+ off 5) (if (= content 65536) 0 content))
+      (ptrmap-note-page db pgno)
       t)))
 
 ;;; ------------------------------------------------------------------
@@ -822,7 +825,8 @@ page: descend, and on meeting the interior copy go left and then rightmost."
 ;;; Whole trees
 
 (defun create-btree (db type)
-  (let ((pg (allocate-page db)))
+  (ensure-write-txn db)                  ; page 1 (and its auto_vacuum flag) first
+  (let ((pg (if (autovacuum-p db) (allocate-root db) (allocate-page db))))
     (serialize-node db pg (make-node :type type :cells '()
                                      :right (unless (leaf-type-p type) 0)))
     pg))
