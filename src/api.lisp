@@ -90,6 +90,17 @@
   (declare (ignore nparam))
   (map 'simple-vector #'lisp-to-sql params))
 
+(defun parse-sql-cached (db sql)
+  "PARSE-SQL, memoised per connection (ASTs are never mutated)."
+  (let ((cache (db-stmt-cache db)))
+    (let ((hit (gethash sql cache)))
+      (if hit
+          (values-list hit)
+          (let ((r (multiple-value-list (parse-sql sql))))
+            (when (> (hash-table-count cache) 500) (clrhash cache))
+            (setf (gethash sql cache) r)
+            (values-list r))))))
+
 (defun check-open (db)
   (when (db-closed db) (sql-error "database is closed")))
 
@@ -97,7 +108,7 @@
   "Run every statement in SQL; return the rows and column names of the last."
   (check-open db)
   (with-sql-floats
-    (multiple-value-bind (stmts nparam names) (parse-sql sql)
+    (multiple-value-bind (stmts nparam names) (parse-sql-cached db sql)
       (let ((*params* (bind-params params nparam))
             (*param-names* names)
             (rows nil) (cols nil))

@@ -52,6 +52,7 @@
   (changes 0)
   (total-changes 0)
   (pending-page-size nil)
+  (stmt-cache (make-hash-table :test #'equal))
   (closed nil))
 
 (defmethod print-object ((db db) s)

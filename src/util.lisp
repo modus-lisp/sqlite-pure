@@ -56,12 +56,20 @@
       (replace r v :start1 p)
       (incf p (length v)))))
 
+(deftype octet-index () '(integer 0 #.(1- array-dimension-limit)))
+
 (declaim (inline get-u8 get-u16 get-u24 get-u32))
-(defun get-u8 (b off) (aref b off))
-(defun get-u16 (b off) (logior (ash (aref b off) 8) (aref b (1+ off))))
+(defun get-u8 (b off)
+  (declare (type octets b) (type octet-index off) (optimize speed))
+  (aref b off))
+(defun get-u16 (b off)
+  (declare (type octets b) (type octet-index off) (optimize speed))
+  (logior (ash (aref b off) 8) (aref b (1+ off))))
 (defun get-u24 (b off)
+  (declare (type octets b) (type octet-index off) (optimize speed))
   (logior (ash (aref b off) 16) (ash (aref b (+ off 1)) 8) (aref b (+ off 2))))
 (defun get-u32 (b off)
+  (declare (type octets b) (type octet-index off) (optimize speed))
   (logior (ash (aref b off) 24) (ash (aref b (+ off 1)) 16)
           (ash (aref b (+ off 2)) 8) (aref b (+ off 3))))
 
@@ -110,9 +118,13 @@
 
 (defun get-varint (b off)
   "Return (values unsigned-value byte-length)."
+  (declare (type octets b) (type octet-index off) (optimize speed))
+  (let ((byte (aref b off)))
+    (when (< byte #x80) (return-from get-varint (values byte 1))))
   (let ((v 0))
-    (loop for i from 0 below 8
-          for byte = (aref b (+ off i))
+    (declare (type (unsigned-byte 56) v))
+    (loop for i of-type fixnum from 0 below 8
+          for byte of-type (unsigned-byte 8) = (aref b (+ off i))
           do (setf v (logior (ash v 7) (logand byte #x7f)))
              (unless (logbitp 7 byte)
                (return-from get-varint (values v (1+ i)))))
@@ -184,9 +196,12 @@
   off)
 
 (defun utf8-encode (s)
-  (let ((b (make-octets (utf8-length s))))
-    (utf8-encode-into s b 0)
-    b))
+  (if (and (simple-string-p s) (every (lambda (c) (< (char-code c) #x80)) s))
+      (let ((b (make-octets (length s))))
+        (dotimes (i (length s) b) (setf (aref b i) (char-code (schar s i)))))
+      (let ((b (make-octets (utf8-length s))))
+        (utf8-encode-into s b 0)
+        b)))
 
 (defun safe-code-char (code)
   (or (and (< code char-code-limit)
@@ -195,6 +210,14 @@
       (code-char #xfffd)))
 
 (defun utf8-decode (b &optional (start 0) (end (length b)))
+  (declare (type octets b) (type octet-index start end) (optimize speed))
+  (when (loop for i of-type octet-index from start below end always (< (aref b i) #x80))
+    ;; pure ASCII: the common case
+    (let ((out (make-string (- end start))))
+      (loop for i of-type octet-index from start below end
+            for k of-type octet-index from 0
+            do (setf (schar out k) (code-char (aref b i))))
+      (return-from utf8-decode out)))
   (let ((out (make-string (- end start)))
         (n 0)
         (i start))
