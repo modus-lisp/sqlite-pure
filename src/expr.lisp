@@ -190,6 +190,11 @@
 ;;; ------------------------------------------------------------------
 ;;; LIKE and GLOB
 
+(defvar *like-matches-blobs* nil
+  "NIL: LIKE and GLOB are false when either operand is a BLOB, as with
+SQLite's recommended SQLITE_LIKE_DOESNT_MATCH_BLOBS build option (which
+the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
+
 (defun c-string (s)
   "S up to its first NUL: SQLite's pattern matchers see C strings."
   (let ((z (position (code-char 0) s))) (if z (subseq s 0 z) s)))
@@ -535,8 +540,11 @@
       (lambda (env)
         (let ((s (funcall fx env)) (p (funcall fp env))
               (ec (and fe (funcall fe env))))
-          (if (or (eq s :null) (eq p :null) (eq ec :null))
-              :null
+          (cond
+            ((and (not *like-matches-blobs*) (or (blobp s) (blobp p))) (bool negated))
+            ((or (eq s :null) (eq p :null) (eq ec :null))
+              :null)
+            (t
               (let* ((ss (c-string (value-to-text s))) (ps (c-string (value-to-text p)))
                      (m (if (eq kind :glob)
                             (glob-match ps ss)
@@ -544,7 +552,7 @@
                               (when (and escs (/= (length escs) 1))
                                 (sql-error "ESCAPE expression must be a single character"))
                               (like-match ps ss (and escs (char escs 0)))))))
-                (bool (if negated (not m) m)))))))))
+                (bool (if negated (not m) m))))))))))
 
 (defun compile-case (e scope)
   (destructuring-bind (base whens else) (cdr e)

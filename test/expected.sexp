@@ -713,6 +713,10 @@ INSERT INTO t(s, b) SELECT printf('%.*c', i * 50, 'a'), zeroblob(i * 97) FROM c;
  ("SELECT (1, 2) = (1, 2), (1, 2) < (1, 3), (1, NULL) = (1, 2), (1, NULL) = (2, 2), (2, 1) > (1, 5);" :rows ("(1, 2) = (1, 2)" "(1, 2) < (1, 3)" "(1, NULL) = (1, 2)" "(1, NULL) = (2, 2)" "(2, 1) > (1, 5)")
   ((1 1 :null 0 1)))
 )
+("expr.test:like-glob-blobs"
+ ("SELECT x'616263' GLOB '*a*', x'616263' LIKE '%a%', 'abc' LIKE x'25', glob('*a*', x'61'), like('a', x'61'), x'61' NOT LIKE 'a';" :rows ("x'616263' GLOB '*a*'" "x'616263' LIKE '%a%'" "'abc' LIKE x'25'" "glob('*a*', x'61')" "like('a', x'61')" "x'61' NOT LIKE 'a'")
+  ((0 0 0 0 0 1)))
+)
 ("select.test:setup-and-where"
  ("CREATE TABLE emp(id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER, mgr INTEGER);" :ok)
  ("INSERT INTO emp VALUES (1,'Ann','eng',120,NULL),(2,'Bob','eng',100,1),(3,'Cid','ops',90,1),(4,'Dee','ops',95,3),(5,'Eve','hr',70,1),(6,'Fay','eng',NULL,2);" :ok)

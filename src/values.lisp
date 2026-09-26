@@ -236,6 +236,10 @@ conversion used for arithmetic on text."
 (defun rtrim-spaces (s) (string-right-trim " " s))
 
 (defun compare-strings (a b collation)
+  (when (and (eq collation :binary) (not (eq *encoding* :utf-8)))
+    ;; BINARY is memcmp over the database's own encoding; for UTF-16 that
+    ;; is not code-point order.
+    (return-from compare-strings (compare-blobs (encode-text a) (encode-text b))))
   (let ((a (if (eq collation :rtrim) (rtrim-spaces a) a))
         (b (if (eq collation :rtrim) (rtrim-spaces b) b)))
     (let ((n (min (length a) (length b))))

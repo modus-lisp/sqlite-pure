@@ -576,20 +576,64 @@ from the immediate parent up to the root."
           (index-insert-payload db root payload))))))
 
 (defun collapse-page (db pgno node path)
-  "NODE (at PGNO) is interior with no cells: replace it by its only child."
+  "NODE (at PGNO) is an interior page left with no cells, only a right
+child.  At the root, pull the child up (every leaf gets one level
+shallower).  Elsewhere, merge it with a sibling through the parent's
+divider, which keeps every leaf at the same depth."
   (let ((child (node-right node)))
     (if (null path)
         (let ((cnode (decode-node db child)))
           (free-page db child)
           (write-node db pgno cnode nil))
         (destructuring-bind ((gpg . gidx) . rest) path
-          (declare (ignore rest))
-          (let ((g (decode-node db gpg)))
-            (if (< gidx (length (node-cells g)))
-                (setf (cell-child (nth gidx (node-cells g))) child)
-                (setf (node-right g) child))
-            (serialize-node db gpg g)
-            (free-page db pgno))))))
+          (let* ((g (decode-node db gpg))
+                 (gcells (node-cells g))
+                 (n (length gcells)))
+            (flet ((child-at (i) (if (< i n) (cell-child (nth i gcells)) (node-right g))))
+              (if (plusp gidx)
+                  ;; merge into the left sibling Q = child (gidx-1)
+                  (let* ((div (nth (1- gidx) gcells))
+                         (q-pg (cell-child div))
+                         (q (decode-node db q-pg)))
+                    (setf (node-cells q)
+                          (append (node-cells q)
+                                  (list (make-cell :child (node-right q) :key (cell-key div)
+                                                   :body (cell-body div))))
+                          (node-right q) child)
+                    ;; drop the divider; the pointer that named PGNO now names Q
+                    (setf gcells (remove div gcells))
+                    (if (< gidx n)
+                        (setf (cell-child (nth (1- gidx) gcells)) q-pg)
+                        (setf (node-right g) q-pg))
+                    (setf (node-cells g) gcells)
+                    (free-page db pgno)
+                    (finish-merge db gpg g rest q-pg q (1- gidx)))
+                  ;; leftmost child: merge into the right sibling Q
+                  (let* ((div (first gcells))
+                         (q-pg (child-at 1))
+                         (q (decode-node db q-pg)))
+                    (setf (node-cells q)
+                          (cons (make-cell :child child :key (cell-key div) :body (cell-body div))
+                                (node-cells q)))
+                    (setf (node-cells g) (rest gcells))
+                    (free-page db pgno)
+                    (finish-merge db gpg g rest q-pg q 0)))))))))
+
+(defun finish-merge (db gpg g gpath q-pg q q-idx)
+  "Store the parent G (one cell shorter) and the merged sibling Q, which
+sits at index Q-IDX of G."
+  (if (node-cells g)
+      (progn
+        (serialize-node db gpg g)
+        (write-node db q-pg q (cons (cons gpg q-idx) gpath)))
+      (progn
+        ;; G is now empty too.  Store Q first (a split would give G a cell
+        ;; back), then deal with G.
+        (serialize-node db gpg g)
+        (write-node db q-pg q (cons (cons gpg q-idx) gpath))
+        (let ((g2 (decode-node db gpg)))
+          (unless (node-cells g2)
+            (collapse-page db gpg g2 gpath))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Index b-tree mutation.  Entries are records whose last column is the

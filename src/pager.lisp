@@ -28,6 +28,8 @@
   (put-u16 b (+ off 5) (if (= usable 65536) 0 usable)))
 (defparameter *cache-limit* 4096 "Clean pages kept before the cache is trimmed.")
 (defparameter *sqlite-version-number* 3040001)
+(defvar *crash-after-pages* nil
+  "Testing hook: abandon COMMIT after writing this many database pages.")
 
 (defstruct (db (:constructor %make-db))
   (path nil)
@@ -114,7 +116,8 @@
         (setf (gethash pgno (db-cache db)) b))))
 
 (defun ensure-write-txn (db)
-  (when (db-readonly db) (sql-error "attempt to write a readonly database"))
+  (when (db-readonly db)
+    (error 'sqlite-error :code :readonly :message "attempt to write a readonly database"))
   (unless (db-txn db)
     (begin-write db :auto)))
 
@@ -164,6 +167,10 @@
       (corrupt "bad page size ~d" ps))
     (when (> (aref b 18) 2)
       (sql-error "unsupported file format (write version ~d)" (aref b 18)))
+    (when (plusp (get-u32 b 52))
+      ;; auto_vacuum databases carry pointer-map pages that this writer does
+      ;; not maintain: allow reading only.
+      (setf (db-readonly db) t))
     (setf (db-page-size db) ps
           (db-usable-size db) (- ps (aref b +hdr-reserved+))
           (db-encoding db) (case (get-u32 b +hdr-text-encoding+)
@@ -317,8 +324,13 @@
           (let ((journaled (plusp (hash-table-count (db-journal db)))))
             (when journaled (write-journal db))
             (let ((pages (sort (loop for k being the hash-keys of (db-dirty db) collect k)
-                               #'<)))
+                               #'<))
+                  (written 0))
               (dolist (p pages)
+                (when (and *crash-after-pages* (>= written *crash-after-pages*))
+                  (finish-output s)
+                  (error "simulated crash during commit"))
+                (incf written)
                 (file-position s (page-offset db p))
                 (write-sequence (gethash p (db-cache db)) s)))
             (finish-output s)

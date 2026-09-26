@@ -4,8 +4,10 @@
 
 
 (defmacro defsqlfun (name (min max) lambda-list &body body)
-  `(setf (gethash ,name *functions*)
-         (list ,min ,max (lambda ,lambda-list ,@body))))
+  (let ((decls (loop while (and (consp (car body)) (eq (caar body) 'declare))
+                     collect (pop body))))
+    `(setf (gethash ,name *functions*)
+           (list ,min ,max (lambda ,lambda-list ,@decls (block nil ,@body))))))
 
 (defmacro defaggregate (name (min max) &body body)
   "BODY returns (values step-fn final-fn); step-fn takes the argument list
@@ -336,10 +338,14 @@ and may return true when this row became the aggregate's witness (min/max)."
 
 (defsqlfun "glob" (2 2) (args)
   (destructuring-bind (pat s) args
+    (when (and (not *like-matches-blobs*) (or (blobp pat) (blobp s)))
+      (return-from nil 0))
     (with-null-args (pat s) (bool (glob-match (c-string (text-of pat)) (c-string (text-of s)))))))
 
 (defsqlfun "like" (2 3) (args)
   (destructuring-bind (pat s &optional esc) args
+    (when (and (not *like-matches-blobs*) (or (blobp pat) (blobp s)))
+      (return-from nil 0))
     (with-null-args (pat s)
       (bool (like-match (c-string (text-of pat)) (c-string (text-of s))
                         (and esc (not (eq esc :null)) (char (text-of esc) 0)))))))
