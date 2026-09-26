@@ -310,7 +310,16 @@ non-local exit.  Nested uses become savepoints."
                                                      (:utf-8 "UTF-8") (:utf-16le "UTF-16le")
                                                      (:utf-16be "UTF-16be"))))))
           ((string= n "journal_mode")
-           (pragma-rows '("journal_mode") (list (list (if (memory-db-p db) "memory" "delete")))))
+           (pragma-rows '("journal_mode")
+                        (list (list (cond (value (set-journal-mode db (string-downcase-ascii (value-to-text value))))
+                                          ((memory-db-p db) "memory")
+                                          ((db-wal db) "wal")
+                                          (t "delete"))))))
+          ((string= n "wal_checkpoint")
+           (pragma-rows '("busy" "log" "checkpointed")
+                        (list (if (db-wal db)
+                                  (let ((k (wal-checkpoint db))) (list 0 k k))
+                                  (list 0 -1 -1)))))
           ((string= n "foreign_keys")
            (if value
                (progn (setf (db-foreign-keys (conn db))
@@ -323,7 +332,7 @@ non-local exit.  Nested uses become savepoints."
                        "busy_timeout" "recursive_triggers" "case_sensitive_like" "auto_vacuum"
                        "secure_delete" "count_changes" "legacy_file_format" "writable_schema"
                        "ignore_check_constraints" "defer_foreign_keys" "mmap_size" "optimize"
-                       "wal_checkpoint" "shrink_memory" "automatic_index")
+                       "shrink_memory" "automatic_index")
                    :test #'string=)
            (if value (values nil nil) (pragma-rows (list n) (list (list 0)))))
           ((string= n "table_info") (pragma-table-info db value nil))

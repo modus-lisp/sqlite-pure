@@ -147,9 +147,10 @@
   (or (gethash pgno (db-cache db))
       (let ((b (make-octets (db-page-size db))))
         (let ((s (db-stream db)))
-          (when (and s (<= (* pgno (db-page-size db)) (file-length s)))
-            (file-position s (page-offset db pgno))
-            (read-sequence b s)))
+          (unless (and (db-wal db) (wal-read-page db pgno b))
+            (when (and s (<= (* pgno (db-page-size db)) (file-length s)))
+              (file-position s (page-offset db pgno))
+              (read-sequence b s))))
         (when (> (hash-table-count (db-cache db)) *cache-limit*)
           (trim-cache db))
         (setf (gethash pgno (db-cache db)) b))))
@@ -158,7 +159,9 @@
   (when (db-readonly db)
     (error 'sqlite-error :code :readonly :message "attempt to write a readonly database"))
   (unless (db-txn db)
-    (lock-reserved db)
+    (if (db-wal db)
+        (wal-begin-session db)          ; before any page is dirtied
+        (lock-reserved db))
     (begin-write db :auto)))
 
 (defun page-for-write (db pgno)
@@ -275,6 +278,7 @@
   (unless (db-closed db)
     (dolist (a (db-attached db)) (close-database (cdr a)))
     (when (db-txn db) (rollback-write db))
+    (when (db-wal db) (wal-close db))
     (unlock-to db :none)
     (when (db-stream db) (close (db-stream db)))
     (setf (db-closed db) t))
@@ -405,6 +409,9 @@
         (put-u32 h +hdr-page-count+ (db-page-count db))
         (put-u32 h +hdr-version-number+ *sqlite-version-number*))
       (let ((s (db-stream db)))
+        (when (and s (db-wal db))
+          (wal-commit db (sort (loop for k being the hash-keys of (db-dirty db) collect k) #'<))
+          (setf s nil))
         (when s
           (let ((journaled (plusp (hash-table-count (db-journal db)))))
             (when journaled (write-journal db))
@@ -459,59 +466,6 @@
                         (write-sequence img s)))))
                 (finish-output s)
                 (delete-file jp)))))))))
-
-;;; ------------------------------------------------------------------
-;;; WAL (read side).  Committed frames override database pages.
-
-(defun load-wal (db)
-  (let ((wp (concatenate 'string (db-path db) "-wal")))
-    (with-open-file (w wp :element-type '(unsigned-byte 8) :if-does-not-exist nil)
-      (when (and w (>= (file-length w) 32))
-        (let ((hdr (make-octets 32)))
-          (read-sequence hdr w)
-          (let* ((magic (get-u32 hdr 0))
-                 (big (= magic #x377f0683))
-                 (ps (get-u32 hdr 8))
-                 (salt1 (get-u32 hdr 16)) (salt2 (get-u32 hdr 20))
-                 (frame-len (+ 24 ps))
-                 (pending '())
-                 (fh (make-octets 24))
-                 (s1 (get-u32 hdr 24)) (s2 (get-u32 hdr 28)))
-            (unless (member magic '(#x377f0682 #x377f0683))
-              (return-from load-wal))
-            (multiple-value-setq (s1 s2) (wal-checksum big hdr 0 24 0 0))
-            (unless (and (= s1 (get-u32 hdr 24)) (= s2 (get-u32 hdr 28)))
-              (return-from load-wal))
-            (loop
-              (when (> (+ (file-position w) frame-len) (file-length w)) (return))
-              (read-sequence fh w)
-              (let ((page (make-octets ps)))
-                (read-sequence page w)
-                (unless (and (= (get-u32 fh 8) salt1) (= (get-u32 fh 12) salt2))
-                  (return))
-                (multiple-value-setq (s1 s2) (wal-checksum big fh 0 8 s1 s2))
-                (multiple-value-setq (s1 s2) (wal-checksum big page 0 ps s1 s2))
-                (unless (and (= s1 (get-u32 fh 16)) (= s2 (get-u32 fh 20)))
-                  (return))
-                (push (cons (get-u32 fh 0) page) pending)
-                (let ((commit-size (get-u32 fh 4)))
-                  (when (plusp commit-size)
-                    (dolist (f (reverse pending))
-                      (setf (gethash (car f) (db-cache db)) (cdr f)))
-                    (setf pending '()
-                          (db-page-count db) commit-size)))))
-            ;; Writes go to the main file; mark the database read-only
-            ;; rather than silently diverging from the WAL.
-            (setf (db-readonly db) t (db-wal db) t)))))))
-
-(defun wal-checksum (big b start end s1 s2)
-  (loop for i from start below end by 8
-        do (flet ((w (k) (if big (get-u32 b k)
-                             (logior (aref b k) (ash (aref b (+ k 1)) 8)
-                                     (ash (aref b (+ k 2)) 16) (ash (aref b (+ k 3)) 24)))))
-             (setf s1 (ldb (byte 32 0) (+ s1 (w i) s2))
-                   s2 (ldb (byte 32 0) (+ s2 (w (+ i 4)) s1)))))
-  (values s1 s2))
 
 ;;; ------------------------------------------------------------------
 ;;; Freelist

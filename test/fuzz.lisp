@@ -25,6 +25,8 @@
         (errors 0) (count 0))
     (when (probe-file sub) (delete-file sub))
     (s:with-database (db sub)
+      (when (uiop:getenv "FUZZ_WAL")        ; the same workload, in WAL mode
+        (s:execute db "PRAGMA journal_mode = WAL"))
       (with-open-file (in (format nil "~a/work.sql" dir) :external-format :utf-8)
         (loop for line = (read-line in nil)
               while line

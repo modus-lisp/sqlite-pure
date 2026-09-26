@@ -75,10 +75,10 @@ constraint, parse and corruption errors) carrying SQLite's own message.
 
 **File format.** Table and index b-trees (all four page types), overflow
 chains, the freelist, page sizes 512–65536, UTF-8 and UTF-16 databases,
-`WITHOUT ROWID` tables, reading WAL-mode databases (committed `-wal` frames
-are applied; such a database opens read-only). Writes go through a rollback
-journal in SQLite's format: a crash mid-commit leaves a hot journal that
-both this library and SQLite roll back. Pages split on insert and merge
+`WITHOUT ROWID` tables. Writes go through a rollback journal in SQLite's
+format — a crash mid-commit leaves a hot journal that both this library and
+SQLite roll back — or, for **WAL-mode** databases, append checksummed frames
+to `-wal` (see below). `PRAGMA journal_mode = WAL / DELETE` switches modes. Pages split on insert and merge
 through their parent on delete, keeping every leaf at the same depth.
 `auto_vacuum` databases open read-only (pointer maps are not maintained).
 
@@ -87,6 +87,17 @@ RESERVED / PENDING / EXCLUSIVE, via `sb-posix` on SBCL), a busy timeout,
 hot-journal recovery only under the lock, and page-cache validation against
 the header change counter at every read transaction — so SQLite processes
 and this library can use a file concurrently.
+
+**WAL databases** are read concurrently with nothing held. Writing takes an
+exclusive session: SQLite's WAL connections share an index in `-shm` that
+every writer must keep current, and rather than maintain it, the first
+write locks the main file exclusively and write-locks the `-shm` byte that
+every attached SQLite connection holds a read lock on. While any SQLite
+connection is attached, writing fails with "database is locked" (and while
+the session lasts, SQLite gets "database is locked"). A crash leaves a
+valid log that SQLite recovers; closing — or `PRAGMA wal_checkpoint` —
+copies the log into the main file and removes `-wal` and `-shm`, as
+SQLite's last connection does.
 
 **SQL.** `SELECT` with every join type (inner, `LEFT`, `RIGHT`, `FULL`,
 cross, `USING`, `NATURAL`), `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY` (`NULLS
@@ -139,7 +150,7 @@ plan can only narrow the candidate rows, never change the answer.
 ## Not implemented
 
 Virtual tables (FTS, R-tree, `pragma_*` table-valued functions), writing to
-WAL-mode databases, maintaining `auto_vacuum` pointer maps, window `EXCLUDE`
+a WAL database while SQLite connections are attached to it, maintaining `auto_vacuum` pointer maps, window `EXCLUDE`
 clauses, `ORDER BY` inside aggregate calls, recursive triggers, `EXPLAIN`. Durability depends on the Lisp's
 `finish-output`; there is no portable `fsync`. File locks need SBCL
 (elsewhere they are no-ops, and cache validation still applies).
@@ -161,6 +172,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
+| `test/run-wal.sh` | WAL writes next to SQLite processes: exclusion both ways, rollback, clean close, crash recovery (a process killed mid-transaction), continuing a log SQLite left, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode |
 | `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |
 
 ## Layout

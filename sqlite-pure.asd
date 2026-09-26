@@ -17,6 +17,7 @@
      (:file "util")
      (:file "pager")
      (:file "locking")
+     (:file "wal")
      (:file "record")
      (:file "btree")
      (:file "values")
