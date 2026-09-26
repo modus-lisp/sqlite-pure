@@ -48,7 +48,8 @@
   outer-ref              ; set when a column resolves to an enclosing scope
   in-agg-arg
   windows                ; window functions of this query level (NIL: not allowed here)
-  window-defs)           ; alist from the WINDOW clause
+  window-defs            ; alist from the WINDOW clause
+  coalesce)              ; RIGHT/FULL JOIN USING: ((lsi . lci) . (rsi . rci)) ...
 
 (defun src-ncols (s) (length (src-columns s)))
 
@@ -336,7 +337,10 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
     (:param (let ((k (second e))) (lambda (env) (declare (ignore env)) (param-value k))))
     (:col
      (multiple-value-bind (depth si ci s) (resolve-column scope (second e) (third e))
-       (cond (depth
+       (cond ((and depth (= depth 0) (null (second e))
+                   (assoc (cons si ci) (scope-coalesce scope) :test #'equal))
+              (compile-coalesced (cons si ci) scope))
+             (depth
               (mark-used s ci)
               (when (plusp depth) (mark-correlated scope depth))
               (compile-column-access depth si ci))
@@ -346,8 +350,10 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
              ((and (null (second e)) (stringp (third e)) (eq (fourth e) :quoted))
               (let ((s (third e))) (lambda (env) (declare (ignore env)) s)))
              (t (sql-error "no such column: ~@[~a.~]~a" (second e) (third e))))))
-    (:srccol (mark-used (nth (second e) (scope-srcs scope)) (third e))
-             (compile-column-access 0 (second e) (third e)))
+    (:srccol (if (assoc (cons (second e) (third e)) (scope-coalesce scope) :test #'equal)
+                 (compile-coalesced (cons (second e) (third e)) scope)
+                 (progn (mark-used (nth (second e) (scope-srcs scope)) (third e))
+                        (compile-column-access 0 (second e) (third e)))))
     (:star (sql-error "misuse of *"))
     (:unary (compile-unary e scope))
     (:binary (compile-binary e scope))
@@ -369,6 +375,16 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
     (:exists (compile-exists (second e) scope))
     (:rowvalue (sql-error "row value misused"))
     (:raise (compile-raise e scope))))
+
+(defun compile-coalesced (key scope)
+  "The column shared through USING by a RIGHT or FULL JOIN reads as
+coalesce(left, right)."
+  (destructuring-bind ((lsi . lci) . (rsi . rci)) (assoc key (scope-coalesce scope) :test #'equal)
+    (mark-used (nth lsi (scope-srcs scope)) lci)
+    (mark-used (nth rsi (scope-srcs scope)) rci)
+    (let ((l (compile-column-access 0 lsi lci))
+          (r (compile-column-access 0 rsi rci)))
+      (lambda (env) (let ((v (funcall l env))) (if (eq v :null) (funcall r env) v))))))
 
 (defun compile-unary (e scope)
   (let ((f (compile-expr (third e) scope)))

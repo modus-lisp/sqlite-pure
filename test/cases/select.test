@@ -201,3 +201,33 @@ SELECT id FROM t ORDER BY a NULLS LAST, id;
 SELECT id, a FROM t ORDER BY 2 DESC, 1;
 SELECT id FROM t WHERE a = 1 ORDER BY id DESC;
 SELECT a AS x FROM t ORDER BY x LIMIT 3 OFFSET 1;
+
+== right-full-joins
+CREATE TABLE a(k, x);
+CREATE TABLE b(k, y);
+CREATE TABLE c(k, z);
+INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3');
+INSERT INTO b VALUES (2, 'b2'), (3, 'b3'), (4, 'b4');
+INSERT INTO c VALUES (3, 'c3'), (4, 'c4'), (5, 'c5');
+SELECT * FROM a RIGHT JOIN b ON a.k = b.k ORDER BY b.k;
+SELECT * FROM a FULL JOIN b ON a.k = b.k ORDER BY coalesce(a.k, b.k);
+SELECT * FROM a RIGHT JOIN b USING (k) ORDER BY k;
+SELECT * FROM a FULL OUTER JOIN b USING (k) ORDER BY k;
+SELECT a.k, b.k, c.k FROM a LEFT JOIN b ON a.k = b.k RIGHT JOIN c ON c.k = b.k ORDER BY c.k;
+SELECT * FROM a RIGHT JOIN b ON a.k = b.k WHERE a.k IS NULL;
+SELECT * FROM a FULL OUTER JOIN b ON a.k = b.k AND b.y = 'b3' ORDER BY a.k, b.k;
+SELECT k FROM a FULL JOIN b USING (k) ORDER BY 1;
+SELECT * FROM a RIGHT JOIN b ON 1 = 0 ORDER BY b.k;
+SELECT count(*), count(a.k), count(b.k) FROM a FULL JOIN b ON a.k = b.k;
+
+== update-from
+CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');
+CREATE TABLE s(id, nv);
+INSERT INTO s VALUES (1, 'X'), (3, 'Z'), (3, 'ZZ');
+UPDATE t SET v = s.nv FROM s WHERE t.id = s.id;
+SELECT * FROM t ORDER BY id;
+SELECT changes();
+UPDATE t AS tt SET v = v || s.nv FROM (SELECT id, count(*) AS nv FROM s GROUP BY id) AS s WHERE tt.id = s.id;
+SELECT * FROM t ORDER BY id;
+SELECT a.k, b.k, c.k FROM a JOIN b ON a.k = b.k AND b.k > 2 RIGHT JOIN c ON c.k = a.k ORDER BY c.k;

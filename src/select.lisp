@@ -238,9 +238,10 @@ subquery (whose references we do not chase)."
   index            ; position in the source list
   fsrc
   iterate          ; (lambda (env fn)) calls fn with each candidate row
-  match            ; list of compiled ON conjuncts (LEFT JOIN)
+  match            ; list of compiled ON conjuncts (LEFT/RIGHT/FULL JOIN)
   filters          ; list of compiled conjuncts
-  left-p
+  left-p           ; unmatched rows of the earlier sources survive (LEFT, FULL)
+  right-p          ; unmatched rows of this source survive (RIGHT, FULL)
   nullrow)
 
 (defun rowid-probe (v)
@@ -600,6 +601,9 @@ Return the per-source ON expressions."
                       (unless left
                         (sql-error "cannot join using column ~a - column not present in both tables" name))
                       (push ri (src-hidden src))
+                      (when (member (fsrc-join fs) '(:right :full))
+                        (push (cons (cons (first left) (second left)) (cons i ri))
+                              (scope-coalesce scope)))
                       (let ((cond (list :binary :eq (cons :srccol left) (list :srccol i ri))))
                         (setf on (if on (list :binary :and on cond) cond)))))
                   on)))
@@ -616,31 +620,44 @@ Return the per-source ON expressions."
       (when (fsrc-tvf fs)
         (destructuring-bind (builder . args) (fsrc-tvf fs)
           (setf (fsrc-rows-fn fs) (funcall builder (mapcar (lambda (a) (compile-expr a scope)) args))))))
-    ;; INNER/CROSS ON conditions behave as WHERE conjuncts
-    (loop for fs in fsrcs
-          for on in ons
-          do (unless (eq (fsrc-join fs) :left)
-               (setf where-conjs (append where-conjs (split-conjuncts on)))))
-    (let ((placed (make-array (max n 1) :initial-element '())))
-      (dolist (c where-conjs)
-        (if (zerop n)
-            (push c finals)
-            (push c (aref placed (max-ref (expr-refs c scope) n)))))
+    ;; INNER/CROSS ON conditions behave as WHERE conjuncts, except that a
+    ;; RIGHT/FULL JOIN does not delay them (they belong to its left side)
+    (let ((inner-ons (loop for fs in fsrcs
+                           for on in ons
+                           unless (member (fsrc-join fs) '(:left :right :full))
+                             append (split-conjuncts on))))
+      (setf where-conjs (append (mapcar (lambda (c) (cons :where c)) where-conjs)
+                                (mapcar (lambda (c) (cons :on c)) inner-ons))))
+    (let ((placed (make-array (max n 1) :initial-element '()))
+          ;; WHERE applies to the joined row: never before a RIGHT/FULL JOIN
+          ;; has decided which of its rows matched
+          (floor-level (or (position-if (lambda (fs) (member (fsrc-join fs) '(:right :full)))
+                                        fsrcs :from-end t)
+                           0)))
+      (dolist (tagged where-conjs)
+        (destructuring-bind (kind . c) tagged
+          (if (zerop n)
+              (push c finals)
+              (push c (aref placed (max (if (eq kind :where) floor-level 0)
+                                        (max-ref (expr-refs c scope) n)))))))
       (loop for fs in fsrcs
             for on in ons
             for i from 0
-            do (let* ((left (eq (fsrc-join fs) :left))
-                      (match-asts (when left (split-conjuncts on)))
+            do (let* ((outer (member (fsrc-join fs) '(:left :right :full)))
+                      (left (member (fsrc-join fs) '(:left :full)))
+                      (right (member (fsrc-join fs) '(:right :full)))
+                      (match-asts (when outer (split-conjuncts on)))
                       (filter-asts (reverse (aref placed i)))
                       ;; conjuncts usable for choosing the access path: never
                       ;; WHERE terms for the inner table of a LEFT JOIN
-                      (access-asts (if left match-asts filter-asts))
+                      (access-asts (cond (right nil) (left match-asts) (t filter-asts)))
                       (iterate (if (fsrc-table fs)
                                    (plan-table-access fs i access-asts scope)
                                    (let ((rf (fsrc-rows-fn fs)))
                                      (lambda (env fn)
                                        (dolist (row (funcall rf env)) (funcall fn row)))))))
-                 (push (make-level :index i :fsrc fs :iterate iterate :left-p left
+                 (push (make-level :index i :fsrc fs :iterate iterate :left-p (and left t)
+                                   :right-p (and right t)
                                    :match (mapcar (lambda (c) (compile-expr c scope)) match-asts)
                                    :filters (mapcar (lambda (c) (compile-expr c scope)) filter-asts)
                                    :nullrow (make-array (1+ (src-ncols (fsrc-src fs)))
@@ -654,25 +671,56 @@ Return the per-source ON expressions."
     (unless (eq (truth (funcall f env)) t) (return nil))))
 
 (defun run-levels (levels env emit)
-  (labels ((run (lvs)
-             (if (null lvs)
-                 (funcall emit)
-                 (let* ((lv (car lvs))
-                        (i (level-index lv))
-                        (rows (env-rows env))
-                        (matched nil))
-                   (funcall (level-iterate lv) env
-                            (lambda (row)
+  (let ((materialized (make-hash-table :test #'eq)))
+    ;; A RIGHT/FULL JOIN source is read once, so that the rows no earlier
+    ;; row matched can be emitted at the end.
+    (dolist (lv levels)
+      (when (level-right-p lv)
+        (let ((rows '()))
+          (funcall (level-iterate lv) env (lambda (row) (push row rows)))
+          (setf (gethash lv materialized)
+                (cons (coerce (nreverse rows) 'vector)
+                      (make-array (length rows) :initial-element nil))))))
+    (labels ((run (lvs)
+               (if (null lvs)
+                   (funcall emit)
+                   (let* ((lv (car lvs))
+                          (i (level-index lv))
+                          (rows (env-rows env))
+                          (matched nil)
+                          (mat (gethash lv materialized)))
+                     (flet ((try (row k)
                               (setf (svref rows i) row)
                               (when (all-true (level-match lv) env)
                                 (setf matched t)
+                                (when k (setf (aref (cdr mat) k) t))
                                 (when (all-true (level-filters lv) env)
                                   (run (cdr lvs))))))
-                   (when (and (level-left-p lv) (not matched))
-                     (setf (svref rows i) (level-nullrow lv))
-                     (when (all-true (level-filters lv) env)
-                       (run (cdr lvs))))))))
-    (run levels)))
+                       (if mat
+                           (loop for row across (car mat) for k from 0 do (try row k))
+                           (funcall (level-iterate lv) env (lambda (row) (try row nil)))))
+                     (when (and (level-left-p lv) (not matched))
+                       (setf (svref rows i) (level-nullrow lv))
+                       (when (all-true (level-filters lv) env)
+                         (run (cdr lvs))))))))
+      (run levels)
+      ;; the unmatched rows of each RIGHT/FULL source, with every earlier
+      ;; source NULL
+      (loop for (lv . rest) on levels
+            for mat = (gethash lv materialized)
+            when mat
+              do (loop for row across (car mat)
+                       for hit across (cdr mat)
+                       unless hit
+                         do (let ((rows (env-rows env)))
+                              (dolist (earlier levels)
+                                (when (eq earlier lv) (return))
+                                (setf (svref rows (level-index earlier)) (level-nullrow earlier)))
+                              (setf (svref rows (level-index lv)) row)
+                              (when (loop for x in levels
+                                          always (all-true (level-filters x) env)
+                                          until (eq x lv))
+                                (run rest))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; ORDER BY support
