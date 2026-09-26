@@ -15,7 +15,11 @@ while [ $seed -lt $((first + count)) ]; do
     --eval '(handler-bind ((warning (function muffle-warning))) (asdf:load-system "sqlite-pure"))' \
     --load "$here/test/differential.lisp" --load "$here/test/fuzz.lisp" \
     --eval "(sqlite-pure.test::run-fuzz-side \"$dir\")" 2>&1 | grep -v '^;'
-  python3 "$here/test/fuzz.py" check "$dir" || fails=$((fails + 1))
+  if python3 "$here/test/fuzz.py" check "$dir"; then
+    rm -rf "$dir"          # keep only failing seeds
+  else
+    fails=$((fails + 1))
+  fi
   seed=$((seed + 1))
 done
 echo "fuzz: $count seeds, $fails failed"

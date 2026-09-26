@@ -58,6 +58,10 @@
   (pending-page-size nil)
   (lock :none)               ; :none :shared :reserved :exclusive
   (wal nil)
+  ;; several databases per connection (TEMP, ATTACH)
+  (name "main")
+  (conn nil)                 ; the connection (main database), or NIL if this is it
+  (attached '())             ; on the main database: alist name -> db, "temp" included
   (stmt-cache (make-hash-table :test #'equal))
   (closed nil))
 
@@ -66,6 +70,31 @@
     (format s "~a ~d pages" (or (db-path db) ":memory:") (db-page-count db))))
 
 (defun database-path (db) (db-path db))
+
+(defun conn (db) (or (db-conn db) db))
+
+(defun conn-dbs (db)
+  "Every database of DB's connection: main first, then temp and attached."
+  (let ((c (conn db)))
+    (cons c (mapcar #'cdr (db-attached c)))))
+
+(defun temp-db (db &optional create)
+  "The connection's TEMP database (an in-memory database), made on demand."
+  (let* ((c (conn db))
+         (hit (cdr (assoc "temp" (db-attached c) :test #'name=))))
+    (or hit
+        (when create
+          (let ((tdb (%make-db :name "temp" :conn c :encoding (db-encoding c))))
+            (setf (db-attached c) (cons (cons "temp" tdb) (db-attached c)))
+            tdb)))))
+
+(defun schema-db (db name &optional (errorp t))
+  "The database called NAME (main, temp, or an attachment) on DB's connection."
+  (let ((c (conn db)))
+    (cond ((name= name "main") c)
+          ((name= name "temp") (temp-db c t))
+          (t (or (cdr (assoc name (db-attached c) :test #'name=))
+                 (and errorp (sql-error "unknown database ~a" name)))))))
 
 (defun memory-db-p (db) (null (db-stream db)))
 
@@ -163,10 +192,13 @@
       (setf (aref b 18) 1 (aref b 19) 1 (aref b 20) 0
             (aref b 21) 64 (aref b 22) 32 (aref b 23) 32)
       (put-u32 b +hdr-schema-format+ 4)
-      (put-u32 b +hdr-text-encoding+ 1)
+      (put-u32 b +hdr-text-encoding+ (ecase (db-encoding db) (:utf-8 1) (:utf-16le 2) (:utf-16be 3)))
       (put-u32 b +hdr-page-count+ 1)
       (init-btree-page b 100 +leaf-table+ ps)
-      (setf (gethash 1 (db-dirty db)) t))))
+      (setf (gethash 1 (db-dirty db)) t)
+      ;; a statement or savepoint rolled back must remove the new page 1
+      (when (db-stmt-journal db) (setf (gethash 1 (db-stmt-journal db)) :new))
+      (dolist (sp (db-savepoints db)) (setf (gethash 1 (second sp)) :new)))))
 
 (defun parse-header (db b)
   (unless (every #'= +magic+ (subseq b 0 16))
@@ -235,6 +267,7 @@
 
 (defun close-database (db)
   (unless (db-closed db)
+    (dolist (a (db-attached db)) (close-database (cdr a)))
     (when (db-txn db) (rollback-write db))
     (unlock-to db :none)
     (when (db-stream db) (close (db-stream db)))
@@ -284,34 +317,29 @@
   (setf (db-page-count db) page-count
         (db-schema db) nil))
 
-(defun savepoint-open (db name)
-  (unless (db-explicit db)
-    (setf (db-explicit db) t (db-savepoint-txn db) t))
+(defun savepoint-push (db name)
   (push (list name (make-hash-table) (db-page-count db)) (db-savepoints db)))
 
-(defun find-savepoint (db name)
-  (or (position name (db-savepoints db) :key #'first :test #'name=)
-      (sql-error "no such savepoint: ~a" name)))
+(defun savepoint-outermost-p (db name)
+  "True if NAME is the outermost open savepoint (signals if unknown)."
+  (let ((k (or (position name (db-savepoints db) :key #'first :test #'name=)
+               (sql-error "no such savepoint: ~a" name))))
+    (= k (1- (length (db-savepoints db))))))
 
-(defun savepoint-release (db name)
-  "RELEASE: forget NAME and everything inside it; releasing the savepoint
-that opened the transaction commits it."
-  (let* ((k (find-savepoint db name))
-         (outermost (= k (1- (length (db-savepoints db))))))
-    (setf (db-savepoints db) (nthcdr (1+ k) (db-savepoints db)))
-    (when (and outermost (db-savepoint-txn db))
-      (commit-write db)
-      (setf (db-explicit db) nil (db-savepoint-txn db) nil))))
+(defun savepoint-pop (db name)
+  "RELEASE on one database: forget NAME and everything inside it."
+  (let ((k (position name (db-savepoints db) :key #'first :test #'name=)))
+    (when k (setf (db-savepoints db) (nthcdr (1+ k) (db-savepoints db))))))
 
-(defun savepoint-rollback-to (db name)
-  "ROLLBACK TO: undo everything since NAME; NAME stays open."
-  (let* ((k (find-savepoint db name))
-         (sp (nth k (db-savepoints db))))
-    (destructuring-bind (spname journal page-count) sp
-      (restore-journal db journal page-count)
-      (setf (db-savepoints db)
-            (cons (list spname (make-hash-table) page-count)
-                  (nthcdr (1+ k) (db-savepoints db)))))))
+(defun savepoint-restore (db name)
+  "ROLLBACK TO on one database: undo everything since NAME; NAME stays open."
+  (let ((k (position name (db-savepoints db) :key #'first :test #'name=)))
+    (when k
+      (destructuring-bind (spname journal page-count) (nth k (db-savepoints db))
+        (restore-journal db journal page-count)
+        (setf (db-savepoints db)
+              (cons (list spname (make-hash-table) page-count)
+                    (nthcdr (1+ k) (db-savepoints db))))))))
 
 (defun rollback-write (db)
   (setf (db-savepoints db) '() (db-savepoint-txn db) nil)

@@ -584,7 +584,6 @@
                       (progn (expect-kw p "INSERT") (parse-conflict-clause p)))))
     (expect-kw p "INTO")
     (multiple-value-bind (table schema) (parse-qualified-name p)
-      (declare (ignore schema))
       (let ((alias (when (accept-kw p "AS") (parse-name p t)))
             (cols nil) (source nil) (upsert nil))
         (when (accept-op p "(")
@@ -614,7 +613,7 @@
                            (push (list :target target :where target-where :action :update
                                        :sets sets :update-where w)
                                  upsert))))))
-        (list :insert :with with :conflict conflict :table table :alias alias
+        (list :insert :with with :conflict conflict :table table :schema schema :alias alias
                       :columns cols :source source :upsert (nreverse upsert)
                       :returning (parse-returning p))))))
 
@@ -636,13 +635,12 @@
   (expect-kw p "UPDATE")
   (let ((conflict (parse-conflict-clause p)))
     (multiple-value-bind (table schema) (parse-qualified-name p)
-      (declare (ignore schema))
       (let ((alias (parse-alias-before p "SET")))
         (expect-kw p "SET")
         (let* ((sets (parse-set-list p))
                (from (when (accept-kw p "FROM") (parse-from p)))
                (where (when (accept-kw p "WHERE") (parse-expr p))))
-          (list :update :with with :conflict conflict :table table :alias alias
+          (list :update :with with :conflict conflict :table table :schema schema :alias alias
                         :sets sets :from from :where where
                         :returning (parse-returning p)))))))
 
@@ -656,10 +654,9 @@
   (expect-kw p "DELETE")
   (expect-kw p "FROM")
   (multiple-value-bind (table schema) (parse-qualified-name p)
-    (declare (ignore schema))
     (let ((alias (parse-alias-before p "WHERE")))
       (let ((where (when (accept-kw p "WHERE") (parse-expr p))))
-        (list :delete :with with :table table :alias alias :where where
+        (list :delete :with with :table table :schema schema :alias alias :where where
                       :returning (parse-returning p))))))
 
 ;;; ------------------------------------------------------------------
@@ -781,9 +778,8 @@
       ((accept-kw p "TABLE")
        (let ((ine (accept-kw p "IF" "NOT" "EXISTS")))
          (multiple-value-bind (name schema) (parse-qualified-name p)
-           (declare (ignore schema))
            (if (accept-kw p "AS")
-               (list :create-table :name name :temp temp :if-not-exists ine
+               (list :create-table :name name :schema schema :temp temp :if-not-exists ine
                                    :as-select (parse-select p))
                (let ((cols '()) (constraints '()))
                  (expect-op p "(")
@@ -803,24 +799,22 @@
                            ((accept-kw p "STRICT") (setf strict t))
                            (t (return)))
                      (unless (accept-op p ",") (return)))
-                   (list :create-table :name name :temp temp :if-not-exists ine
+                   (list :create-table :name name :schema schema :temp temp :if-not-exists ine
                                        :columns (nreverse cols)
                                        :constraints (nreverse constraints)
                                        :without-rowid without-rowid :strict strict)))))))
       ((accept-kw p "INDEX")
        (let ((ine (accept-kw p "IF" "NOT" "EXISTS")))
          (multiple-value-bind (name schema) (parse-qualified-name p)
-           (declare (ignore schema))
            (expect-kw p "ON")
            (let* ((table (parse-name p t))
                   (cols (parse-indexed-columns p))
                   (where (when (accept-kw p "WHERE") (parse-expr p))))
-             (list :create-index :name name :table table :unique unique
+             (list :create-index :name name :schema schema :table table :unique unique
                                  :if-not-exists ine :columns cols :where where)))))
       ((accept-kw p "VIEW")
        (let ((ine (accept-kw p "IF" "NOT" "EXISTS")))
          (multiple-value-bind (name schema) (parse-qualified-name p)
-           (declare (ignore schema))
            (let ((cols nil))
              (when (accept-op p "(")
                (setf cols (list (parse-name p t)))
@@ -828,13 +822,12 @@
                (setf cols (nreverse cols))
                (expect-op p ")"))
              (expect-kw p "AS")
-             (list :create-view :name name :temp temp :if-not-exists ine :columns cols
+             (list :create-view :name name :schema schema :temp temp :if-not-exists ine :columns cols
                                 :select (parse-select p))))))
       ((accept-kw p "TRIGGER")
        (let ((ine (accept-kw p "IF" "NOT" "EXISTS")))
          (multiple-value-bind (name schema) (parse-qualified-name p)
-           (declare (ignore schema))
-           (parse-trigger-rest p name ine))))
+           (append (parse-trigger-rest p name ine) (list :schema schema :temp temp)))))
       ((accept-kw p "VIRTUAL" "TABLE")
        (perr p "virtual tables are not supported"))
       (t (perr p "syntax error")))))
@@ -870,29 +863,27 @@
                     (t (perr p "syntax error")))))
     (let ((ie (accept-kw p "IF" "EXISTS")))
       (multiple-value-bind (name schema) (parse-qualified-name p)
-        (declare (ignore schema))
-        (list :drop :kind kind :name name :if-exists ie)))))
+        (list :drop :kind kind :name name :schema schema :if-exists ie)))))
 
 (defun parse-alter (p)
   (expect-kw p "ALTER") (expect-kw p "TABLE")
   (multiple-value-bind (name schema) (parse-qualified-name p)
-    (declare (ignore schema))
-    (cond ((accept-kw p "RENAME" "TO") (list :alter :table name :rename-to (parse-name p t)))
+    (cond ((accept-kw p "RENAME" "TO") (list :alter :table name :schema schema :rename-to (parse-name p t)))
           ((accept-kw p "RENAME")
            (accept-kw p "COLUMN")
            (let ((old (parse-name p t)))
              (expect-kw p "TO")
-             (list :alter :table name :rename-column old :to (parse-name p t))))
+             (list :alter :table name :schema schema :rename-column old :to (parse-name p t))))
           ((accept-kw p "ADD")
            (accept-kw p "COLUMN")
            (let ((start (tok-pos (peek-tok p))))
              (let ((def (parse-column-def p)))
-               (list :alter :table name :add-column def
+               (list :alter :table name :schema schema :add-column def
                             :sql (string-trim " " (subseq (ps-sql p) start
                                                           (tok-pos (peek-tok p))))))))
           ((accept-kw p "DROP")
            (accept-kw p "COLUMN")
-           (list :alter :table name :drop-column (parse-name p t)))
+           (list :alter :table name :schema schema :drop-column (parse-name p t)))
           (t (perr p "syntax error")))))
 
 (defun parse-pragma (p)
@@ -949,6 +940,14 @@
          (list :rollback)))
     ((accept-kw p "SAVEPOINT") (list :savepoint (parse-name p t)))
     ((accept-kw p "RELEASE") (accept-kw p "SAVEPOINT") (list :release (parse-name p t)))
+    ((accept-kw p "ATTACH")
+     (accept-kw p "DATABASE")
+     (let ((file (parse-expr p)))
+       (expect-kw p "AS")
+       (list :attach file (parse-name p t))))
+    ((accept-kw p "DETACH")
+     (accept-kw p "DATABASE")
+     (list :detach (parse-name p t)))
     ((accept-kw p "VACUUM") (list :noop))
     ((accept-kw p "ANALYZE") (unless (op-p p ";") (when (name-token-p (peek-tok p) t) (parse-qualified-name p))) (list :noop))
     ((accept-kw p "REINDEX") (when (name-token-p (peek-tok p) t) (parse-qualified-name p)) (list :noop))

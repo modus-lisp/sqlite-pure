@@ -23,24 +23,32 @@
 (defun null-row (table)
   (make-array (1+ (length (table-columns table))) :initial-element :null))
 
+(defun trigger-dbs (table)
+  "Databases whose triggers may fire on TABLE: its own, and TEMP."
+  (let ((own (or (table-owner table) *db*)) (tmp (temp-db *db*)))
+    (if (and tmp (not (eq tmp own))) (list own tmp) (list own))))
+
 (defun triggers-for (table event timing)
   (let ((out '()))
-    (maphash (lambda (k v) (declare (ignore k))
-               (destructuring-bind (tbl . ast) v
-                 (when (and (name= tbl (table-name table))
-                            (eq (getf (cdr ast) :event) event)
-                            (eq (getf (cdr ast) :timing) timing))
-                   (push ast out))))
-             (schema-triggers (db-schema* *db*)))
-    ;; newest first: sort by position in sqlite_schema, descending
-    (let ((order (mapcar #'third (schema-rows (db-schema* *db*)))))
-      (sort out #'> :key (lambda (ast) (or (position (getf (cdr ast) :name) order :test #'name=) 0))))))
+    (dolist (d (trigger-dbs table))
+      (let ((order (mapcar #'third (schema-rows (db-schema* d)))))
+        (maphash (lambda (k v) (declare (ignore k))
+                   (destructuring-bind (tbl . ast) v
+                     (when (and (name= tbl (table-name table))
+                                (eq (getf (cdr ast) :event) event)
+                                (eq (getf (cdr ast) :timing) timing))
+                       (push (cons (or (position (getf (cdr ast) :name) order :test #'name=) 0) ast)
+                             out))))
+                 (schema-triggers (db-schema* d)))))
+    ;; newest first: by position in sqlite_schema, descending
+    (mapcar #'cdr (sort out #'> :key #'car))))
 
 (defun table-has-triggers-p (table)
   (let ((hit nil))
-    (maphash (lambda (k v) (declare (ignore k))
-               (when (name= (car v) (table-name table)) (setf hit t)))
-             (schema-triggers (db-schema* *db*)))
+    (dolist (d (trigger-dbs table))
+      (maphash (lambda (k v) (declare (ignore k))
+                 (when (name= (car v) (table-name table)) (setf hit t)))
+               (schema-triggers (db-schema* d))))
     hit))
 
 (defun run-trigger-statement (st)

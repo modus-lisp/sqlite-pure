@@ -2,7 +2,13 @@
 
 (in-package #:sqlite-pure)
 
-(defun schema-table () (lookup-table *db* "sqlite_schema"))
+(defun schema-table () (find-table-in *db* "sqlite_schema"))
+
+(defun ddl-target (schema temp)
+  "The database a CREATE statement writes to."
+  (cond (temp (temp-db *db* t))
+        (schema (schema-db *db* schema))
+        (t (conn *db*))))
 
 (defun bump-schema-cookie ()
   (set-header-u32 *db* +hdr-schema-cookie+ (1+ (header-u32 *db* +hdr-schema-cookie+)))
@@ -76,7 +82,7 @@
           for k from 1
           do (add-schema-row "index" (format nil "sqlite_autoindex_~a_~d" name k) name
                              (create-btree *db* +leaf-index+) nil))
-    (when (and (table-autoincrement tb) (null (lookup-table *db* "sqlite_sequence" nil)))
+    (when (and (table-autoincrement tb) (null (find-table-in *db* "sqlite_sequence")))
       (let ((seq-sql "CREATE TABLE sqlite_sequence(name,seq)"))
         (add-schema-row "table" "sqlite_sequence" "sqlite_sequence"
                         (create-btree *db* +leaf-table+) seq-sql)))
@@ -86,9 +92,9 @@
   (case aff (:integer "INT") (:real "REAL") (:numeric "NUM") (:text "TEXT") (t "")))
 
 (defun exec-create-table (st text)
-  (destructuring-bind (&key name temp if-not-exists as-select &allow-other-keys) (cdr st)
-    (declare (ignore temp))
-    (when (lookup-table *db* name nil)
+  (destructuring-bind (&key name schema temp if-not-exists as-select &allow-other-keys) (cdr st)
+   (let ((*db* (ddl-target schema temp)))
+    (when (find-table-in *db* name)
       (if if-not-exists
           (return-from exec-create-table nil)
           (sql-error "table ~a already exists" name)))
@@ -105,7 +111,7 @@
                                     collect (format nil "~a~:[ ~a~;~*~]" (quote-ident n)
                                                     (string= ty "") ty)))))
             (create-table-from-ast (car (first (parse-sql sql))) sql)
-            (let ((tb (lookup-table *db* name))
+            (let ((tb (find-table-in *db* name))
                   (ctx nil))
               (setf ctx (make-write-ctx :table tb))
               (dolist (r rows)
@@ -116,7 +122,7 @@
                   (finalize-rowid tb row)
                   (write-row tb row))))))
         (create-table-from-ast st (stored-create-sql text "TABLE")))
-    nil))
+    nil)))
 
 (defun dedupe-names (names)
   (let ((seen '()))
@@ -150,13 +156,15 @@
                           (index-insert *db* (index-root idx) key)))))))
 
 (defun exec-create-index (st text)
-  (destructuring-bind (&key name table if-not-exists &allow-other-keys) (cdr st)
-    (when (lookup-index *db* name)
+  (destructuring-bind (&key name schema table if-not-exists &allow-other-keys) (cdr st)
+   (let* ((tb (lookup-table *db* table t schema))
+          (*db* (table-owner tb)))
+    (when (gethash (schema-key name) (schema-indexes (db-schema* *db*)))
       (if if-not-exists
           (return-from exec-create-index nil)
           (sql-error "index ~a already exists" name)))
     (check-new-name name :index)
-    (let ((tb (lookup-table *db* table)))
+    (let ((tb (find-table-in *db* table)))
       (when (table-view-select tb) (sql-error "views may not be indexed"))
       (when (= (table-root tb) 1) (sql-error "table ~a may not be indexed" table))
       (let* ((sql (stored-create-sql text "INDEX"))
@@ -169,11 +177,12 @@
         (populate-index tb idx)
         (add-schema-row "index" name (table-name tb) (index-root idx) sql)
         (bump-schema-cookie)))
-    nil))
+    nil)))
 
 (defun exec-create-view (st text)
-  (destructuring-bind (&key name if-not-exists select &allow-other-keys) (cdr st)
-    (when (lookup-table *db* name nil)
+  (destructuring-bind (&key name schema temp if-not-exists select &allow-other-keys) (cdr st)
+   (let ((*db* (ddl-target schema temp)))
+    (when (find-table-in *db* name)
       (if if-not-exists
           (return-from exec-create-view nil)
           (sql-error "view ~a already exists" name)))
@@ -182,27 +191,41 @@
     (compile-select select (make-scope))
     (add-schema-row "view" name name 0 (stored-create-sql text "VIEW"))
     (bump-schema-cookie)
-    nil))
+    nil)))
 
 (defun exec-create-trigger (st text)
-  (destructuring-bind (&key name if-not-exists table &allow-other-keys) (cdr st)
+  (destructuring-bind (&key name schema temp if-not-exists table &allow-other-keys) (cdr st)
+   (let* ((tb (lookup-table *db* table t (unless temp schema)))
+          (*db* (if temp (temp-db *db* t) (table-owner tb))))
     (when (gethash (schema-key name) (schema-triggers (db-schema* *db*)))
       (if if-not-exists
           (return-from exec-create-trigger nil)
           (sql-error "trigger ~a already exists" name)))
-    (let ((tb (lookup-table *db* table)))
+    (progn
       (add-schema-row "trigger" name (table-name tb) 0 (stored-create-sql text "TRIGGER"))
       (bump-schema-cookie))
-    nil))
+    nil)))
 
 ;;; ------------------------------------------------------------------
 ;;; DROP
 
+(defun object-db (kind name schema)
+  "The database holding the index or trigger NAME."
+  (loop for d in (if schema (list (schema-db *db* schema)) (temp-first (conn-dbs *db*)))
+        when (gethash (schema-key name) (if (eq kind :index)
+                                            (schema-indexes (db-schema* d))
+                                            (schema-triggers (db-schema* d))))
+          return d))
+
 (defun exec-drop (st)
-  (destructuring-bind (&key kind name if-exists) (cdr st)
+  (destructuring-bind (&key kind name schema if-exists) (cdr st)
+    (let ((*db* (case kind
+                  ((:table :view) (let ((tb (lookup-table *db* name nil schema)))
+                                    (if tb (table-owner tb) *db*)))
+                  (t (or (object-db kind name schema) *db*)))))
     (ecase kind
       ((:table :view)
-       (let ((tb (lookup-table *db* name nil)))
+       (let ((tb (find-table-in *db* name)))
          (when (or (null tb) (if (eq kind :view)
                                  (null (table-view-select tb))
                                  (table-view-select tb)))
@@ -228,7 +251,7 @@
          (delete-schema-rows (lambda (r) (and (stringp (fourth r)) (name= (fourth r) name))))
          (bump-schema-cookie)))
       (:index
-       (let ((idx (lookup-index *db* name)))
+       (let ((idx (gethash (schema-key name) (schema-indexes (db-schema* *db*)))))
          (unless idx
            (if if-exists (return-from exec-drop nil) (sql-error "no such index: ~a" name)))
          (when (index-auto idx)
@@ -240,7 +263,7 @@
        (unless (gethash (schema-key name) (schema-triggers (db-schema* *db*)))
          (if if-exists (return-from exec-drop nil) (sql-error "no such trigger: ~a" name)))
        (delete-schema-rows (lambda (r) (and (equal (second r) "trigger") (name= (third r) name))))
-       (bump-schema-cookie)))
+       (bump-schema-cookie))))
     nil))
 
 ;;; ------------------------------------------------------------------
@@ -261,8 +284,9 @@
     (get-output-stream-string out)))
 
 (defun exec-alter (st)
-  (destructuring-bind (&key table rename-to rename-column to add-column drop-column sql) (cdr st)
-    (let ((tb (lookup-table *db* table)))
+  (destructuring-bind (&key table schema rename-to rename-column to add-column drop-column sql) (cdr st)
+    (let* ((tb (lookup-table *db* table t schema))
+           (*db* (table-owner tb)))
       (when (table-view-select tb) (sql-error "cannot alter view ~a" table))
       (when (and (>= (length table) 7) (name= (subseq table 0 7) "sqlite_"))
         (sql-error "table ~a may not be altered" table))
@@ -388,7 +412,7 @@
         (let ((rows (scan-table-rows tb nil nil)))
           (rewrite-schema-row r :sql new)
           (setf (db-schema *db*) nil)
-          (let ((ntb (lookup-table *db* (table-name tb))))
+          (let ((ntb (find-table-in *db* (table-name tb))))
             (dolist (row rows)
               (let ((nrow (concatenate 'vector (subseq row 0 ci) (subseq row (1+ ci)))))
                 (table-insert *db* (table-root ntb) (svref nrow (1- (length nrow)))

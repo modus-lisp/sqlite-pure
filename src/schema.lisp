@@ -8,6 +8,7 @@
 
 (defstruct table
   name root sql
+  owner                  ; the database (pager) the table lives in
   columns                ; vector of COLUMN
   rowid-alias            ; index of the INTEGER PRIMARY KEY column, or NIL
   without-rowid
@@ -210,6 +211,8 @@
                 ((and (equal type "trigger") (stringp sql))
                  (setf (gethash (schema-key name) (schema-triggers schema))
                        (cons tbl (car (first (parse-sql sql))))))))))
+    (maphash (lambda (k tb) (declare (ignore k)) (setf (table-owner tb) db))
+             (schema-tables schema))
     ;; A WITHOUT ROWID table is its own primary-key index.
     (maphash (lambda (k tb) (declare (ignore k))
                (when (table-without-rowid tb)
@@ -242,12 +245,34 @@
   (or (db-schema db)
       (setf (db-schema db) (load-schema db))))
 
-(defun lookup-table (db name &optional (errorp t))
-  (or (gethash (schema-key name) (schema-tables (db-schema* db)))
-      (and errorp (sql-error "no such table: ~a" name))))
+(defun find-table-in (db name)
+  "NAME in DB's own schema only."
+  (gethash (schema-key name) (schema-tables (db-schema* db))))
 
-(defun lookup-index (db name)
-  (gethash (schema-key name) (schema-indexes (db-schema* db))))
+(defun temp-first (dbs)
+  (append (remove-if-not (lambda (x) (name= (db-name x) "temp")) dbs)
+          (remove-if (lambda (x) (name= (db-name x) "temp")) dbs)))
+
+(defun lookup-table (db name &optional (errorp t) schema)
+  "Resolve a table name as SQLite does: in SCHEMA if given, else TEMP, then
+main, then attached databases in order."
+  (or (cond
+        (schema (let ((d (schema-db db schema nil)))
+                  (and d (if (member name '("sqlite_temp_master" "sqlite_temp_schema")
+                                     :test #'name=)
+                             (find-table-in d "sqlite_schema")
+                             (find-table-in d name)))))
+        ((member name '("sqlite_temp_master" "sqlite_temp_schema") :test #'name=)
+         (find-table-in (temp-db db t) "sqlite_schema"))
+        ((member name '("sqlite_master" "sqlite_schema") :test #'name=)
+         (find-table-in (conn db) name))
+        (t (loop for d in (temp-first (conn-dbs db))
+                 thereis (find-table-in d name))))
+      (and errorp (sql-error "no such table: ~@[~a.~]~a" schema name))))
+
+(defun lookup-index (db name &optional schema)
+  (loop for d in (if schema (list (schema-db db schema)) (temp-first (conn-dbs db)))
+        thereis (gethash (schema-key name) (schema-indexes (db-schema* d)))))
 
 (defun table-triggers (db table event timing)
   (let ((out '()))

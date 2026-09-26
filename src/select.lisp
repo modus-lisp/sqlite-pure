@@ -47,7 +47,7 @@
     row))
 
 (defun fetch-row (table rowid &optional wanted)
-  (let ((payload (table-lookup *db* (table-root table) rowid)))
+  (let ((payload (table-lookup (table-owner table) (table-root table) rowid)))
     (when payload
       (table-record-to-row table rowid (decode-record payload 0 (length payload) nil wanted)))))
 
@@ -55,9 +55,9 @@
   "Call FN on every row of TABLE.  WANTED (a bit vector) limits which
 columns are decoded; the others read as NULL."
   (if (table-without-rowid table)
-      (map-index *db* (table-root table)
+      (map-index (table-owner table) (table-root table)
                  (lambda (vals) (funcall fn (table-record-to-row table nil vals))))
-      (map-table *db* (table-root table)
+      (map-table (table-owner table) (table-root table)
                  (lambda (rowid payload)
                    (funcall fn (table-record-to-row
                                 table rowid (decode-record payload 0 (length payload) nil wanted))))
@@ -149,11 +149,10 @@ columns are decoded; the others read as NULL."
             (ecase (car source)
               (:table
                (destructuring-bind (name alias &optional schema) (cdr source)
-                 (declare (ignore schema))
                  (let ((cte (and (null (fourth source)) (cdr (assoc name *ctes* :test #'name=)))))
                    (cond
                      (cte (cte-source cte alias))
-                     (t (let ((table (lookup-table *db* name)))
+                     (t (let ((table (lookup-table *db* name t schema)))
                           (if (table-view-select table)
                               (let ((*ctes* '()))
                                 (select-derived-source (table-view-select table) (or alias name)
@@ -350,7 +349,7 @@ source[LI].col = expr where expr references only earlier sources."
                                    collect (convert-probe v ca oa))))
                   (when (= (length probe) (length fns))
                     (catch :index-done
-                      (map-index *db* (index-root idx)
+                      (map-index (table-owner table) (index-root idx)
                                  (lambda (vals)
                                    (unless (zerop (funcall cmp vals probe))
                                      (throw :index-done nil))
@@ -771,12 +770,13 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                (= (length from) 1)
                (eq (car (getf (first from) :source)) :table)
                (null (cdr (assoc (second (getf (first from) :source)) *ctes* :test #'name=))))
-      (let ((table (lookup-table *db* (second (getf (first from) :source)) nil)))
+      (let ((table (lookup-table *db* (second (getf (first from) :source)) nil
+                                 (fourth (getf (first from) :source)))))
         (when (and table (not (table-view-select table)))
           (let ((c (first cols)))
             (values (lambda (parent-env)
                       (declare (ignore parent-env))
-                      (list (list (btree-count *db* (table-root table)))))
+                      (list (list (btree-count (table-owner table) (table-root table)))))
                     (list (list (or (third c) (fourth c) "count(*)") nil :binary))
                     nil)))))))
 

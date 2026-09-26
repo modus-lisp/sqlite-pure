@@ -1,0 +1,52 @@
+== temp-tables
+CREATE TABLE t(a);
+INSERT INTO t VALUES (1), (2);
+CREATE TEMP TABLE t(b);
+INSERT INTO t VALUES ('temp');
+SELECT * FROM t;
+SELECT * FROM main.t ORDER BY a;
+SELECT * FROM temp.t;
+SELECT name FROM sqlite_temp_master;
+SELECT name FROM sqlite_master;
+DROP TABLE t;
+SELECT * FROM t ORDER BY a;
+CREATE TEMPORARY TABLE tt(x PRIMARY KEY, y);
+INSERT INTO tt VALUES (1, 'a'), (2, 'b');
+INSERT INTO tt VALUES (1, 'dup');
+CREATE INDEX temp.tty ON tt(y);
+SELECT x FROM tt WHERE y = 'b';
+SELECT type, name FROM temp.sqlite_master ORDER BY name;
+CREATE TEMP VIEW v AS SELECT a FROM main.t;
+SELECT * FROM v ORDER BY a;
+
+== temp-trigger-on-main
+CREATE TABLE t(a);
+CREATE TEMP TABLE log(m);
+CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.a * 10); END;
+INSERT INTO t VALUES (1), (2);
+SELECT m FROM log ORDER BY m;
+SELECT count(*) FROM sqlite_master WHERE type = 'trigger';
+
+== attach-memory
+CREATE TABLE t(a);
+INSERT INTO t VALUES (1);
+ATTACH DATABASE ':memory:' AS aux;
+CREATE TABLE aux.t(a);
+INSERT INTO aux.t VALUES (100), (200);
+SELECT a FROM t;
+SELECT a FROM aux.t ORDER BY a;
+SELECT m.a, x.a FROM main.t m, aux.t x ORDER BY 2;
+CREATE TABLE aux.u(z UNIQUE);
+INSERT INTO u VALUES (1);
+INSERT INTO aux.u VALUES (1);
+SELECT name FROM aux.sqlite_master ORDER BY name;
+PRAGMA database_list;
+BEGIN;
+INSERT INTO aux.t VALUES (300);
+INSERT INTO main.t VALUES (2);
+ROLLBACK;
+SELECT (SELECT count(*) FROM main.t), (SELECT count(*) FROM aux.t);
+ATTACH ':memory:' AS aux;
+DETACH aux;
+SELECT * FROM aux.t;
+DETACH nosuch;

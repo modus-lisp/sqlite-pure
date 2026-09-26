@@ -20,28 +20,31 @@
                           :test #'name=)))
     (t nil)))
 
+(defun commit-all (db) (dolist (d (conn-dbs db)) (commit-write d)))
+(defun rollback-all (db) (dolist (d (conn-dbs db)) (rollback-write d)))
+
 (defun run-in-write-txn (db thunk)
-  "Run THUNK as one atomic statement."
+  "Run THUNK as one atomic statement (across every attached database)."
   (cond
     ((db-explicit db)
-     (ensure-write-txn db)
-     (statement-begin db)
-     (let ((ok nil))
+     (let ((ok nil) (started (conn-dbs db)))
+       (dolist (d started) (statement-begin d))
        (unwind-protect
             (handler-bind ((sqlite-conflict
                              (lambda (c)
                                (case (conflict-action c)
-                                 (:rollback (rollback-write db) (setf (db-explicit db) nil ok t))
+                                 (:rollback (rollback-all db) (setf (db-explicit db) nil ok t))
                                  (:fail (setf ok t))))))
               (multiple-value-prog1 (funcall thunk) (setf ok t)))
-         (if ok (statement-end db) (statement-rollback db)))))
+         (dolist (d (conn-dbs db))
+           (if (and (not ok) (member d started)) (statement-rollback d) (statement-end d))))))
     (t
      (let ((ok nil) (keep nil))
        (unwind-protect
             (handler-bind ((sqlite-conflict
                              (lambda (c) (when (eq (conflict-action c) :fail) (setf keep t)))))
               (multiple-value-prog1 (funcall thunk) (setf ok t)))
-         (if (or ok keep) (commit-write db) (rollback-write db)))))))
+         (if (or ok keep) (commit-all db) (rollback-all db)))))))
 
 (defun exec-ast (db st text)
   "Execute one parsed statement.  Return (values rows column-names)."
@@ -56,17 +59,31 @@
        (values nil nil))
       (:commit
        (unless (db-explicit db) (sql-error "cannot commit - no transaction is active"))
-       (commit-write db)
-       (setf (db-explicit db) nil (db-savepoints db) '() (db-savepoint-txn db) nil)
+       (commit-all db)
+       (setf (db-explicit db) nil (db-savepoint-txn db) nil)
        (values nil nil))
       (:rollback
        (unless (db-explicit db) (sql-error "cannot rollback - no transaction is active"))
-       (rollback-write db)
+       (rollback-all db)
        (setf (db-explicit db) nil)
        (values nil nil))
-      (:savepoint (savepoint-open db (second st)) (values nil nil))
-      (:release (savepoint-release db (second st)) (values nil nil))
-      (:rollback-to (savepoint-rollback-to db (second st)) (values nil nil))
+      (:savepoint
+       (unless (db-explicit db) (setf (db-explicit db) t (db-savepoint-txn db) t))
+       (dolist (d (conn-dbs db)) (savepoint-push d (second st)))
+       (values nil nil))
+      (:release
+       (let ((outermost (savepoint-outermost-p db (second st))))
+         (dolist (d (conn-dbs db)) (savepoint-pop d (second st)))
+         (when (and outermost (db-savepoint-txn db))
+           (commit-all db)
+           (setf (db-explicit db) nil (db-savepoint-txn db) nil)))
+       (values nil nil))
+      (:rollback-to
+       (savepoint-outermost-p db (second st))   ; signals if unknown
+       (dolist (d (conn-dbs db)) (savepoint-restore d (second st)))
+       (values nil nil))
+      (:attach (exec-attach db (second st) (third st)) (values nil nil))
+      (:detach (exec-detach db (second st)) (values nil nil))
       (:noop (values nil nil))
       (:pragma (exec-pragma db st))
       (t
@@ -117,11 +134,12 @@
           (let ((*json-values* (make-hash-table :test #'eq)))
             (unwind-protect
                  (progn
-                   (lock-shared db)
+                   (dolist (d (conn-dbs db)) (lock-shared d))
                    (multiple-value-setq (rows cols) (exec-ast db (car s) (cdr s))))
               ;; outside a transaction every statement is its own read transaction
-              (unless (or (db-explicit db) (db-txn db))
-                (unlock-to db :none)))))
+              (unless (db-explicit db)
+                (dolist (d (conn-dbs db))
+                  (unless (db-txn d) (unlock-to d :none)))))))
         (values rows cols)))))
 
 (defun execute (db sql &rest params)
@@ -236,7 +254,14 @@ non-local exit.  Nested uses become savepoints."
           ((string= n "index_info") (pragma-index-info db value nil))
           ((string= n "index_xinfo") (pragma-index-info db value t))
           ((string= n "database_list")
-           (pragma-rows '("seq" "name" "file") (list (list 0 "main" (or (db-path db) "")))))
+           (pragma-rows '("seq" "name" "file")
+                        (let ((next 2))
+                          ;; seq: main 0, temp 1, attachments from 2
+                          (loop for d in (temp-first-list db)
+                                collect (list (cond ((eq d (conn db)) 0)
+                                                    ((name= (db-name d) "temp") 1)
+                                                    (t (prog1 next (incf next))))
+                                              (db-name d) (or (db-path d) ""))))))
           ((string= n "table_list") (pragma-table-list db))
           ((member n '("integrity_check" "quick_check") :test #'string=)
            (let ((problems (integrity-check db)))
@@ -249,6 +274,33 @@ non-local exit.  Nested uses become savepoints."
              (maphash (lambda (k v) (declare (ignore v)) (pushnew k names :test #'string=)) *aggregates*)
              (pragma-rows '("name") (mapcar #'list (sort names #'string<)))))
           (t (values nil nil)))))))
+
+(defun temp-first-list (db)
+  "main, temp, then attachments: PRAGMA database_list order."
+  (let* ((all (conn-dbs db))
+         (tmp (find "temp" all :key #'db-name :test #'name=)))
+    (append (list (first all)) (and tmp (list tmp))
+            (remove tmp (rest all)))))
+
+(defun exec-attach (db file-expr name)
+  (let* ((c (conn db))
+         (file (value-to-text (funcall (compile-expr file-expr (make-scope)) nil))))
+    (when (or (name= name "main") (name= name "temp")
+              (assoc name (db-attached c) :test #'name=))
+      (sql-error "database ~a is already in use" name))
+    (when (db-explicit c) (sql-error "cannot ATTACH database within transaction"))
+    (let ((d (open-database file)))
+      (setf (db-name d) name (db-conn d) c)
+      (setf (db-attached c) (append (db-attached c) (list (cons name d)))))))
+
+(defun exec-detach (db name)
+  (let* ((c (conn db))
+         (hit (assoc name (db-attached c) :test #'name=)))
+    (when (or (null hit) (name= name "temp"))
+      (sql-error "no such database: ~a" name))
+    (when (db-explicit c) (sql-error "cannot DETACH database within transaction"))
+    (close-database (cdr hit))
+    (setf (db-attached c) (remove hit (db-attached c)))))
 
 (defun to-signed32 (u) (if (logbitp 31 u) (- u (expt 2 32)) u))
 

@@ -84,14 +84,14 @@
     (unless (index-pk-index idx)
       (when (index-applies-p table idx row)
         (let ((*index-cmp* (index-full-cmp table idx)))
-          (index-insert *db* (index-root idx) (index-key table idx row)))))))
+          (index-insert (table-owner table) (index-root idx) (index-key table idx row)))))))
 
 (defun delete-index-entries (table row)
   (dolist (idx (table-indexes table))
     (unless (index-pk-index idx)
       (when (index-applies-p table idx row)
         (let ((*index-cmp* (index-full-cmp table idx)))
-          (index-delete *db* (index-root idx) (index-key table idx row)))))))
+          (index-delete (table-owner table) (index-root idx) (index-key table idx row)))))))
 
 (defun write-row (table row)
   "Store ROW (a full row vector, rowid last) and its index entries."
@@ -99,8 +99,8 @@
     (if (table-without-rowid table)
         (let* ((pkidx (find-if #'index-pk-index (table-indexes table)))
                (*index-cmp* (index-full-cmp table pkidx)))
-          (index-insert *db* (table-root table) (wr-record table row)))
-        (table-insert *db* (table-root table) (svref row n)
+          (index-insert (table-owner table) (table-root table) (wr-record table row)))
+        (table-insert (table-owner table) (table-root table) (svref row n)
                       (encode-record (table-record table row))))
     (insert-index-entries table row)))
 
@@ -109,8 +109,8 @@
   (if (table-without-rowid table)
       (let* ((pkidx (find-if #'index-pk-index (table-indexes table)))
              (*index-cmp* (index-full-cmp table pkidx)))
-        (index-delete *db* (table-root table) (wr-record table row)))
-      (table-delete *db* (table-root table) (svref row (length (table-columns table))))))
+        (index-delete (table-owner table) (table-root table) (wr-record table row)))
+      (table-delete (table-owner table) (table-root table) (svref row (length (table-columns table))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Conflict detection
@@ -123,7 +123,7 @@
     (when (member :null key) (return-from find-index-conflicts nil))
     (let ((cmp (index-key-cmp (index-collations index) (index-descs index))))
       (catch :probe-done
-        (map-index *db* (index-root index)
+        (map-index (table-owner table) (index-root index)
                    (lambda (vals)
                      (unless (zerop (funcall cmp vals key)) (throw :probe-done nil))
                      (let ((other (cond ((index-pk-index index) (table-record-to-row table nil vals))
@@ -141,7 +141,7 @@
          (cmp (index-key-cmp (index-collations pkidx) (index-descs pkidx)))
          (found nil))
     (catch :probe-done
-      (map-index *db* (table-root table)
+      (map-index (table-owner table) (table-root table)
                  (lambda (vals)
                    (when (zerop (funcall cmp vals pk-vals))
                      (setf found (table-record-to-row table nil vals)))
@@ -174,10 +174,12 @@
 ;;; ------------------------------------------------------------------
 ;;; Rowids
 
-(defun sequence-table () (lookup-table *db* "sqlite_sequence" nil))
+(defun sequence-table (&optional (db *db*))
+  "sqlite_sequence of DB (a table's owner)."
+  (find-table-in db "sqlite_sequence"))
 
 (defun sequence-value (table)
-  (let ((seq (sequence-table)))
+  (let ((seq (sequence-table (table-owner table))))
     (if (null seq)
         0
         (let ((v 0))
@@ -187,7 +189,7 @@
           v))))
 
 (defun update-sequence (table rowid)
-  (let ((seq (sequence-table)))
+  (let ((seq (sequence-table (table-owner table))))
     (when seq
       (let ((existing nil))
         (map-table-rows seq (lambda (row)
@@ -195,7 +197,7 @@
                                 (setf existing row))))
         (cond ((null existing)
                (let ((r (vector (table-name table) rowid
-                                (1+ (or (table-max-rowid *db* (table-root seq)) 0)))))
+                                (1+ (or (table-max-rowid (table-owner seq) (table-root seq)) 0)))))
                  (write-row seq r)))
               ((< (value-to-integer (svref existing 1)) rowid)
                (let ((r (copy-seq existing)))
@@ -203,7 +205,7 @@
                  (write-row seq r))))))))
 
 (defun new-rowid (table)
-  (let ((mx (or (table-max-rowid *db* (table-root table)) 0)))
+  (let ((mx (or (table-max-rowid (table-owner table) (table-root table)) 0)))
     (when (table-autoincrement table)
       (setf mx (max mx (sequence-value table))))
     (if (< mx +i64-max+)
@@ -213,7 +215,7 @@
             ;; SQLite probes random rowids when the maximum is taken
             (loop repeat 100
                   for r = (1+ (random +i64-max+))
-                  unless (table-lookup *db* (table-root table) r) return r
+                  unless (table-lookup (table-owner table) (table-root table) r) return r
                   finally (error 'sqlite-error :code :full :message "database or disk is full"))))))
 
 ;;; ------------------------------------------------------------------
@@ -360,7 +362,7 @@
             (t
              (write-row table row)
              (unless (table-without-rowid table)
-               (setf (db-last-insert-rowid *db*) (svref row (length (table-columns table)))))
+               (setf (db-last-insert-rowid (conn *db*)) (svref row (length (table-columns table)))))
              (incf (wc-changes ctx))
              (collect-returning ctx row)
              t)))))
@@ -433,8 +435,8 @@
                (view-column-info table)))
     copy))
 
-(defun writable-table (name &optional event)
-  (let ((table (lookup-table *db* name)))
+(defun writable-table (name &optional event schema)
+  (let ((table (lookup-table *db* name t schema)))
     (when (table-view-select table)
       (if (and event (triggers-for table event :instead-of))
           (return-from writable-table (view-as-table table))
@@ -467,11 +469,11 @@
             rnames)))
 
 (defun exec-insert (st)
-  (destructuring-bind (&key with conflict table alias columns source upsert returning) (cdr st)
+  (destructuring-bind (&key with conflict table schema alias columns source upsert returning) (cdr st)
     (let* ((*ctes* *ctes*)
            (tb (progn (when with (register-ctes (make-sel :with (first with)
                                                           :recursive (second with))))
-                      (writable-table table :insert)))
+                      (writable-table table :insert schema)))
            (view (table-view-select tb))
            (triggers (table-has-triggers-p tb))
            (ncols (length (table-columns tb)))
@@ -519,8 +521,8 @@
                  (update-sequence tb (svref row ncols)))
                (when (and (eq (insert-prepared-row ctx row) t) triggers)
                  (fire-triggers tb :insert :after nil row))))))
-        (setf (db-changes *db*) (wc-changes ctx))
-        (incf (db-total-changes *db*) (wc-changes ctx))
+        (setf (db-changes (conn *db*)) (wc-changes ctx))
+        (incf (db-total-changes (conn *db*)) (wc-changes ctx))
         (values (reverse (wc-returned ctx)) rnames)))))
 
 (defun before-insert-image (table row)
@@ -568,11 +570,11 @@
     (nreverse out)))
 
 (defun exec-update (st)
-  (destructuring-bind (&key with conflict table alias sets from where returning) (cdr st)
+  (destructuring-bind (&key with conflict table schema alias sets from where returning) (cdr st)
     (when from (sql-error "UPDATE ... FROM is not supported"))
     (let* ((*ctes* *ctes*)
            (tb (progn (when with (register-ctes (make-sel :with (first with) :recursive (second with))))
-                      (writable-table table :update)))
+                      (writable-table table :update schema)))
            (view (table-view-select tb))
            (triggers (table-has-triggers-p tb))
            (changed (loop for (cols) in sets append cols))
@@ -600,19 +602,19 @@
                     (incf (wc-changes ctx)))
               ;; the row may have been removed by an earlier REPLACE or trigger
               ((not (or (table-without-rowid tb)
-                        (table-lookup *db* (table-root tb) (svref old (length (table-columns tb)))))))
+                        (table-lookup (table-owner tb) (table-root tb) (svref old (length (table-columns tb)))))))
               ((and triggers (eq :ignore (fire-triggers tb :update :before old new changed))))
               (t (when (and (eq (update-one ctx old new) t) triggers)
                    (fire-triggers tb :update :after old new changed))))))
-        (setf (db-changes *db*) (wc-changes ctx))
-        (incf (db-total-changes *db*) (wc-changes ctx))
+        (setf (db-changes (conn *db*)) (wc-changes ctx))
+        (incf (db-total-changes (conn *db*)) (wc-changes ctx))
         (values (reverse (wc-returned ctx)) rnames)))))
 
 (defun exec-delete (st)
-  (destructuring-bind (&key with table alias where returning) (cdr st)
+  (destructuring-bind (&key with table schema alias where returning) (cdr st)
     (let* ((*ctes* *ctes*)
            (tb (progn (when with (register-ctes (make-sel :with (first with) :recursive (second with))))
-                      (writable-table table :delete)))
+                      (writable-table table :delete schema)))
            (view (table-view-select tb))
            (triggers (table-has-triggers-p tb)))
       (multiple-value-bind (ctx rnames) (make-ctx-for tb nil returning alias)
@@ -620,10 +622,10 @@
             ;; truncate: drop every page but the roots
             (let ((n 0))
               (map-table-rows tb (lambda (row) (declare (ignore row)) (incf n)))
-              (clear-btree *db* (table-root tb) :keep-root t)
+              (clear-btree (table-owner tb) (table-root tb) :keep-root t)
               (dolist (idx (table-indexes tb))
                 (unless (index-pk-index idx)
-                  (clear-btree *db* (index-root idx) :keep-root t)))
+                  (clear-btree (table-owner tb) (index-root idx) :keep-root t)))
               (setf (wc-changes ctx) n))
             (dolist (row (scan-table-rows tb alias where))
               (cond
@@ -631,11 +633,11 @@
                       (incf (wc-changes ctx)))
                 ((and triggers (eq :ignore (fire-triggers tb :delete :before row nil))))
                 ((and triggers (not (table-without-rowid tb))
-                      (not (table-lookup *db* (table-root tb) (svref row (length (table-columns tb)))))))
+                      (not (table-lookup (table-owner tb) (table-root tb) (svref row (length (table-columns tb)))))))
                 (t (delete-row tb row)
                    (incf (wc-changes ctx))
                    (collect-returning ctx row)
                    (when triggers (fire-triggers tb :delete :after row nil))))))
-        (setf (db-changes *db*) (wc-changes ctx))
-        (incf (db-total-changes *db*) (wc-changes ctx))
+        (setf (db-changes (conn *db*)) (wc-changes ctx))
+        (incf (db-total-changes (conn *db*)) (wc-changes ctx))
         (values (reverse (wc-returned ctx)) rnames)))))
