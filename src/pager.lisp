@@ -46,6 +46,8 @@
   (orig-page-count 0)
   (journal (make-hash-table)) ; pgno -> original octets
   (stmt-journal nil)          ; pgno -> octets or :new, while a statement runs
+  (savepoints '())            ; innermost first: (name journal page-count)
+  (savepoint-txn nil)         ; the outermost SAVEPOINT began the transaction
   (stmt-page-count 0)
   ;; schema and bookkeeping
   (schema nil)
@@ -132,6 +134,11 @@
       (when (and sj (not (nth-value 1 (gethash pgno sj))))
         (setf (gethash pgno sj)
               (if (> pgno (db-stmt-page-count db)) :new (copy-seq b)))))
+    (dolist (sp (db-savepoints db))
+      (destructuring-bind (name journal page-count) sp
+        (declare (ignore name))
+        (unless (nth-value 1 (gethash pgno journal))
+          (setf (gethash pgno journal) (if (> pgno page-count) :new (copy-seq b))))))
     (setf (gethash pgno (db-dirty db)) t)
     b))
 
@@ -264,7 +271,46 @@
             (db-stmt-journal db) nil
             (db-schema db) nil))))
 
+(defun restore-journal (db journal page-count)
+  (maphash (lambda (pgno img)
+             (if (eq img :new)
+                 (progn (remhash pgno (db-cache db)) (remhash pgno (db-dirty db)))
+                 (setf (gethash pgno (db-cache db)) (copy-seq img))))
+           journal)
+  (setf (db-page-count db) page-count
+        (db-schema db) nil))
+
+(defun savepoint-open (db name)
+  (unless (db-explicit db)
+    (setf (db-explicit db) t (db-savepoint-txn db) t))
+  (push (list name (make-hash-table) (db-page-count db)) (db-savepoints db)))
+
+(defun find-savepoint (db name)
+  (or (position name (db-savepoints db) :key #'first :test #'name=)
+      (sql-error "no such savepoint: ~a" name)))
+
+(defun savepoint-release (db name)
+  "RELEASE: forget NAME and everything inside it; releasing the savepoint
+that opened the transaction commits it."
+  (let* ((k (find-savepoint db name))
+         (outermost (= k (1- (length (db-savepoints db))))))
+    (setf (db-savepoints db) (nthcdr (1+ k) (db-savepoints db)))
+    (when (and outermost (db-savepoint-txn db))
+      (commit-write db)
+      (setf (db-explicit db) nil (db-savepoint-txn db) nil))))
+
+(defun savepoint-rollback-to (db name)
+  "ROLLBACK TO: undo everything since NAME; NAME stays open."
+  (let* ((k (find-savepoint db name))
+         (sp (nth k (db-savepoints db))))
+    (destructuring-bind (spname journal page-count) sp
+      (restore-journal db journal page-count)
+      (setf (db-savepoints db)
+            (cons (list spname (make-hash-table) page-count)
+                  (nthcdr (1+ k) (db-savepoints db)))))))
+
 (defun rollback-write (db)
+  (setf (db-savepoints db) '() (db-savepoint-txn db) nil)
   (when (db-txn db)
     (maphash (lambda (pgno img) (setf (gethash pgno (db-cache db)) img))
              (db-journal db))
@@ -337,7 +383,8 @@
             (when journaled (delete-journal db))))))
     (clrhash (db-dirty db))
     (clrhash (db-journal db))
-    (setf (db-txn db) nil (db-stmt-journal db) nil)))
+    (setf (db-txn db) nil (db-stmt-journal db) nil))
+  (setf (db-savepoints db) '() (db-savepoint-txn db) nil))
 
 (defun recover-hot-journal (db)
   "Play back a rollback journal left by an interrupted commit."

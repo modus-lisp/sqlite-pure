@@ -57,15 +57,16 @@
       (:commit
        (unless (db-explicit db) (sql-error "cannot commit - no transaction is active"))
        (commit-write db)
-       (setf (db-explicit db) nil)
+       (setf (db-explicit db) nil (db-savepoints db) '() (db-savepoint-txn db) nil)
        (values nil nil))
       (:rollback
        (unless (db-explicit db) (sql-error "cannot rollback - no transaction is active"))
        (rollback-write db)
        (setf (db-explicit db) nil)
        (values nil nil))
-      ((:savepoint :release :rollback-to)
-       (sql-error "SAVEPOINT is not supported"))
+      (:savepoint (savepoint-open db (second st)) (values nil nil))
+      (:release (savepoint-release db (second st)) (values nil nil))
+      (:rollback-to (savepoint-rollback-to db (second st)) (values nil nil))
       (:noop (values nil nil))
       (:pragma (exec-pragma db st))
       (t
@@ -153,15 +154,28 @@ the rows of the last statement if it produced any, else its change count."
 (defun commit (db) (execute db "COMMIT"))
 (defun rollback (db) (execute db "ROLLBACK"))
 
+(defvar *savepoint-counter* 0)
+
+(defun call-with-transaction (db thunk)
+  (if (in-transaction-p db)
+      ;; nested: a savepoint, so an inner failure undoes only the inner work
+      (let ((name (format nil "sqlp_sp_~d" (incf *savepoint-counter*)))
+            (ok nil))
+        (execute db (format nil "SAVEPOINT ~a" name))
+        (unwind-protect (multiple-value-prog1 (funcall thunk) (setf ok t))
+          (when (in-transaction-p db)
+            (unless ok (execute db (format nil "ROLLBACK TO ~a" name)))
+            (execute db (format nil "RELEASE ~a" name)))))
+      (let ((ok nil))
+        (begin-transaction db)
+        (unwind-protect (multiple-value-prog1 (funcall thunk) (setf ok t))
+          (when (in-transaction-p db)
+            (if ok (commit db) (rollback db)))))))
+
 (defmacro with-transaction ((db) &body body)
   "Run BODY in a transaction: committed on normal exit, rolled back on a
-non-local exit."
-  (let ((d (gensym "DB")) (ok (gensym "OK")))
-    `(let ((,d ,db) (,ok nil))
-       (begin-transaction ,d)
-       (unwind-protect (multiple-value-prog1 (progn ,@body) (setf ,ok t))
-         (when (in-transaction-p ,d)
-           (if ,ok (commit ,d) (rollback ,d)))))))
+non-local exit.  Nested uses become savepoints."
+  `(call-with-transaction ,db (lambda () ,@body)))
 
 ;;; ------------------------------------------------------------------
 ;;; PRAGMA
