@@ -1,0 +1,40 @@
+== json-basics
+SELECT json(' { "a" : 1.0 , "b":[1e2, "xA\n", true,null] } '), json('"\/"'), json(' 12 '), json('-0.5E+3'), json(' [ ] ');
+SELECT json_quote('a"b\c' || char(10) || char(1)), json_quote(1.5), json_quote(NULL), json_quote(3);
+SELECT json_valid('{"a":}'), json_valid('[1,2]'), json_valid(NULL), json_valid(12), json_valid('[1,2,]');
+SELECT json('[1');
+SELECT json('[1,2,]');
+
+== json-extract
+SELECT json_extract('{"a":{"b":[10,20,{"c":"x"}]}}', '$.a.b[2].c'), json_extract('[1,2,3]', '$[#-1]'), json_extract('{"a":1}', '$.x');
+SELECT json_extract('{"a":1.5,"b":"s","c":null,"d":true,"e":[1]}', '$.a', '$.b', '$.c', '$.d', '$.e');
+SELECT json_extract('{"a":-0}', '$.a'), json_extract('{"a":12345678901234567890}', '$.a'), json_extract('{"a b":1}', '$."a b"');
+SELECT json_extract('"é\/"', '$'), typeof(json_extract('{"a":[]}', '$.a')), json_extract('{"a":true}', '$.a'), json_extract('[[1]]', '$[0][0]');
+SELECT json_extract('{"a":1,"a":2}', '$.a'), json('{"a":1,"a":2}');
+SELECT json_extract('[1]', 'a');
+SELECT '{"a":[1,2]}' -> '$.a', '{"a":[1,2]}' ->> 'a', '[5,6]' -> 1, '{"a":"x"}' -> 'a', '{"a":"x"}' ->> 'a', '{"a":{"b":3}}' -> 'a' ->> 'b';
+
+== json-build
+SELECT json_array(1, 'x', NULL, 2.5, json('[3]'), '[4]'), json_object('a', 1, 'b', json_array(2)), json_object('k', 1.0), json_array(1e100, -0.0, 0.1);
+SELECT json_array(json_extract('{"a":[1]}', '$.a')), json_array('{"a":1}' -> '$'), json_object('n', json('null'));
+SELECT json_array(x'01');
+SELECT json_group_array(x) FROM (SELECT 1 x UNION ALL SELECT 'a' UNION ALL SELECT NULL);
+SELECT json_group_object(k, v) FROM (SELECT 'a' k, 1 v UNION ALL SELECT 'b', 2);
+
+== json-modify
+SELECT json_insert('{"a":1}', '$.b', 2, '$.a', 9), json_replace('{"a":1}', '$.a', 'x', '$.c', 3), json_set('{"a":1}', '$.a', 2, '$.c[0]', 3);
+SELECT json_set('[1,2]', '$[#]', 3), json_remove('[1,2,3]', '$[1]'), json_remove('{"a":1,"b":2}', '$.a'), json_set('{}', '$.a.b', 1), json_insert('[]', '$[5]', 1);
+SELECT json_patch('{"a":1,"b":{"c":2}}', '{"b":{"c":null,"d":4},"e":5}'), json_patch('[1]', '{"a":1}'), json_patch('{"a":1}', '[2]');
+SELECT json_type('{"a":1.5}', '$.a'), json_type('[1]'), json_type('{"a":1}', '$.b'), json_type('{"a":"s","b":null,"c":false,"d":7}', '$.c'), json_array_length('[1,2,3]'), json_array_length('{"a":[1,2]}', '$.a'), json_array_length('5');
+
+== json-each-tree
+SELECT * FROM json_each('{"a":1,"b":[2,3],"c":{"d":null}}');
+SELECT key, value, type, atom, id, parent, fullkey, path FROM json_tree('{"a":1,"b":[2,{"x":"y"}]}');
+SELECT key, value FROM json_each('{"a":{"b":[7,8]}}', '$.a.b');
+SELECT key, value FROM json_each('5');
+CREATE TABLE doc(id INTEGER PRIMARY KEY, body TEXT);
+INSERT INTO doc VALUES (1, '{"tags":["a","b"],"n":1}'), (2, '{"tags":["c"],"n":2}'), (3, '{"n":3}');
+SELECT doc.id, j.value FROM doc, json_each(doc.body, '$.tags') AS j ORDER BY doc.id, j.key;
+SELECT id FROM doc WHERE EXISTS (SELECT 1 FROM json_each(doc.body, '$.tags') WHERE value = 'c');
+SELECT body ->> '$.n' AS n, json_array_length(body, '$.tags') FROM doc ORDER BY n;
+SELECT count(*) FROM doc, json_tree(doc.body);

@@ -113,7 +113,8 @@
             (*param-names* names)
             (rows nil) (cols nil))
         (dolist (s stmts)
-          (multiple-value-setq (rows cols) (exec-ast db (car s) (cdr s))))
+          (let ((*json-values* (make-hash-table :test #'eq)))
+            (multiple-value-setq (rows cols) (exec-ast db (car s) (cdr s)))))
         (values rows cols)))))
 
 (defun execute (db sql &rest params)

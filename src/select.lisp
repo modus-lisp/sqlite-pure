@@ -83,6 +83,7 @@
 (defstruct fsrc
   src table
   rows-fn         ; for derived sources: (lambda (env)) -> list of row vectors
+  tvf             ; table-valued function: (builder . arg-asts), args compiled late
   join            ; :first :inner :left :cross :comma
   on using natural)
 
@@ -162,7 +163,14 @@
                 (make-sel :cores (list (make-select-core :cols (list (list :star nil))
                                                          :from (second source))))
                 (third source) scope))
-              (:tvf (sql-error "no such table-valued function: ~a" (second source))))))
+              (:tvf
+               (destructuring-bind (name args alias) (cdr source)
+                 (unless (or (name= name "json_each") (name= name "json_tree"))
+                   (sql-error "no such table-valued function: ~a" name))
+                 (let ((fs (json-table-source name nil alias)))
+                   (setf (fsrc-tvf fs)
+                         (cons (lambda (fns) (fsrc-rows-fn (json-table-source name fns alias))) args))
+                   fs))))))
       (setf (fsrc-join fs) join (fsrc-on fs) on (fsrc-using fs) using (fsrc-natural fs) natural)
       fs)))
 
@@ -497,6 +505,11 @@ Return the per-source ON expressions."
          (where-conjs (split-conjuncts where))
          (levels '())
          (finals '()))
+    ;; table-valued function arguments may name earlier FROM items
+    (dolist (fs fsrcs)
+      (when (fsrc-tvf fs)
+        (destructuring-bind (builder . args) (fsrc-tvf fs)
+          (setf (fsrc-rows-fn fs) (funcall builder (mapcar (lambda (a) (compile-expr a scope)) args))))))
     ;; INNER/CROSS ON conditions behave as WHERE conjuncts
     (loop for fs in fsrcs
           for on in ons

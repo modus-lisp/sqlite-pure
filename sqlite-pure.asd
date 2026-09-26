@@ -28,6 +28,7 @@
      (:file "functions")
      (:file "printf")
      (:file "datetime")
+     (:file "json")
      (:file "triggers")
      (:file "dml")
      (:file "ddl")
