@@ -255,9 +255,13 @@ and may return true when this row became the aggregate's witness (min/max)."
   (let ((v (first args)))
     (cond ((eq v :null) "NULL")
           ((integerp v) (format nil "~d" v))
-          ((floatp v) (let ((s (format-real v)))
-                        ;; quote() uses enough digits to round-trip
-                        (let ((r (format-real-roundtrip v))) (declare (ignore s)) r)))
+          ((floatp v)
+           ;; SQLite 3.40: "%!.15g", or "%!.20e" when that does not read back
+           ;; (through SQLite's own AtoF) as the same double
+           (let ((s (format-real v)))
+             (if (eql (text-numeric-value s) v)
+                 s
+                 (sql-float-text v :exp 20 :alt2 t))))
           ((stringp v) (with-output-to-string (o)
                          (write-char #\' o)
                          (loop for c across v do (when (char= c #\') (write-char #\' o)) (write-char c o))
@@ -266,38 +270,6 @@ and may return true when this row became the aggregate's witness (min/max)."
                (write-string "X'" o)
                (loop for x across v do (format o "~2,'0X" x))
                (write-char #\' o))))))
-
-(defun format-real-roundtrip (x)
-  "%!.17g, shortened to the fewest digits that round-trip (SQLite's quote())."
-  (cond ((float-infinity-p x) (if (plusp x) "9.0e+999" "-9.0e+999"))
-        (t (let ((best nil))
-             (loop for p from 15 to 17
-                   do (let ((s (format-real-digits x p)))
-                        (when (= (value-to-real s) x) (setf best s) (return))))
-             (or best (format-real-digits x 17))))))
-
-(defun format-real-digits (x p)
-  "Like FORMAT-REAL but with P significant digits."
-  (if (zerop x) "0.0"
-      (let* ((neg (minusp x)) (r (abs (rational x)))
-             (e (let ((e (floor (log (abs x) 10))))
-                  (loop while (> (expt 10 e) r) do (decf e))
-                  (loop while (<= (expt 10 (1+ e)) r) do (incf e))
-                  e))
-             (d (round (/ r (expt 10 (- e (1- p)))))))
-        (when (>= d (expt 10 p)) (setf d (round d 10)) (incf e))
-        (let* ((digits (string-right-trim "0" (format nil "~d" d)))
-               (digits (if (string= digits "") "0" digits))
-               (body (if (or (< e -4) (>= e p))
-                         (format nil "~a.~a~ae~a~2,'0d" (char digits 0)
-                                 (if (> (length digits) 1) (subseq digits 1) "")
-                                 (if (> (length digits) 1) "" "0")
-                                 (if (minusp e) "-" "+") (abs e))
-                         (cond ((minusp e) (format nil "0.~a~a" (make-string (- (- e) 1) :initial-element #\0) digits))
-                               ((>= e (1- (length digits)))
-                                (format nil "~a~a.0" digits (make-string (- e (1- (length digits))) :initial-element #\0)))
-                               (t (format nil "~a.~a" (subseq digits 0 (1+ e)) (subseq digits (1+ e))))))))
-          (if neg (concatenate 'string "-" body) body)))))
 
 (defsqlfun "char" (0 nil) (args)
   (map 'string (lambda (v) (safe-code-char (max 0 (let ((n (value-to-integer v))) (if (eq n :null) 0 n))))) args))

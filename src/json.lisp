@@ -194,9 +194,9 @@
 ;;; SQL values <-> JSON
 
 (defun json-number-value (text)
-  (multiple-value-bind (r end int-syntax) (scan-number text)
+  (multiple-value-bind (r end int-syntax dbl) (scan-number text)
     (declare (ignore end))
-    (rational-to-sql-number r int-syntax)))
+    (rational-to-sql-number r int-syntax dbl)))
 
 (defun json-node-sql-value (node)
   "The SQL value json_extract / ->> return for NODE."

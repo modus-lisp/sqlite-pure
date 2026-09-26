@@ -7,36 +7,51 @@
 
 (in-package #:sqlite-pure)
 
+(defparameter +ar-round+
+  (map 'vector #'rational '(5d-1 5d-2 5d-3 5d-4 5d-5 5d-6 5d-7 5d-8 5d-9 5d-10)))
+
+(defun dbl (r) (rational (safe-double r)))   ; round a rational to double
+
 (defun sql-float-text (x xtype precision &key alt alt2 (plus nil) (space nil))
-  "Format finite or infinite double X as SQLite does for conversion
-XTYPE (:float :exp :generic).  Returns the string without width padding."
-  (let ((prefix (cond ((minusp (float-sign x)) (if (zerop x) "" "-"))
+  "Format double X as sqlite3_str_vappendf does for conversion XTYPE
+(:float :exp :generic), in SQLite's own x87 long-double arithmetic
+(emulated: every intermediate is rounded to a 64-bit significand)."
+  (let ((prefix (cond ((and (minusp (float-sign x)) (not (zerop x))) "-")
                       (plus "+") (space " ") (t ""))))
-    (when (and (zerop x) (minusp (float-sign x))) (setf prefix (cond (plus "+") (space " ") (t ""))))
     (when (float-infinity-p x)
       (return-from sql-float-text (concatenate 'string prefix "Inf")))
-    (let* ((r (abs (rational x)))
-           (precision (if (and (eq xtype :generic) (plusp precision)) (1- precision) precision))
-           (rounder (* 1/2 (expt 1/10 precision)))
+    (let* ((rv (abs (rational x)))                  ; long double realvalue
+           (generic (eq xtype :generic))
+           (precision (if (and generic (plusp precision)) (1- precision) precision))
+           (idx (logand precision #xfff))
+           (rounder (aref +ar-round+ (mod idx 10)))  ; a double
            (exp 0)
            (flag-rtz nil)
-           (generic (eq xtype :generic))
            (nsd (if alt2 26 16))
            (out (make-string-output-stream)))
+      (loop while (>= idx 10) do (setf rounder (dbl (* rounder 1/10000000000)) idx (- idx 10)))
       (when (eq xtype :float)
-        (let ((ex (if (zerop x) -1023 (- (nth-value 1 (decode-float x)) 1))))
+        (let ((ex (if (zerop x) -1023
+                      (- (ldb (byte 11 52) (bits-from-double (float x 1d0))) 1023))))
           (when (< (+ precision (truncate ex 3)) 15)
-            (incf rounder (* r 3/10000000000000000))))
-        (incf r rounder))
-      ;; normalise R into [1,10)
-      (when (plusp r)
-        (loop while (>= r (expt 10 (1+ exp))) do (incf exp))
-        (loop while (< r (expt 10 exp)) do (decf exp))
-        (setf r (/ r (expt 10 exp))))
+            (setf rounder (dbl (ld (+ rounder (ld (* rv (rational 3d-16)))))))))
+        (setf rv (ld (+ rv rounder))))
+      ;; normalise into [1,10)
+      (when (plusp rv)
+        (let ((scale 1))
+          (loop while (and (>= rv (ld (* (rational 1d100) scale))) (<= exp 350))
+                do (setf scale (ld (* scale (rational 1d100)))) (incf exp 100))
+          (loop while (and (>= rv (ld (* (rational 1d10) scale))) (<= exp 350))
+                do (setf scale (ld (* scale (rational 1d10)))) (incf exp 10))
+          (loop while (and (>= rv (* 10 scale)) (<= exp 350))
+                do (setf scale (ld (* scale 10))) (incf exp))
+          (setf rv (ld (/ rv scale)))
+          (loop while (< rv (rational 1d-8)) do (setf rv (ld (* rv (rational 1d8)))) (decf exp 8))
+          (loop while (< rv 1) do (setf rv (ld (* rv 10))) (decf exp))))
       (unless (eq xtype :float)
-        (incf r rounder)
-        (when (>= r 10) (setf r (/ r 10)) (incf exp)))
-      (when (eq xtype :generic)
+        (setf rv (ld (+ rv rounder)))
+        (when (>= rv 10) (setf rv (ld (* rv (rational 1d-1)))) (incf exp)))
+      (when generic
         (setf flag-rtz (not alt))
         (if (or (< exp -4) (> exp precision))
             (setf xtype :exp)
@@ -47,10 +62,10 @@ XTYPE (:float :exp :generic).  Returns the string without width padding."
         (flet ((digit ()
                  (if (<= nsd 0)
                      #\0
-                     (let ((d (min 9 (floor r))))
+                     (let ((d (floor rv)))
                        (decf nsd)
-                       (setf r (* (- r d) 10))
-                       (code-char (+ 48 d))))))
+                       (setf rv (ld (* (- rv d) 10)))
+                       (code-char (+ 48 (min 9 (max 0 d))))))))
           (if (< e2 0)
               (write-char #\0 out)
               (loop while (>= e2 0) do (write-char (digit) out) (decf e2)))
@@ -77,8 +92,8 @@ XTYPE (:float :exp :generic).  Returns the string without width padding."
 (defun sql-round (x n)
   (cond ((or (float-infinity-p x) (> (abs x) 4503599627370496d0)) x)
         ((zerop n)
-         (let ((v (float (truncate (+ (rational x) (if (minusp x) -1/2 1/2))) 1d0)))
-           (if (and (zerop v) (minusp x)) -0d0 v)))
+         ;; (double)(sqlite_int64)(r + (r<0 ? -0.5 : +0.5)), in doubles
+         (float (truncate (+ x (if (minusp x) -0.5d0 0.5d0))) 1d0))
         (t (let ((v (value-to-real (sql-float-text x :float n))))
              v))))
 

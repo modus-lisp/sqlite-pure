@@ -194,7 +194,7 @@
 (defun parse-unary (p)
   (cond ((accept-op p "-")
          (let ((tok (peek-tok p)))
-           (if (and (eq (tok-kind tok) :bigint) (= (tok-value tok) (expt 2 63)))
+           (if (and (eq (tok-kind tok) :bigint) (= (car (tok-value tok)) (expt 2 63)))
                (progn (next-tok p) (parse-postfix p (list :lit +i64-min+)))
                (list :unary :neg (parse-unary p)))))
         ((accept-op p "+") (list :unary :pos (parse-unary p)))
@@ -229,7 +229,7 @@
   (let ((tok (peek-tok p)))
     (case (tok-kind tok)
       ((:integer :float :string :blob) (next-tok p) (list :lit (tok-value tok)))
-      (:bigint (next-tok p) (list :lit (safe-double (tok-value tok))))
+      (:bigint (next-tok p) (list :lit (cdr (tok-value tok))))
       (:param
        (next-tok p)
        (let ((v (tok-value tok)))

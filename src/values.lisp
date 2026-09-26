@@ -56,29 +56,91 @@
         (t (clamp-i64 (truncate x)))))
 
 ;;; Scanning numeric text in the manner of sqlite3AtoF.
+;;;
+;;; SQLite 3.40 does not round decimal text to the nearest double.  It
+;;; accumulates at most ~18 significant digits into a 64-bit integer
+;;; (silently dropping the rest), then scales by powers of ten in x87
+;;; "long double" (64-bit significand) and finally rounds to double.  The
+;;; functions below reproduce that bit for bit with exact rationals.
 
 (defun whitespace-char-p (c)
   (member c '(#\Space #\Tab #\Newline #\Return #\Page #.(code-char 11))))
 
+(defun round-significand (r bits)
+  "Round the rational R to BITS significant bits (nearest, ties to even)."
+  (if (zerop r)
+      0
+      (let* ((a (abs r))
+             (e (- (integer-length (numerator a)) (integer-length (denominator a)) bits)))
+        ;; settle E so that 2^(bits-1) <= a/2^e < 2^bits
+        (loop while (>= (/ a (expt 2 e)) (expt 2 bits)) do (incf e))
+        (loop while (< (/ a (expt 2 e)) (expt 2 (1- bits))) do (decf e))
+        (* (signum r) (round (/ a (expt 2 e))) (expt 2 e)))))
+
+(defun ld (r) (round-significand r 64))
+
+(defparameter +double-1e308+ (rational 1d308))
+
+(defun sqlite-atof-result (sign s d e esign)
+  "The double sqlite3AtoF computes from significand S (an integer), the
+decimal-point shift D, and exponent E with sign ESIGN."
+  (let ((e (+ (* e esign) d)))
+    (if (minusp e) (setf esign -1 e (- e)) (setf esign 1))
+    (if (zerop s)
+        (if (minusp sign) -0d0 0d0)
+        (progn
+          (loop while (plusp e)
+                do (if (plusp esign)
+                       (if (>= s (floor +i64-max+ 10)) (return) (setf s (* s 10)))
+                       (if (/= 0 (mod s 10)) (return) (setf s (floor s 10))))
+                   (decf e))
+          (setf s (* sign s))
+          (cond
+            ((zerop e) (float s 1d0))
+            ((> e 307)
+             (if (< e 342)
+                 (let ((scale 1))
+                   (loop while (/= 0 (mod e 308)) do (setf scale (ld (* scale 10))) (decf e))
+                   (if (minusp esign)
+                       (safe-double (/ (rational (safe-double (ld (/ s scale)))) +double-1e308+))
+                       (safe-double (* (rational (safe-double (ld (* s scale)))) +double-1e308+))))
+                 (if (minusp esign)
+                     (if (minusp s) -0d0 0d0)
+                     (if (minusp s) (double-negative-infinity) (double-positive-infinity)))))
+            (t
+             (let ((scale 1))
+               (loop while (/= 0 (mod e 22)) do (setf scale (ld (* scale 10))) (decf e))
+               (loop while (plusp e) do (setf scale (ld (* scale (expt 10 22)))) (decf e 22))
+               (safe-double (ld (if (minusp esign) (/ s scale) (* s scale)))))))))))
+
 (defun scan-number (s &optional (start 0))
   "Scan a decimal numeric literal in S from START (after optional leading
-whitespace).  Return (values rational end integer-syntax-p) or NIL if no
-digits were found."
+whitespace).  Return (values rational end integer-syntax-p double) where
+DOUBLE is the value SQLite's sqlite3AtoF would produce, or NIL if no digits
+were found."
   (let ((i start) (n (length s)) (sign 1) (mant 0) (scale 0) (digits 0)
-        (int-syntax t))
+        (int-syntax t)
+        ;; sqlite3AtoF's own accumulators
+        (as 0) (ad 0) (ae 0) (aesign 1)
+        (limit (floor (- +i64-max+ 9) 10)))
     (loop while (and (< i n) (whitespace-char-p (char s i))) do (incf i))
     (when (and (< i n) (member (char s i) '(#\+ #\-)))
       (when (char= (char s i) #\-) (setf sign -1))
       (incf i))
     (loop while (and (< i n) (digit-char-p (char s i)))
-          do (setf mant (+ (* mant 10) (digit-char-p (char s i)))) (incf i) (incf digits))
+          do (let ((dg (digit-char-p (char s i))))
+               (setf mant (+ (* mant 10) dg))
+               (if (>= as limit) (incf ad) (setf as (+ (* as 10) dg))))
+             (incf i) (incf digits))
     (when (and (< i n) (char= (char s i) #\.))
-      (let ((j (1+ i)) (frac-digits 0))
+      (let ((j (1+ i)) (frac-digits 0) (as2 as) (ad2 ad))
         (loop while (and (< j n) (digit-char-p (char s j)))
-              do (setf mant (+ (* mant 10) (digit-char-p (char s j))))
+              do (let ((dg (digit-char-p (char s j))))
+                   (setf mant (+ (* mant 10) dg))
+                   (when (< as2 limit) (setf as2 (+ (* as2 10) dg)) (decf ad2)))
                  (decf scale) (incf j) (incf frac-digits))
         (when (or (plusp digits) (plusp frac-digits))
-          (setf i j int-syntax nil)
+          (setf i j int-syntax nil as as2 ad ad2)
           (incf digits frac-digits))))
     (when (zerop digits) (return-from scan-number nil))
     (when (and (< i n) (char-equal (char s i) #\e))
@@ -87,32 +149,33 @@ digits were found."
           (when (char= (char s j) #\-) (setf esign -1))
           (incf j))
         (loop while (and (< j n) (digit-char-p (char s j)))
-              do (when (< e 100000) (setf e (+ (* e 10) (digit-char-p (char s j)))))
+              do (setf e (if (< e 10000) (+ (* e 10) (digit-char-p (char s j))) 10000))
                  (incf j) (incf edigits))
         (when (plusp edigits)
-          (setf i j int-syntax nil)
+          (setf i j int-syntax nil ae e aesign esign)
           (incf scale (* esign e)))))
-    (values (* sign mant (expt 10 scale)) i int-syntax)))
+    (values (* sign mant (expt 10 scale)) i int-syntax
+            (sqlite-atof-result sign as ad ae aesign))))
 
-(defun rational-to-sql-number (r int-syntax)
-  "Integer if it was written as one and fits, else a double."
-  (if (and int-syntax (i64-p r)) r (safe-double r)))
+(defun rational-to-sql-number (r int-syntax &optional dbl)
+  "Integer if it was written as one and fits, else a double (SQLite's)."
+  (if (and int-syntax (i64-p r)) r (or dbl (safe-double r))))
 
 (defun text-numeric-value (s)
   "If the whole of S (modulo surrounding whitespace) is a numeric literal,
 return its value (integer or double), else NIL."
-  (multiple-value-bind (r end int-syntax) (scan-number s)
+  (multiple-value-bind (r end int-syntax dbl) (scan-number s)
     (when (and r
                (loop for k from end below (length s)
                      always (whitespace-char-p (char s k))))
-      (rational-to-sql-number r int-syntax))))
+      (rational-to-sql-number r int-syntax dbl))))
 
 (defun text-numeric-prefix (s)
   "Numeric value of the longest numeric prefix of S (0 if none): the
 conversion used for arithmetic on text."
-  (multiple-value-bind (r end int-syntax) (scan-number s)
+  (multiple-value-bind (r end int-syntax dbl) (scan-number s)
     (declare (ignore end))
-    (if r (rational-to-sql-number r int-syntax) 0)))
+    (if r (rational-to-sql-number r int-syntax dbl) 0)))
 
 (defun text-integer-prefix (s)
   "CAST(text AS INTEGER): the leading integer, saturating."
