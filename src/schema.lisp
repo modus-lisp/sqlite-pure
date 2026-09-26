@@ -80,8 +80,12 @@
                                                :unique (getf cd :unique)
                                                :generated (getf cd :generated))))
                   'vector))
-           (tb (make-table :name name :root root :sql sql :columns cols
-                           :without-rowid without-rowid))
+           (tb (progn
+                 (loop for (c . rest) on (coerce cols 'list)
+                       do (when (find (column-name c) rest :key #'column-name :test #'name=)
+                            (sql-error "duplicate column name: ~a" (column-name c))))
+                 (make-table :name name :root root :sql sql :columns cols
+                           :without-rowid without-rowid)))
            (pk-set nil) (uniques '()))
       (labels ((colidx (nm)
                  (or (position nm cols :key #'column-name :test #'name=)
@@ -108,8 +112,8 @@
                    (push (list :unique (list (list i (collate-of (aref cols i)) nil))
                                (getf cd :unique-conflict))
                          uniques))
-                 (dolist (ck (getf cd :checks))
-                   (push (cons nil ck) (table-checks tb))))
+                 (dolist (ck (reverse (getf cd :checks)))
+                   (push (cons (second ck) (first ck)) (table-checks tb))))
         (dolist (tc constraints)
           (case (car tc)
             (:primary-key
@@ -121,7 +125,7 @@
                (push (list :pk pk-set conflict) uniques)))
             (:unique
              (push (list :unique (index-cols (second tc)) (third tc)) uniques))
-            (:check (push (cons nil (second tc)) (table-checks tb))))))
+            (:check (push (cons (third tc) (second tc)) (table-checks tb))))))
       (setf (table-checks tb) (nreverse (table-checks tb)))
       (setf (table-pk tb) (mapcar #'first pk-set))
       ;; INTEGER PRIMARY KEY (not DESC, exactly one column) aliases the rowid

@@ -378,7 +378,8 @@
                (scope (make-scope :srcs (list src exsrc)))
                (env (make-env :rows (vector existing proposed)))
                (where (getf clause :update-where)))
-          (setf (src-rowid-p exsrc) nil)
+          (setf (src-rowid-p exsrc) nil
+                (src-hidden exsrc) (loop for i below (length (table-columns table)) collect i))
           (when (and where (not (eq (truth (funcall (compile-expr where scope) env)) t)))
             (return-from run-upsert :ignore))
           (let ((new (copy-seq existing)))

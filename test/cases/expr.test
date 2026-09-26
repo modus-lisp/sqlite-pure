@@ -1,0 +1,76 @@
+== arithmetic
+SELECT 1 + 2, 7 - 10, 6 * 7, 7 / 2, -7 / 2, 7 % 3, -7 % 3, 7 % -3;
+SELECT 7.0 / 2, 1 / 0, 1 % 0, 1.0 / 0, 5.5 % 2, 10 % 3.5;
+SELECT 9223372036854775807 + 1, -9223372036854775808 - 1, 9223372036854775807 * 2;
+SELECT -9223372036854775808 / -1, -9223372036854775808 % -1;
+SELECT '3abc' + 1, 'abc' * 2, ' 1.5e2x' + 0, '0x10' + 0, x'3132' + 1;
+SELECT 0.1 + 0.2, 1e308 * 10, -(-9223372036854775808);
+SELECT 2 + 3 * 4, (2 + 3) * 4, 10 - 2 - 3, 100 / 10 / 5, 2 || 3 + 1;
+
+== bitwise
+SELECT 5 & 3, 5 | 3, ~5, 1 << 4, 256 >> 4, -1 >> 1, 1 << 63, 1 << 64, -8 >> 100, 3 << -1;
+
+== comparisons
+SELECT 1 < 2, 2 <= 2, 3 > 4, 'a' < 'b', 'B' < 'a', 1 < 'a', x'00' > 'z', 1 = 1.0;
+SELECT 1 == 1, 1 != 2, 1 <> 1, NULL < 1, 'abc' = 'ABC';
+SELECT 'abc' = 'ABC' COLLATE NOCASE, 'abc ' = 'abc' COLLATE RTRIM, 'a' < 'B' COLLATE NOCASE;
+
+== comparison-affinity
+CREATE TABLE t(i INTEGER, x TEXT, b BLOB, n);
+INSERT INTO t VALUES (5, '5', '5', '5');
+SELECT i = '5', x = 5, b = 5, n = 5, i = x, x = i, i < '10', x < 10, b < 10;
+SELECT i IN ('5', 6), x IN (5), b IN (5), n IN ('5');
+SELECT CAST(i AS TEXT) = x, i = CAST(x AS INTEGER);
+
+== cast
+SELECT CAST('123' AS INTEGER), CAST('12.9' AS INTEGER), CAST('1e3' AS INTEGER), CAST('  -42xyz' AS INTEGER), CAST('abc' AS INTEGER);
+SELECT CAST(12.9 AS INTEGER), CAST(-12.9 AS INTEGER), CAST(1e30 AS INTEGER), CAST(-1e30 AS INTEGER);
+SELECT CAST('1.5' AS REAL), CAST(3 AS REAL), CAST('x' AS REAL), CAST('1e400' AS REAL);
+SELECT CAST(12 AS TEXT), CAST(1.5 AS TEXT), CAST(1e20 AS TEXT), CAST(0.1 AS TEXT), CAST(100.0 AS TEXT), CAST(1e-5 AS TEXT);
+SELECT CAST(123456789.123 AS TEXT), CAST(1.0/3 AS TEXT), CAST(2.0/3 AS TEXT), CAST(-1.25e-10 AS TEXT);
+SELECT CAST('12.0' AS NUMERIC), CAST('12.5' AS NUMERIC), CAST('1e2' AS NUMERIC), CAST(3.0 AS NUMERIC), CAST('abc' AS NUMERIC);
+SELECT CAST(NULL AS INTEGER), typeof(CAST(NULL AS TEXT)), CAST(x'3132' AS INTEGER), hex(CAST(12 AS BLOB));
+SELECT typeof(CAST(5 AS VARCHAR)), typeof(CAST('5' AS FLOAT)), typeof(CAST('5' AS whatever));
+
+== real-to-text
+SELECT 1.0 || '', 1.5 || '', 1e15 || '', 1e16 || '', 123456789012345.0 || '', 1234567890123456.0 || '';
+SELECT 0.0001 || '', 0.00001 || '', 3.14159265358979 || '', 2.718281828459045 || '', -0.0 || '';
+SELECT 1e100 || '', 1.7976931348623157e308 || '', 5e-324 || '', 4.9e-300 || '', 100.25 || '';
+
+== strings
+SELECT 'a' || 'b' || 'c', length('hello'), lower('HeLLo'), upper('hello'), length(NULL), length(123), length(1.5);
+SELECT substr('hello', 2), substr('hello', 2, 3), substr('hello', -3), substr('hello', -3, 2), substr('hello', 0, 2), substr('hello', 10), substr('hello', 2, -1), substr('hello', 0);
+SELECT substr(x'0102030405', 2, 2), substring('abcdef', 3);
+SELECT trim('  x  '), ltrim('  x  '), rtrim('  x  '), trim('xxhixx', 'x'), ltrim('abcba', 'ab'), rtrim('abcba', 'ab');
+SELECT replace('hello world', 'o', '0'), replace('aaa', 'a', 'bb'), replace('abc', '', 'x'), instr('hello', 'll'), instr('hello', 'z');
+SELECT hex('abc'), hex(NULL), hex(255), quote('it''s'), quote(1), quote(NULL), quote(x'abcd'), quote(1.5);
+SELECT char(72, 105), unicode('A'), unicode(''), printf('%d', 5);
+
+== like-glob
+SELECT 'hello' LIKE 'h%', 'hello' LIKE 'H%', 'hello' LIKE '_ello', 'hello' LIKE '%l%', 'hello' LIKE 'hel', 'hello' NOT LIKE 'x%';
+SELECT 'a%c' LIKE 'a\%c' ESCAPE '\', 'abc' LIKE 'a\%c' ESCAPE '\', 'a_c' LIKE 'a#_c' ESCAPE '#';
+SELECT 'hello' GLOB 'h*', 'hello' GLOB 'H*', 'hello' GLOB 'h?llo', 'hello' GLOB 'h[a-e]llo', 'hello' GLOB 'h[^e]llo', 'a]b' GLOB 'a[]]b';
+SELECT NULL LIKE 'a', 'a' LIKE NULL, like('a%', 'abc'), glob('*c', 'abc');
+SELECT 'ABC' LIKE 'abc', 'Ä' LIKE 'ä', '' LIKE '%', '' LIKE '_';
+
+== case
+SELECT CASE 1 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'many' END;
+SELECT CASE 3 WHEN 1 THEN 'one' WHEN 2 THEN 'two' END;
+SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END;
+SELECT CASE NULL WHEN NULL THEN 'null' ELSE 'not' END;
+SELECT iif(1, 'y', 'n'), iif(0, 'y', 'n'), iif(NULL, 'y', 'n');
+
+== between-in
+SELECT 5 BETWEEN 1 AND 10, 5 NOT BETWEEN 1 AND 10, 'b' BETWEEN 'a' AND 'c', NULL BETWEEN 1 AND 2, 1 BETWEEN NULL AND 2, 3 BETWEEN NULL AND 2;
+SELECT 1 IN (1, 2), 3 IN (1, 2), 3 NOT IN (1, 2), NULL IN (1), 1 IN (NULL, 1), 2 IN (NULL, 1), 2 NOT IN (NULL, 1), 1 IN (), 1 NOT IN ();
+SELECT 'a' IN ('A', 'a'), 1.0 IN (1), '1' IN (1);
+
+== functions-math
+SELECT abs(-5), abs(5), abs(-5.5), abs(NULL), abs('-3'), abs('x');
+SELECT round(2.5), round(-2.5), round(1.2345, 2), round(1.005, 2), round(5), typeof(round(5)), round(123.456, -1), round(NULL);
+SELECT max(1, 5, 3), min(1, 5, 3), max('a', 'b'), max(1, NULL), min(1, 'a', x'00');
+SELECT sign(-3), sign(0), sign(2.5), sign('x'), sign(NULL);
+SELECT typeof(random()), length(randomblob(8)), zeroblob(3) = x'000000';
+
+== row-values
+SELECT (1, 2) = (1, 2), (1, 2) < (1, 3), (1, NULL) = (1, 2), (1, NULL) = (2, 2), (2, 1) > (1, 5);

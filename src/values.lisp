@@ -126,44 +126,6 @@ conversion used for arithmetic on text."
     (if any (clamp-i64 (* sign v)) 0)))
 
 ;;; ------------------------------------------------------------------
-;;; Formatting reals as SQLite does ("%!.15g")
-
-(defun format-real (x)
-  (cond ((float-nan-p x) "NaN")
-        ((float-infinity-p x) (if (plusp x) "Inf" "-Inf"))
-        ((zerop x) "0.0")
-        (t
-         (let* ((neg (minusp x))
-                (r (abs (rational x)))
-                (e (let ((e (floor (log (abs x) 10))))
-                     ;; correct the floating estimate exactly
-                     (loop while (> (expt 10 e) r) do (decf e))
-                     (loop while (<= (expt 10 (1+ e)) r) do (incf e))
-                     e))
-                (d (round (/ r (expt 10 (- e 14))))))
-           (when (>= d (expt 10 15)) (setf d (round d 10)) (incf e))
-           (let* ((digits (string-right-trim "0" (format nil "~d" d)))
-                  (digits (if (string= digits "") "0" digits))
-                  (body
-                    (if (or (< e -4) (>= e 15))
-                        (format nil "~a.~a~ae~a~2,'0d"
-                                (char digits 0)
-                                (if (> (length digits) 1) (subseq digits 1) "")
-                                (if (> (length digits) 1) "" "0")
-                                (if (minusp e) "-" "+")
-                                (abs e))
-                        (cond ((minusp e)
-                               (format nil "0.~a~a"
-                                       (make-string (- (- e) 1) :initial-element #\0)
-                                       digits))
-                              ((>= e (1- (length digits)))
-                               (format nil "~a~a.0" digits
-                                       (make-string (- e (1- (length digits)))
-                                                    :initial-element #\0)))
-                              (t (format nil "~a.~a" (subseq digits 0 (1+ e))
-                                         (subseq digits (1+ e))))))))
-             (if neg (concatenate 'string "-" body) body))))))
-
 ;;; ------------------------------------------------------------------
 ;;; Conversions
 

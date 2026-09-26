@@ -316,23 +316,9 @@ and may return true when this row became the aggregate's witness (min/max)."
 (defsqlfun "round" (1 2) (args)
   (let ((x (first args)) (digits (if (cdr args) (second args) 0)))
     (with-null-args (x digits)
-      (let* ((n (value-to-real x))
-             (d (max 0 (min 30 (value-to-integer digits)))))
-        (if (or (float-infinity-p n) (> (abs n) 4.5d15))
-            n
-            ;; round half away from zero on the exact decimal expansion,
-            ;; as SQLite's printf-based rounding does
-            (let* ((scale (expt 10 d))
-                   (r (rational n))
-                   (q (* (abs r) scale))
-                   (i (floor (+ q 1/2))))
-              (let ((res (safe-double (/ (* (signum r) i) scale))))
-                ;; SQLite rounds using the value printed to 15 digits
-                (let ((alt (value-to-real (format-real-digits n 15))))
-                  (let* ((q2 (* (abs (rational alt)) scale))
-                         (i2 (floor (+ q2 1/2))))
-                    (setf res (safe-double (/ (* (signum r) i2) scale)))))
-                (if (zerop res) (if (minusp n) -0d0 0d0) res))))))))
+      (let ((n (value-to-real x))
+            (d (value-to-integer digits)))
+        (sql-round n (max 0 (min 30 (if (integerp d) d 0))))))))
 
 (defsqlfun "sign" (1 1) (args)
   (let ((v (first args)))

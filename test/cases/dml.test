@@ -1,0 +1,172 @@
+== update-basic
+CREATE TABLE t(id INTEGER PRIMARY KEY, v, w);
+INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+UPDATE t SET w = w + 1 WHERE id >= 2;
+SELECT * FROM t ORDER BY id;
+UPDATE t SET v = upper(v), w = w * 2;
+SELECT * FROM t ORDER BY id;
+UPDATE t SET id = id + 10 WHERE id = 1;
+SELECT * FROM t ORDER BY id;
+UPDATE t SET v = 'z' WHERE 0;
+SELECT changes();
+UPDATE t SET w = NULL WHERE v = 'B';
+SELECT changes(), total_changes();
+SELECT * FROM t ORDER BY id;
+
+== delete-basic
+CREATE TABLE t(a);
+INSERT INTO t VALUES (1), (2), (3), (4), (5);
+DELETE FROM t WHERE a % 2 = 0;
+SELECT a FROM t ORDER BY a;
+SELECT changes();
+DELETE FROM t;
+SELECT count(*) FROM t;
+INSERT INTO t VALUES (9);
+SELECT rowid, a FROM t;
+
+== not-null
+CREATE TABLE t(a NOT NULL, b);
+INSERT INTO t VALUES (1, 2);
+INSERT INTO t VALUES (NULL, 2);
+INSERT OR IGNORE INTO t VALUES (NULL, 3);
+SELECT * FROM t;
+UPDATE t SET a = NULL;
+SELECT * FROM t;
+
+== not-null-replace-default
+CREATE TABLE t(a NOT NULL DEFAULT 'dflt', b);
+INSERT OR REPLACE INTO t VALUES (NULL, 1);
+SELECT * FROM t;
+
+== unique
+CREATE TABLE t(a UNIQUE, b);
+INSERT INTO t VALUES (1, 'x'), (2, 'y');
+INSERT INTO t VALUES (1, 'z');
+INSERT INTO t VALUES (NULL, 'n1'), (NULL, 'n2');
+SELECT * FROM t ORDER BY rowid;
+INSERT OR IGNORE INTO t VALUES (2, 'ignored'), (3, 'kept');
+SELECT * FROM t ORDER BY rowid;
+INSERT OR REPLACE INTO t VALUES (1, 'replaced');
+SELECT a, b FROM t ORDER BY a;
+UPDATE t SET a = 2 WHERE a = 3;
+UPDATE OR REPLACE t SET a = 2 WHERE a = 3;
+SELECT a, b FROM t ORDER BY a;
+
+== multi-column-unique
+CREATE TABLE t(a, b, c, UNIQUE(a, b));
+INSERT INTO t VALUES (1, 1, 'x'), (1, 2, 'y');
+INSERT INTO t VALUES (1, 1, 'dup');
+INSERT INTO t VALUES (1, NULL, 'n'), (1, NULL, 'n2');
+SELECT * FROM t ORDER BY rowid;
+
+== primary-key-text
+CREATE TABLE t(k TEXT PRIMARY KEY, v);
+INSERT INTO t VALUES ('a', 1), ('b', 2);
+INSERT INTO t VALUES ('a', 3);
+REPLACE INTO t VALUES ('a', 4);
+SELECT * FROM t ORDER BY k;
+SELECT * FROM t WHERE k = 'b';
+
+== conflict-abort-atomic
+CREATE TABLE t(a UNIQUE);
+INSERT INTO t VALUES (1);
+INSERT INTO t VALUES (2), (3), (1), (4);
+SELECT a FROM t ORDER BY a;
+INSERT OR FAIL INTO t VALUES (5), (1), (6);
+SELECT a FROM t ORDER BY a;
+
+== check-constraint
+CREATE TABLE t(a CHECK (a > 0), b, CONSTRAINT bpos CHECK (b IS NULL OR b < 10));
+INSERT INTO t VALUES (1, 1);
+INSERT INTO t VALUES (0, 1);
+INSERT INTO t VALUES (1, 11);
+INSERT INTO t VALUES (NULL, NULL);
+SELECT * FROM t ORDER BY rowid;
+
+== autoincrement
+CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+INSERT INTO t(v) VALUES ('a'), ('b'), ('c');
+DELETE FROM t WHERE id = 3;
+INSERT INTO t(v) VALUES ('d');
+SELECT * FROM t ORDER BY id;
+SELECT name, seq FROM sqlite_sequence;
+INSERT INTO t VALUES (100, 'e');
+INSERT INTO t(v) VALUES ('f');
+SELECT * FROM t ORDER BY id;
+SELECT seq FROM sqlite_sequence WHERE name = 't';
+
+== rowid-reuse-without-autoincrement
+CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+INSERT INTO t(v) VALUES ('a'), ('b'), ('c');
+DELETE FROM t WHERE id = 3;
+INSERT INTO t(v) VALUES ('d');
+SELECT * FROM t ORDER BY id;
+
+== upsert
+CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER, n INTEGER DEFAULT 0);
+INSERT INTO kv(k, v) VALUES ('a', 1);
+INSERT INTO kv(k, v) VALUES ('a', 5) ON CONFLICT(k) DO UPDATE SET v = excluded.v, n = n + 1;
+INSERT INTO kv(k, v) VALUES ('b', 2) ON CONFLICT(k) DO UPDATE SET v = excluded.v;
+INSERT INTO kv(k, v) VALUES ('b', 9) ON CONFLICT DO NOTHING;
+SELECT * FROM kv ORDER BY k;
+INSERT INTO kv(k, v) VALUES ('a', 0) ON CONFLICT(k) DO UPDATE SET v = v + 100 WHERE excluded.v > 0;
+SELECT * FROM kv ORDER BY k;
+
+== returning
+CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+INSERT INTO t(v) VALUES ('a'), ('b') RETURNING id, v;
+UPDATE t SET v = v || '!' WHERE id = 2 RETURNING *;
+DELETE FROM t WHERE id = 1 RETURNING v, id * 10 AS ten;
+SELECT * FROM t;
+
+== insert-column-mismatch
+CREATE TABLE t(a, b);
+INSERT INTO t VALUES (1);
+INSERT INTO t(a) VALUES (1, 2);
+INSERT INTO t(nosuch) VALUES (1);
+SELECT count(*) FROM t;
+
+== transactions
+CREATE TABLE t(a);
+BEGIN;
+INSERT INTO t VALUES (1);
+INSERT INTO t VALUES (2);
+ROLLBACK;
+SELECT count(*) FROM t;
+BEGIN;
+INSERT INTO t VALUES (3);
+COMMIT;
+SELECT a FROM t;
+COMMIT;
+BEGIN;
+BEGIN;
+ROLLBACK;
+
+== statement-atomicity-in-transaction
+CREATE TABLE t(a UNIQUE);
+BEGIN;
+INSERT INTO t VALUES (1);
+INSERT INTO t VALUES (2), (1);
+INSERT INTO t VALUES (3);
+COMMIT;
+SELECT a FROM t ORDER BY a;
+
+== update-with-index
+CREATE TABLE t(a, b);
+CREATE INDEX tb ON t(b);
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'x');
+UPDATE t SET b = 'z' WHERE b = 'x';
+SELECT a FROM t WHERE b = 'z' ORDER BY a;
+SELECT a FROM t WHERE b = 'x';
+DELETE FROM t WHERE b = 'z';
+SELECT a, b FROM t;
+
+== large-values
+CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, b BLOB);
+INSERT INTO t VALUES (1, 'x', NULL);
+WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 200)
+INSERT INTO t(s, b) SELECT printf('%.*c', i * 50, 'a'), zeroblob(i * 97) FROM c;
+SELECT count(*), sum(length(s)), sum(length(b)) FROM t;
+UPDATE t SET s = s || s WHERE id % 7 = 0;
+DELETE FROM t WHERE id % 3 = 0;
+SELECT count(*), sum(length(s)), sum(length(b)) FROM t;

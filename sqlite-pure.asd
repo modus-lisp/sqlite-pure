@@ -25,6 +25,7 @@
      (:file "expr")
      (:file "select")
      (:file "functions")
+     (:file "printf")
      (:file "dml")
      (:file "ddl")
      (:file "integrity")

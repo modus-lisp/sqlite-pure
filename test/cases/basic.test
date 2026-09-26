@@ -1,0 +1,83 @@
+== literals
+SELECT 1, 1.5, 'abc', x'00ff', NULL, -7, 0x10, 1e3, .5, 5.;
+SELECT 9223372036854775807, -9223372036854775808, 9223372036854775808;
+SELECT typeof(1), typeof(1.0), typeof('a'), typeof(x'01'), typeof(NULL);
+SELECT 'it''s', "no such column", 1 AS "quoted alias";
+
+== create-insert-select
+CREATE TABLE t(a INTEGER, b TEXT, c REAL);
+INSERT INTO t VALUES (1, 'one', 1.0), (2, 'two', 2.5), (3, 'three', NULL);
+SELECT * FROM t ORDER BY a;
+SELECT a, b FROM t WHERE c IS NULL;
+SELECT count(*) FROM t;
+SELECT rowid, a FROM t ORDER BY rowid;
+
+== integer-primary-key
+CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+INSERT INTO t(v) VALUES ('a'), ('b');
+INSERT INTO t VALUES (10, 'c');
+INSERT INTO t(v) VALUES ('d');
+SELECT id, rowid, _rowid_, oid, v FROM t ORDER BY id;
+SELECT * FROM t WHERE id = 10;
+SELECT * FROM t WHERE rowid > 2 ORDER BY 1;
+INSERT INTO t VALUES (10, 'dup');
+INSERT INTO t VALUES ('x', 'bad');
+INSERT INTO t VALUES ('11', 'text-int');
+INSERT INTO t VALUES (12.0, 'real-int');
+SELECT * FROM t ORDER BY id;
+
+== affinity-storage
+CREATE TABLE t(i INTEGER, r REAL, n NUMERIC, x TEXT, b BLOB, none);
+INSERT INTO t VALUES ('12', '12', '12', 12, '12', '12');
+INSERT INTO t VALUES ('12.5', '12.5', '12.50', 12.5, 12.5, 12.5);
+INSERT INTO t VALUES ('abc', 'abc', 'abc', 'abc', 'abc', 'abc');
+INSERT INTO t VALUES (1e20, 5, '1e2', 1e20, x'41', x'41');
+INSERT INTO t VALUES (' 7 ', '-0', '0x10', -0.0, NULL, 3.0);
+SELECT typeof(i), i, typeof(r), r, typeof(n), n, typeof(x), x, typeof(b), b, typeof(none), none FROM t ORDER BY rowid;
+
+== declared-types
+CREATE TABLE t(a VARCHAR(10), b DOUBLE PRECISION, c BIGINT, d FLOATING POINT, e DECIMAL(10,2), f CHARINT, g BOOLEAN, h DATE);
+INSERT INTO t VALUES ('5', '5', '5', '5', '5', '5', '5', '5');
+SELECT typeof(a), typeof(b), typeof(c), typeof(d), typeof(e), typeof(f), typeof(g), typeof(h) FROM t;
+
+== nulls
+SELECT NULL = NULL, NULL IS NULL, NULL IS NOT NULL, 1 IS NULL, NULL + 1, NULL || 'a';
+SELECT NULL AND 0, NULL AND 1, NULL OR 1, NULL OR 0, NOT NULL;
+SELECT 1 IS 1, 1 IS 2, NULL IS 1, 1 IS NOT NULL, NULL IS NOT NULL, 1 IS NOT 2;
+SELECT coalesce(NULL, NULL, 3), ifnull(NULL, 'x'), nullif(1, 1), nullif(1, 2);
+SELECT 1 ISNULL, NULL NOTNULL, NULL NOT NULL;
+
+== empty-table
+CREATE TABLE t(a, b);
+SELECT * FROM t;
+SELECT count(*), sum(a), total(a), avg(a), min(a), max(a), group_concat(a) FROM t;
+SELECT a FROM t GROUP BY a;
+
+== multiple-rows-insert-select
+CREATE TABLE s(x);
+INSERT INTO s VALUES (1), (2), (3);
+CREATE TABLE d(y);
+INSERT INTO d SELECT x * 10 FROM s WHERE x > 1;
+SELECT * FROM d ORDER BY y;
+INSERT INTO d SELECT * FROM d;
+SELECT count(*), sum(y) FROM d;
+
+== default-values
+CREATE TABLE t(a DEFAULT 5, b TEXT DEFAULT 'hi', c DEFAULT (1+2), d DEFAULT -3, e DEFAULT NULL, f);
+INSERT INTO t DEFAULT VALUES;
+INSERT INTO t(f) VALUES ('x');
+INSERT INTO t(a, f) VALUES (NULL, 'y');
+SELECT * FROM t ORDER BY rowid;
+
+== blobs
+CREATE TABLE t(b BLOB);
+INSERT INTO t VALUES (x''), (x'00'), (x'0102ff'), (zeroblob(4));
+SELECT hex(b), length(b), typeof(b) FROM t ORDER BY rowid;
+SELECT b FROM t ORDER BY b;
+SELECT x'41' = 'A', CAST(x'41' AS TEXT), CAST('A' AS BLOB);
+
+== unicode-text
+CREATE TABLE t(s TEXT);
+INSERT INTO t VALUES ('héllo'), ('日本語'), ('emoji 😀'), ('');
+SELECT s, length(s), upper(s), hex(s) FROM t ORDER BY rowid;
+SELECT substr('日本語テキスト', 2, 3), instr('日本語', '語'), unicode('日');

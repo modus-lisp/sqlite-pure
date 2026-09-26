@@ -1,0 +1,106 @@
+== indexes-and-lookup
+CREATE TABLE t(a, b, c);
+CREATE INDEX ta ON t(a);
+CREATE UNIQUE INDEX tbc ON t(b, c DESC);
+INSERT INTO t VALUES (1, 'x', 1), (2, 'x', 2), (1, 'y', 3), (3, 'z', NULL);
+SELECT c FROM t WHERE a = 1 ORDER BY c;
+SELECT a FROM t WHERE b = 'x' AND c = 2;
+INSERT INTO t VALUES (9, 'x', 1);
+SELECT count(*) FROM t WHERE a = '1';
+SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name;
+CREATE INDEX ta ON t(b);
+CREATE INDEX IF NOT EXISTS ta ON t(b);
+DROP INDEX ta;
+SELECT c FROM t WHERE a = 1 ORDER BY c;
+DROP INDEX ta;
+DROP INDEX IF EXISTS ta;
+
+== index-collation
+CREATE TABLE t(name TEXT COLLATE NOCASE, v);
+CREATE INDEX tn ON t(name);
+INSERT INTO t VALUES ('Alice', 1), ('bob', 2), ('ALICE', 3);
+SELECT v FROM t WHERE name = 'alice' ORDER BY v;
+SELECT name FROM t ORDER BY name, v;
+SELECT v FROM t WHERE name = 'BOB';
+
+== unique-index-on-existing-data
+CREATE TABLE t(a);
+INSERT INTO t VALUES (1), (2), (1);
+CREATE UNIQUE INDEX ua ON t(a);
+SELECT count(*) FROM sqlite_schema WHERE name = 'ua';
+DELETE FROM t WHERE rowid = 3;
+CREATE UNIQUE INDEX ua ON t(a);
+INSERT INTO t VALUES (2);
+
+== drop-table
+CREATE TABLE t(a UNIQUE);
+CREATE INDEX ti ON t(a);
+INSERT INTO t VALUES (1);
+DROP TABLE t;
+SELECT * FROM t;
+SELECT count(*) FROM sqlite_schema;
+CREATE TABLE t(b);
+SELECT * FROM t;
+DROP TABLE IF EXISTS nosuch;
+DROP TABLE nosuch;
+
+== create-errors
+CREATE TABLE t(a);
+CREATE TABLE t(b);
+CREATE TABLE IF NOT EXISTS t(b);
+CREATE TABLE T(c);
+CREATE TABLE sqlite_x(a);
+CREATE TABLE u(a, a);
+CREATE TABLE v(a PRIMARY KEY, b PRIMARY KEY);
+SELECT name FROM sqlite_schema ORDER BY name;
+
+== create-table-as
+CREATE TABLE src(a INTEGER, b TEXT, c);
+INSERT INTO src VALUES (1, 'x', 1.5), (2, 'y', NULL);
+CREATE TABLE dst AS SELECT a, b AS bee, c * 2 AS c2, a || b FROM src;
+SELECT * FROM dst ORDER BY a;
+SELECT sql FROM sqlite_schema WHERE name = 'dst';
+SELECT typeof(a), typeof(bee) FROM dst;
+
+== alter-table
+CREATE TABLE t(a, b);
+INSERT INTO t VALUES (1, 2);
+ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'dc';
+ALTER TABLE t ADD d INTEGER;
+SELECT * FROM t;
+INSERT INTO t VALUES (3, 4, 'x', 5);
+SELECT * FROM t ORDER BY a;
+SELECT sql FROM sqlite_schema WHERE name = 't';
+ALTER TABLE t RENAME TO t2;
+SELECT a FROM t2 ORDER BY a;
+SELECT name, sql FROM sqlite_schema;
+ALTER TABLE t2 RENAME COLUMN b TO bb;
+SELECT bb FROM t2 ORDER BY bb;
+ALTER TABLE t2 DROP COLUMN c;
+SELECT * FROM t2 ORDER BY a;
+SELECT sql FROM sqlite_schema WHERE name = 't2';
+ALTER TABLE t2 ADD COLUMN e NOT NULL;
+ALTER TABLE t2 ADD COLUMN a;
+
+== pragmas
+CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'x', score REAL, u UNIQUE);
+CREATE INDEX ts ON t(score DESC, name);
+PRAGMA table_info(t);
+PRAGMA index_list(t);
+PRAGMA index_info(ts);
+PRAGMA user_version;
+PRAGMA user_version = 42;
+PRAGMA user_version;
+PRAGMA integrity_check;
+
+== without-rowid
+CREATE TABLE w(k TEXT, n INTEGER, v, PRIMARY KEY (k, n)) WITHOUT ROWID;
+INSERT INTO w VALUES ('b', 2, 'b2'), ('a', 1, 'a1'), ('a', 2, 'a2');
+SELECT * FROM w;
+SELECT v FROM w WHERE k = 'a' AND n = 2;
+INSERT INTO w VALUES ('a', 1, 'dup');
+INSERT OR REPLACE INTO w VALUES ('a', 1, 'new');
+UPDATE w SET v = v || '!' WHERE k = 'b';
+DELETE FROM w WHERE k = 'a' AND n = 2;
+SELECT * FROM w;
+SELECT rowid FROM w;

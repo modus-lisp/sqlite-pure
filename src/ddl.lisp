@@ -97,13 +97,13 @@
         (multiple-value-bind (fn cols) (compile-select as-select (make-scope))
           (let* ((rows (funcall fn nil))
                  (names (dedupe-names (mapcar #'first cols)))
+                 ;; SQLite 3.40's layout: CREATE TABLE t(a INT,b TEXT,c)
                  (sql (format nil "CREATE TABLE ~a(~{~a~^,~})" (quote-ident name)
                               (loop for n in names
                                     for c in cols
                                     for ty = (affinity-type-name (second c))
-                                    collect (format nil "~%  ~a~:[ ~a~;~*~]" (quote-ident n)
-                                                    (string= ty "") ty))))
-                 (sql (concatenate 'string (subseq sql 0 (1- (length sql))) (string #\Newline) ")")))
+                                    collect (format nil "~a~:[ ~a~;~*~]" (quote-ident n)
+                                                    (string= ty "") ty)))))
             (create-table-from-ast (car (first (parse-sql sql))) sql)
             (let ((tb (lookup-table *db* name))
                   (ctx nil))
@@ -246,13 +246,16 @@
 ;;; ------------------------------------------------------------------
 ;;; ALTER TABLE
 
-(defun replace-token-text (sql pred new)
+(defun replace-token-text (sql pred new &optional always-quote)
   "Replace identifier tokens of SQL satisfying PRED with NEW (quoted)."
   (let ((toks (tokenize sql)) (out (make-string-output-stream)) (pos 0))
     (loop for tk across toks
           do (when (and (eq (tok-kind tk) :id) (funcall pred tk))
                (write-string sql out :start pos :end (tok-pos tk))
-               (write-string (quote-ident new) out)
+               (write-string (if always-quote
+                                 (format nil "\"~a\"" (substitute-string "\"" "\"\"" new))
+                                 (quote-ident new))
+                             out)
                (setf pos (tok-end tk))))
     (write-string sql out :start pos)
     (get-output-stream-string out)))
@@ -290,7 +293,7 @@
                                     (and (name= (tok-value tk) table)
                                          (or (not (equal type "table")) (not done))
                                          (setf done t)))
-                                  rename-to)))))
+                                  rename-to t)))))
                (rewrite-schema-row r :name new-name :tbl rename-to :sql new-sql))))
          (when (sequence-table)
            (let ((seq (sequence-table)))

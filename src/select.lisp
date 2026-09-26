@@ -86,7 +86,7 @@
   join            ; :first :inner :left :cross :comma
   on using natural)
 
-(defun make-table-src (table alias)
+(defun make-table-src (table &optional alias)
   (let ((cols (table-columns table)))
     (make-src :name (or alias (table-name table))
               :columns (map 'vector #'column-name cols)
@@ -380,11 +380,11 @@ source[LI].col = expr where expr references only earlier sources."
                                           (when (and stop (if (eq stop-op :lt) (>= r stop) (> r stop)))
                                             (throw :range-done nil)))
                                         (funcall fn row))
-                                      :start (and start (clamp-i64 start)))))))))))
-      ;; 4. full scan
-      (lambda (env fn)
-        (declare (ignore env))
-        (map-table-rows table fn)))))
+                                      :start (and start (clamp-i64 start))))))))))))
+    ;; 4. full scan
+    (lambda (env fn)
+      (declare (ignore env))
+      (map-table-rows table fn))))
 
 (defun ceiling* (x strict)
   "Smallest integer > X (STRICT) or >= X."
@@ -447,7 +447,11 @@ source[LI].col = expr where expr references only earlier sources."
       (:col (multiple-value-bind (depth si ci s) (resolve-column scope (second e*) (third e*))
               (declare (ignore si))
               (cond ((and depth (integerp ci)) (svref (src-columns s) ci))
-                    ((and depth (eq ci :rowid)) (third e*))
+                    ((and depth (eq ci :rowid))
+                     (let ((tb (src-table s)))
+                       (if (and tb (table-rowid-alias tb))
+                           (column-name (aref (table-columns tb) (table-rowid-alias tb)))
+                           (third e*))))
                     (t (or text (third e*))))))
       (t (or text "?")))))
 
@@ -481,10 +485,10 @@ Return the per-source ON expressions."
                         (setf on (if on (list :binary :and on cond) cond)))))
                   on)))
 
-(defun build-levels (fsrcs scope where)
+(defun build-levels (fsrcs scope where &optional (ons nil ons-p))
   "Plan the nested loops.  Return (values levels final-filters)."
   (let* ((n (length fsrcs))
-         (ons (apply-joins fsrcs scope))
+         (ons (if ons-p ons (apply-joins fsrcs scope)))
          (where-conjs (split-conjuncts where))
          (levels '())
          (finals '()))
@@ -581,6 +585,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
   (let* ((fsrcs (mapcar (lambda (item) (make-fsrc-for item scope))
                         (select-core-from core)))
          (cscope (make-scope :srcs (mapcar #'fsrc-src fsrcs) :parent scope))
+         (ons (apply-joins fsrcs cscope))
          (rcols (expand-result-columns core cscope))
          (_ (setf (scope-aliases cscope)
                   (loop for c in (select-core-cols core)
@@ -594,7 +599,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
     (declare (ignore _))
     (when (and having (not group) (not agg-p))
       (sql-error "a GROUP BY clause is required before HAVING"))
-    (multiple-value-bind (levels finals) (build-levels fsrcs cscope (select-core-where core))
+    (multiple-value-bind (levels finals) (build-levels fsrcs cscope (select-core-where core) ons)
       (let* ((nsrc (length fsrcs))
              (columns (loop for (e name) in rcols
                             collect (list name (expr-affinity e cscope)
@@ -660,7 +665,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                             (let* ((key (group-key (mapcar (lambda (f) (funcall f env)) group-fns)
                                                    group-colls))
                                    (g (or (gethash key groups)
-                                          (let ((g (cons (make-array nsrc)
+                                          (let ((g (cons (copy-seq (env-rows env))
                                                          (mapcar #'agg-instantiate aggs))))
                                             (push key order-of-groups)
                                             (setf (gethash key groups) g)))))
@@ -718,19 +723,26 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
 (defun compile-order-terms (order rcols scope)
   "Return list of (fn-or-column-index desc collation nulls)."
   (loop for (e desc coll nulls) in order
-        collect (let* ((idx (order-term-column e rcols))
+        for k from 1
+        collect (let* ((idx (order-term-column e rcols k))
                        (collation (cond (coll (collation-keyword coll))
                                         (idx (or (expr-collation (first (nth idx rcols)) scope) :binary))
                                         (t (or (expr-collation e scope) :binary)))))
                   (list (or idx (compile-expr e scope)) desc collation nulls))))
 
-(defun order-term-column (e rcols)
+(defun ordinal (k)
+  (format nil "~d~a" k (if (<= 11 (mod k 100) 13)
+                           "th"
+                           (case (mod k 10) (1 "st") (2 "nd") (3 "rd") (t "th")))))
+
+(defun order-term-column (e rcols &optional (k 1))
   "Index of the result column an ORDER BY term names, or NIL."
   (cond ((and (eq (car e) :lit) (integerp (second e)))
-         (let ((k (second e)))
-           (unless (<= 1 k (length rcols))
-             (sql-error "ORDER BY term out of range - should be between 1 and ~d" (length rcols)))
-           (1- k)))
+         (let ((v (second e)))
+           (unless (<= 1 v (length rcols))
+             (sql-error "~a ORDER BY term out of range - should be between 1 and ~d"
+                        (ordinal k) (length rcols)))
+           (1- v)))
         ((and (eq (car e) :col) (null (second e)))
          (position-if (lambda (rc) (and (not (eq (car (first rc)) :srccol))
                                         (name= (second rc) (third e))

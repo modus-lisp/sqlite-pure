@@ -1,0 +1,174 @@
+== setup-and-where
+CREATE TABLE emp(id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER, mgr INTEGER);
+INSERT INTO emp VALUES (1,'Ann','eng',120,NULL),(2,'Bob','eng',100,1),(3,'Cid','ops',90,1),(4,'Dee','ops',95,3),(5,'Eve','hr',70,1),(6,'Fay','eng',NULL,2);
+SELECT name FROM emp WHERE salary > 90 ORDER BY name;
+SELECT name FROM emp WHERE dept = 'eng' AND salary >= 100 ORDER BY id;
+SELECT name FROM emp WHERE dept = 'hr' OR salary IS NULL ORDER BY id;
+SELECT name FROM emp WHERE NOT (dept = 'eng') ORDER BY id;
+SELECT name FROM emp WHERE name LIKE '%e%' ORDER BY id;
+SELECT id FROM emp WHERE id IN (2, 4, 99) ORDER BY id;
+SELECT id FROM emp WHERE id BETWEEN 2 AND 4 ORDER BY id DESC;
+
+== order-limit
+CREATE TABLE t(a, b);
+INSERT INTO t VALUES (3,'c'),(1,'a'),(2,'b'),(NULL,'n'),(2,'bb'),(5, NULL);
+SELECT a, b FROM t ORDER BY a, b;
+SELECT a, b FROM t ORDER BY a DESC, b;
+SELECT a FROM t ORDER BY a NULLS LAST;
+SELECT a FROM t ORDER BY a DESC NULLS FIRST;
+SELECT a, b FROM t ORDER BY 2 DESC;
+SELECT a AS x FROM t ORDER BY x LIMIT 3;
+SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 2;
+SELECT a FROM t ORDER BY a LIMIT 2, 3;
+SELECT a FROM t ORDER BY a LIMIT -1 OFFSET 4;
+SELECT a FROM t ORDER BY a LIMIT 0;
+SELECT b FROM t ORDER BY b COLLATE NOCASE DESC;
+SELECT a * -1 AS neg FROM t WHERE a IS NOT NULL ORDER BY neg;
+SELECT a FROM t ORDER BY 3;
+
+== distinct
+CREATE TABLE t(a, b);
+INSERT INTO t VALUES (1,'x'),(1,'x'),(2,'y'),(1,'X'),(NULL,NULL),(NULL,NULL),(1.0,'x');
+SELECT DISTINCT a FROM t ORDER BY a;
+SELECT DISTINCT a, b FROM t ORDER BY a, b;
+SELECT count(DISTINCT a), count(DISTINCT b), count(a), count(*) FROM t;
+SELECT DISTINCT b COLLATE NOCASE FROM t ORDER BY 1;
+
+== aggregates
+CREATE TABLE t(g, v);
+INSERT INTO t VALUES ('a',1),('a',2),('b',3),('b',NULL),('c',NULL),('a',3.5),('b','7');
+SELECT g, count(*), count(v), sum(v), total(v), avg(v), min(v), max(v) FROM t GROUP BY g ORDER BY g;
+SELECT g, group_concat(v), group_concat(v, '|') FROM t GROUP BY g ORDER BY g;
+SELECT count(*), sum(v), max(g) FROM t;
+SELECT g FROM t GROUP BY g HAVING count(v) > 1 ORDER BY g;
+SELECT g, sum(v) AS s FROM t GROUP BY g HAVING s > 3 ORDER BY s DESC;
+SELECT sum(v) FILTER (WHERE g = 'a'), count(*) FILTER (WHERE v IS NULL) FROM t;
+SELECT g, max(v) FROM t GROUP BY 1 ORDER BY 1;
+SELECT count(*) FROM t WHERE 0;
+SELECT sum(x) FROM (SELECT 9223372036854775807 AS x UNION ALL SELECT 1);
+SELECT sum(1.5), avg(2), total(NULL), sum(NULL);
+
+== group-by-expressions
+CREATE TABLE t(n);
+INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7);
+SELECT n % 3 AS r, count(*), sum(n) FROM t GROUP BY n % 3 ORDER BY r;
+SELECT n > 3, count(*) FROM t GROUP BY 1 ORDER BY 1;
+SELECT count(*) AS c FROM t GROUP BY n % 2 HAVING c > 3;
+SELECT max(n), n FROM t;
+SELECT min(n), n FROM t;
+
+== joins
+CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT);
+CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER, y TEXT);
+INSERT INTO a VALUES (1,'one'),(2,'two'),(3,'three');
+INSERT INTO b VALUES (10,1,'p'),(11,1,'q'),(12,2,'r'),(13,9,'s');
+SELECT a.x, b.y FROM a JOIN b ON a.id = b.a_id ORDER BY b.id;
+SELECT a.x, b.y FROM a, b WHERE a.id = b.a_id ORDER BY b.id;
+SELECT a.x, b.y FROM a LEFT JOIN b ON a.id = b.a_id ORDER BY a.id, b.id;
+SELECT a.x, b.y FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.y IS NULL;
+SELECT a.x, b.y FROM a LEFT JOIN b ON a.id = b.a_id AND b.y = 'q' ORDER BY a.id;
+SELECT count(*) FROM a CROSS JOIN b;
+SELECT a.x, count(b.id) FROM a LEFT JOIN b ON b.a_id = a.id GROUP BY a.id ORDER BY a.id;
+SELECT t1.x, t2.x FROM a t1 JOIN a t2 ON t1.id < t2.id ORDER BY 1, 2;
+SELECT * FROM a JOIN b ON a.id = b.a_id WHERE a.id = 1 ORDER BY b.id;
+
+== join-using-natural
+CREATE TABLE p(k, v1);
+CREATE TABLE q(k, v2);
+INSERT INTO p VALUES (1,'a'),(2,'b'),(3,'c');
+INSERT INTO q VALUES (1,'x'),(3,'y'),(4,'z');
+SELECT * FROM p JOIN q USING (k) ORDER BY k;
+SELECT * FROM p NATURAL JOIN q ORDER BY k;
+SELECT k, v1, v2 FROM p LEFT JOIN q USING (k) ORDER BY k;
+SELECT p.k, q.k FROM p JOIN q USING (k) ORDER BY 1;
+
+== three-way-join
+CREATE TABLE c(id, name);
+CREATE TABLE o(id, cid, total);
+CREATE TABLE l(oid, item, qty);
+INSERT INTO c VALUES (1,'x'),(2,'y');
+INSERT INTO o VALUES (100,1,5),(101,1,7),(102,2,1);
+INSERT INTO l VALUES (100,'pen',2),(100,'ink',1),(101,'pad',3),(102,'pen',9);
+SELECT c.name, o.id, l.item, l.qty FROM c JOIN o ON o.cid = c.id JOIN l ON l.oid = o.id ORDER BY c.name, o.id, l.item;
+SELECT c.name, sum(l.qty) FROM c, o, l WHERE o.cid = c.id AND l.oid = o.id GROUP BY c.name ORDER BY 1;
+
+== subqueries
+CREATE TABLE t(a, b);
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+SELECT (SELECT max(a) FROM t), (SELECT a FROM t WHERE b = 20), (SELECT a FROM t WHERE 0);
+SELECT a FROM t WHERE b > (SELECT avg(b) FROM t);
+SELECT a FROM t WHERE a IN (SELECT a FROM t WHERE b >= 20) ORDER BY a;
+SELECT a FROM t WHERE a NOT IN (SELECT a FROM t WHERE b >= 20);
+SELECT a, (SELECT count(*) FROM t t2 WHERE t2.a <= t.a) FROM t ORDER BY a;
+SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.a = t.a + 1) ORDER BY a;
+SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM t t2 WHERE t2.a > t.a);
+SELECT * FROM (SELECT a * 2 AS d FROM t) WHERE d > 2 ORDER BY d;
+SELECT s.d FROM (SELECT a + b AS d FROM t) AS s ORDER BY 1 DESC;
+SELECT 2 IN (SELECT a FROM t), 5 IN (SELECT a FROM t), NULL IN (SELECT a FROM t);
+SELECT (SELECT a, b FROM t);
+
+== compound
+CREATE TABLE x(v);
+CREATE TABLE y(v);
+INSERT INTO x VALUES (1),(2),(2),(3);
+INSERT INTO y VALUES (2),(3),(4);
+SELECT v FROM x UNION SELECT v FROM y;
+SELECT v FROM x UNION ALL SELECT v FROM y ORDER BY v;
+SELECT v FROM x INTERSECT SELECT v FROM y;
+SELECT v FROM x EXCEPT SELECT v FROM y;
+SELECT v FROM y EXCEPT SELECT v FROM x ORDER BY 1 DESC;
+SELECT v, 'x' FROM x UNION SELECT v, 'y' FROM y ORDER BY 2, 1;
+SELECT 1 UNION SELECT 1 UNION SELECT 2;
+SELECT v FROM x UNION SELECT v FROM y LIMIT 2;
+SELECT 1, 2 UNION SELECT 3;
+
+== values-clause
+VALUES (1, 'a'), (2, 'b');
+SELECT * FROM (VALUES (1, 'a'), (2, 'b')) ORDER BY 1 DESC;
+SELECT column1 + column2 FROM (VALUES (1, 2), (3, 4));
+
+== cte
+WITH t(x) AS (SELECT 1 UNION ALL SELECT 2) SELECT x * 10 FROM t ORDER BY x;
+WITH a AS (SELECT 1 AS v), b AS (SELECT v + 1 AS v FROM a) SELECT * FROM a, b;
+WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 10) SELECT sum(x), count(*) FROM cnt;
+WITH RECURSIVE fib(a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a + b FROM fib WHERE b < 100) SELECT a FROM fib;
+WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n % 3 + 1 FROM r) SELECT n FROM r ORDER BY n;
+WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 5) SELECT x FROM c;
+
+== tree-cte
+CREATE TABLE node(id, parent, name);
+INSERT INTO node VALUES (1, NULL, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'a1'), (5, 4, 'a1x');
+WITH RECURSIVE sub(id, depth) AS (SELECT id, 0 FROM node WHERE id = 2 UNION ALL SELECT node.id, depth + 1 FROM node JOIN sub ON node.parent = sub.id) SELECT n.name, s.depth FROM sub s JOIN node n ON n.id = s.id ORDER BY s.depth;
+
+== views
+CREATE TABLE t(a, b);
+INSERT INTO t VALUES (1, 2), (3, 4);
+CREATE VIEW v AS SELECT a + b AS s, a FROM t;
+SELECT * FROM v ORDER BY s;
+SELECT s FROM v WHERE a = 3;
+CREATE VIEW v2(x, y) AS SELECT a, b FROM t;
+SELECT x, y FROM v2 ORDER BY x;
+SELECT count(*) FROM v JOIN v2 ON v.a = v2.x;
+DROP VIEW v;
+SELECT * FROM v;
+
+== column-names
+CREATE TABLE t(Abc, "b c");
+INSERT INTO t VALUES (1, 2);
+SELECT abc, ABC+1 , t.abc, "b c", count(*), 1 AS one, * FROM t;
+SELECT t.* FROM t;
+
+== star-join-names
+CREATE TABLE a(x, y);
+CREATE TABLE b(y, z);
+INSERT INTO a VALUES (1, 2);
+INSERT INTO b VALUES (2, 3);
+SELECT * FROM a JOIN b ON a.y = b.y;
+SELECT a.*, b.z FROM a, b;
+
+== ambiguous
+CREATE TABLE a(x);
+CREATE TABLE b(x);
+SELECT x FROM a, b;
+SELECT nosuch FROM a;
+SELECT * FROM nosuch;
