@@ -12,7 +12,7 @@
 (defvar *params* #() "Bound parameter values, 1-based by position.")
 (defvar *param-names* nil "alist name -> index for named parameters.")
 
-(defstruct env rows parent agg)
+(defstruct env rows parent agg win)
 
 (defvar *functions* (make-hash-table :test #'equal)
   "name -> (min-args max-args fn); fn receives a list of argument values.")
@@ -34,7 +34,9 @@
   (aggs (make-array 0 :adjustable t :fill-pointer t))
   aliases                ; alist result-alias -> AST, fallback for resolution
   outer-ref              ; set when a column resolves to an enclosing scope
-  in-agg-arg)
+  in-agg-arg
+  windows                ; window functions of this query level (NIL: not allowed here)
+  window-defs)           ; alist from the WINDOW clause
 
 (defun src-ncols (s) (length (src-columns s)))
 
@@ -343,6 +345,9 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
     (:cast (let ((f (compile-expr (second e) scope)) (ty (third e)))
              (lambda (env) (cast-value (funcall f env) ty))))
     (:fn (compile-function e scope))
+    (:winfn (if (scope-windows scope)
+                (compile-window-call e scope)
+                (sql-error "misuse of window function ~a()" (second e))))
     (:subquery (compile-scalar-subquery (second e) scope))
     (:exists (compile-exists (second e) scope))
     (:rowvalue (sql-error "row value misused"))

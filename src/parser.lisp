@@ -18,7 +18,7 @@
   sql toks (pos 0) (nparam 0) (names '()))
 
 (defstruct select-core
-  distinct cols from where group having)
+  distinct cols from where group having windows)
 
 (defstruct sel
   with       ; list of (name columns select) ; recursive flag in RECURSIVE
@@ -327,9 +327,50 @@
         (let ((filter (when (accept-kw p "FILTER")
                         (expect-op p "(") (expect-kw p "WHERE")
                         (prog1 (parse-expr p) (expect-op p ")")))))
-          (when (kw-p p "OVER") (perr p "window functions are not supported"))
-          (let ((f (list :fn name (nreverse args) distinct star filter)))
-            (if order (append f (list order)) f)))))))
+          (if (accept-kw p "OVER")
+              (list :winfn name (nreverse args) distinct star filter
+                    (if (op-p p "(")
+                        (progn (next-tok p) (prog1 (parse-window-spec p) (expect-op p ")")))
+                        (list :ref (parse-name p t))))
+              (let ((f (list :fn name (nreverse args) distinct star filter)))
+                (if order (append f (list order)) f))))))))
+
+(defun parse-frame-bound (p)
+  (cond ((accept-kw p "UNBOUNDED" "PRECEDING") '(:unbounded-preceding))
+        ((accept-kw p "UNBOUNDED" "FOLLOWING") '(:unbounded-following))
+        ((accept-kw p "CURRENT" "ROW") '(:current-row))
+        (t (let ((e (parse-additive p)))
+             (cond ((accept-kw p "PRECEDING") (list :preceding e))
+                   ((accept-kw p "FOLLOWING") (list :following e))
+                   (t (perr p "expected PRECEDING or FOLLOWING")))))))
+
+(defun parse-window-spec (p)
+  "Inside the parentheses of OVER (...) or WINDOW name AS (...)."
+  (let ((base nil) (partition nil) (order nil) (frame nil))
+    (when (and (name-token-p (peek-tok p))
+               (not (kw-p p "PARTITION")) (not (kw-p p "ORDER"))
+               (not (kw-p p "ROWS")) (not (kw-p p "RANGE")) (not (kw-p p "GROUPS")))
+      (setf base (parse-name p)))
+    (when (accept-kw p "PARTITION" "BY")
+      (setf partition (list (parse-expr p)))
+      (loop while (accept-op p ",") do (push (parse-expr p) partition))
+      (setf partition (nreverse partition)))
+    (when (accept-kw p "ORDER" "BY")
+      (setf order (parse-order-list p)))
+    (let ((unit (cond ((accept-kw p "ROWS") :rows) ((accept-kw p "RANGE") :range)
+                      ((accept-kw p "GROUPS") :groups))))
+      (when unit
+        (let (start end)
+          (if (accept-kw p "BETWEEN")
+              (progn (setf start (parse-frame-bound p))
+                     (expect-kw p "AND")
+                     (setf end (parse-frame-bound p)))
+              (setf start (parse-frame-bound p) end '(:current-row)))
+          (when (accept-kw p "EXCLUDE")
+            (cond ((accept-kw p "NO" "OTHERS"))
+                  (t (perr p "EXCLUDE is not supported"))))
+          (setf frame (list unit start end)))))
+    (list :spec :base base :partition partition :order order :frame frame)))
 
 ;;; ------------------------------------------------------------------
 ;;; SELECT
@@ -431,6 +472,16 @@
         (loop while (accept-op p ",") do (push (parse-expr p) g))
         (setf (select-core-group c) (nreverse g))))
     (when (accept-kw p "HAVING") (setf (select-core-having c) (parse-expr p)))
+    (when (accept-kw p "WINDOW")
+      (let ((defs '()))
+        (loop
+          (let ((name (parse-name p t)))
+            (expect-kw p "AS")
+            (expect-op p "(")
+            (push (cons name (parse-window-spec p)) defs)
+            (expect-op p ")"))
+          (unless (accept-op p ",") (return)))
+        (setf (select-core-windows c) (nreverse defs))))
     c))
 
 (defun source-text (p start-idx)

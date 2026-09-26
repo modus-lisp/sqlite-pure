@@ -24,6 +24,7 @@
      (:file "schema")
      (:file "expr")
      (:file "select")
+     (:file "window")
      (:file "functions")
      (:file "printf")
      (:file "datetime")
