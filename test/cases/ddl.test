@@ -104,3 +104,14 @@ UPDATE w SET v = v || '!' WHERE k = 'b';
 DELETE FROM w WHERE k = 'a' AND n = 2;
 SELECT * FROM w;
 SELECT rowid FROM w;
+
+== without-rowid-secondary-index
+CREATE TABLE w(p INTEGER, q TEXT, r, PRIMARY KEY (p, q)) WITHOUT ROWID;
+CREATE INDEX wr ON w(r);
+INSERT INTO w VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 10);
+SELECT p, q FROM w WHERE r = 10 ORDER BY p;
+UPDATE w SET p = p + 100 WHERE r = 10;
+SELECT * FROM w ORDER BY p;
+DELETE FROM w WHERE r = 20;
+SELECT count(*) FROM w;
+PRAGMA integrity_check;

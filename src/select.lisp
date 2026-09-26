@@ -349,9 +349,10 @@ source[LI].col = expr where expr references only earlier sources."
                                  (lambda (vals)
                                    (unless (zerop (funcall cmp vals probe))
                                      (throw :index-done nil))
-                                   (let ((row (if pk-index
-                                                  (table-record-to-row table nil vals)
-                                                  (fetch-row table (car (last vals))))))
+                                   (let ((row (cond (pk-index (table-record-to-row table nil vals))
+                                                    ((table-without-rowid table)
+                                                     (fetch-wr-row table (last vals (length (table-pk table)))))
+                                                    (t (fetch-row table (car (last vals)))))))
                                      (when row (funcall fn row))))
                                  :probe probe :cmp cmp))))))))))
     ;; 3. rowid range
