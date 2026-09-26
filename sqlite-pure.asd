@@ -32,6 +32,7 @@
      (:file "datetime")
      (:file "json")
      (:file "triggers")
+     (:file "fkeys")
      (:file "dml")
      (:file "ddl")
      (:file "integrity")

@@ -306,7 +306,7 @@ column may use one declared after it)."
           (let ((action (resolve-action ctx (table-pk-conflict table))))
             (case action
               (:ignore (return-from resolve-uniqueness :ignore))
-              (:replace (delete-row table existing))
+              (:replace (fk-parent-delete table existing) (delete-row table existing))
               (t (conflict-fail action "UNIQUE constraint failed: ~a"
                                 (if (table-rowid-alias table)
                                     (format nil "~a.~a" (table-name table)
@@ -323,7 +323,7 @@ column may use one declared after it)."
             (let ((action (resolve-action ctx (index-conflict idx))))
               (case action
                 (:ignore (return-from resolve-uniqueness :ignore))
-                (:replace (dolist (o others) (delete-row table o)))
+                (:replace (dolist (o others) (fk-parent-delete table o) (delete-row table o)))
                 (t (conflict-fail action "UNIQUE constraint failed: ~a"
                                   (if (index-pk-index idx)
                                       (constraint-columns-text table idx)
@@ -391,6 +391,7 @@ column may use one declared after it)."
              (run-upsert ctx (second u) (third u) row))
             (t
              (write-row table row)
+             (fk-check-child table row)
              (unless (table-without-rowid table)
                (setf (db-last-insert-rowid (conn *db*)) (svref row (length (table-columns table)))))
              (incf (wc-changes ctx))
@@ -452,6 +453,8 @@ column may use one declared after it)."
         (when (eq u :ignore) (return-from update-one :ignore))))
     (delete-row table old)
     (write-row table new)
+    (fk-check-child table new old)
+    (fk-parent-update table old new)
     (incf (wc-changes ctx))
     (collect-returning ctx new)
     t))
@@ -712,7 +715,8 @@ row once, from the last joined row that matched it."
            (view (table-view-select tb))
            (triggers (table-has-triggers-p tb)))
       (multiple-value-bind (ctx rnames) (make-ctx-for tb nil returning alias)
-        (if (and (null where) (null returning) (not triggers) (not view))
+        (if (and (null where) (null returning) (not triggers) (not view)
+                 (not (and (fk-enabled-p) (referencing-keys tb))))
             ;; truncate: drop every page but the roots
             (let ((n 0))
               (map-table-rows tb (lambda (row) (declare (ignore row)) (incf n)))
@@ -728,7 +732,8 @@ row once, from the last joined row that matched it."
                 ((and triggers (eq :ignore (fire-triggers tb :delete :before row nil))))
                 ((and triggers (not (table-without-rowid tb))
                       (not (table-lookup (table-owner tb) (table-root tb) (svref row (length (table-columns tb)))))))
-                (t (delete-row tb row)
+                (t (fk-parent-delete tb row)
+                   (delete-row tb row)
                    (incf (wc-changes ctx))
                    (collect-returning ctx row)
                    (when triggers (fire-triggers tb :delete :after row nil))))))

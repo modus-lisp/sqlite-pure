@@ -22,7 +22,15 @@
   view-select            ; SEL, for views
   view-columns
   (unique-constraints '()) ; list of (col-idxs collations conflict) in declaration order
+  (fkeys '())            ; list of FKEY, declaration order
   pk-conflict)
+
+(defstruct fkey
+  child-cols             ; column indexes in the child table
+  parent                 ; parent table name
+  parent-cols            ; parent column names, or NIL for its primary key
+  (on-delete :no-action) (on-update :no-action)
+  deferred)
 
 (defstruct index
   name table root sql unique
@@ -132,7 +140,14 @@
                                (getf cd :unique-conflict))
                          uniques))
                  (dolist (ck (reverse (getf cd :checks)))
-                   (push (cons (second ck) (first ck)) (table-checks tb))))
+                   (push (cons (second ck) (first ck)) (table-checks tb)))
+                 (let ((ref (getf cd :references)))
+                   (when ref
+                     (push (make-fkey :child-cols (list i) :parent (getf ref :table)
+                                      :parent-cols (getf ref :columns)
+                                      :on-delete (getf ref :on-delete) :on-update (getf ref :on-update)
+                                      :deferred (getf ref :deferred))
+                           (table-fkeys tb)))))
         (dolist (tc constraints)
           (case (car tc)
             (:primary-key
@@ -144,7 +159,15 @@
                (push (list :pk pk-set conflict) uniques)))
             (:unique
              (push (list :unique (index-cols (second tc)) (third tc)) uniques))
-            (:check (push (cons (third tc) (second tc)) (table-checks tb))))))
+            (:check (push (cons (third tc) (second tc)) (table-checks tb)))
+            (:foreign-key
+             (destructuring-bind (child-names ref) (cdr tc)
+               (push (make-fkey :child-cols (mapcar #'colidx child-names) :parent (getf ref :table)
+                                :parent-cols (getf ref :columns)
+                                :on-delete (getf ref :on-delete) :on-update (getf ref :on-update)
+                                :deferred (getf ref :deferred))
+                     (table-fkeys tb)))))))
+      (setf (table-fkeys tb) (nreverse (table-fkeys tb)))
       (setf (table-checks tb) (nreverse (table-checks tb)))
       (setf (table-pk tb) (mapcar #'first pk-set))
       ;; INTEGER PRIMARY KEY (not DESC, exactly one column) aliases the rowid

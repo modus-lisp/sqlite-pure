@@ -62,6 +62,8 @@
   (name "main")
   (conn nil)                 ; the connection (main database), or NIL if this is it
   (attached '())             ; on the main database: alist name -> db, "temp" included
+  (foreign-keys nil)         ; PRAGMA foreign_keys (on the connection)
+  (fk-deferred nil)          ; a deferred foreign key was violated in this transaction
   (stmt-cache (make-hash-table :test #'equal))
   (closed nil))
 

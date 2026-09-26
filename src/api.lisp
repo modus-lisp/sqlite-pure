@@ -21,7 +21,9 @@
     (t nil)))
 
 (defun commit-all (db) (dolist (d (conn-dbs db)) (commit-write d)))
-(defun rollback-all (db) (dolist (d (conn-dbs db)) (rollback-write d)))
+(defun rollback-all (db)
+  (setf (db-fk-deferred (conn db)) nil)
+  (dolist (d (conn-dbs db)) (rollback-write d)))
 
 (defun run-in-write-txn (db thunk)
   "Run THUNK as one atomic statement (across every attached database)."
@@ -44,7 +46,11 @@
             (handler-bind ((sqlite-conflict
                              (lambda (c) (when (eq (conflict-action c) :fail) (setf keep t)))))
               (multiple-value-prog1 (funcall thunk) (setf ok t)))
-         (if (or ok keep) (commit-all db) (rollback-all db)))))))
+         (if (or ok keep)
+             (handler-bind ((error (lambda (c) (declare (ignore c)) (rollback-all db))))
+               (fk-check-deferred db)
+               (commit-all db))
+             (rollback-all db)))))))
 
 (defun exec-ast (db st text)
   "Execute one parsed statement.  Return (values rows column-names)."
@@ -59,6 +65,7 @@
        (values nil nil))
       (:commit
        (unless (db-explicit db) (sql-error "cannot commit - no transaction is active"))
+       (fk-check-deferred db)
        (commit-all db)
        (setf (db-explicit db) nil (db-savepoint-txn db) nil)
        (values nil nil))
@@ -241,7 +248,15 @@ non-local exit.  Nested uses become savepoints."
                                                      (:utf-16be "UTF-16be"))))))
           ((string= n "journal_mode")
            (pragma-rows '("journal_mode") (list (list (if (memory-db-p db) "memory" "delete")))))
-          ((member n '("foreign_keys" "synchronous" "cache_size" "temp_store" "locking_mode"
+          ((string= n "foreign_keys")
+           (if value
+               (progn (setf (db-foreign-keys (conn db))
+                            (let ((v (if (stringp value) (string-downcase-ascii value) value)))
+                              (not (member v '(0 "0" "off" "false" "no") :test #'equal))))
+                      (values nil nil))
+               (pragma-rows '("foreign_keys") (list (list (if (db-foreign-keys (conn db)) 1 0))))))
+          ((string= n "foreign_key_list") (pragma-foreign-key-list db value))
+          ((member n '("synchronous" "cache_size" "temp_store" "locking_mode"
                        "busy_timeout" "recursive_triggers" "case_sensitive_like" "auto_vacuum"
                        "secure_delete" "count_changes" "legacy_file_format" "writable_schema"
                        "ignore_check_constraints" "defer_foreign_keys" "mmap_size" "optimize"
@@ -325,6 +340,23 @@ non-local exit.  Nested uses become savepoints."
                                                   (t 0))))))
            (append '("cid" "name" "type" "notnull" "dflt_value" "pk")
                    (when xinfo '("hidden"))))))))
+
+(defun pragma-foreign-key-list (db name)
+  (let* ((*db* db) (tb (lookup-table db (value-to-text name) nil)))
+    (if (null tb)
+        (values nil nil)
+        (flet ((act (a) (substitute #\Space #\- (string-upcase (symbol-name a)))))
+          (values
+           (loop for fk in (reverse (table-fkeys tb))
+                 for id from 0
+                 append (loop for ci in (fkey-child-cols fk)
+                              for seq from 0
+                              collect (list id seq (fkey-parent fk)
+                                            (column-name (aref (table-columns tb) ci))
+                                            (or (nth seq (fkey-parent-cols fk)) :null)
+                                            (act (fkey-on-update fk)) (act (fkey-on-delete fk))
+                                            "NONE")))
+           '("id" "seq" "table" "from" "to" "on_update" "on_delete" "match"))))))
 
 (defun view-column-info (tb)
   (multiple-value-bind (fn cols) (compile-select (table-view-select tb) (make-scope))
