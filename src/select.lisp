@@ -705,7 +705,9 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                               (let ((rep-changed nil))
                                 (loop for a in (cdr g)
                                       do (when (agg-step a env) (setf rep-changed t)))
-                                (when (or rep-changed (not (single-minmax-p aggs)))
+                                ;; bare columns come from the group's first row,
+                                ;; or from the row that set a lone min()/max()
+                                (when (and rep-changed (single-minmax-p aggs))
                                   (replace (car g) (env-rows env))))))))
                        (when (and (null group) (zerop (hash-table-count groups)))
                          (setf (gethash nil groups)

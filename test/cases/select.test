@@ -172,3 +172,13 @@ CREATE TABLE b(x);
 SELECT x FROM a, b;
 SELECT nosuch FROM a;
 SELECT * FROM nosuch;
+
+== bare-columns-in-groups
+CREATE TABLE t(a, b);
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (1, 'z'), (2, 'w'), (3, 'v'), (1, 'u');
+SELECT a, b FROM t GROUP BY a;
+SELECT a, b, count(*) FROM t GROUP BY a;
+SELECT a, b, max(b) FROM t GROUP BY a;
+SELECT a, b, min(b) FROM t GROUP BY a;
+SELECT b, count(*) FROM t;
+SELECT b, max(b) FROM t;
