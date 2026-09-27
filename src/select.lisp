@@ -1196,10 +1196,8 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                             collect (list name (expr-affinity e cscope)
                                           (or (expr-collation e cscope) :binary))))
              ;; group-by expressions are compiled before switching to aggregate mode
-             (group-fns (mapcar (lambda (g)
-                                  (let ((g (resolve-group-term g rcols)))
-                                    (compile-expr g cscope)))
-                                group))
+             (group-fns (loop for g in group for k from 1
+                              collect (compile-expr (resolve-group-term g rcols k) cscope)))
              (group-colls (mapcar (lambda (g) (or (expr-collation (resolve-group-term g rcols) cscope)
                                                   :binary))
                                   group))
@@ -1402,12 +1400,14 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
   "sqlite3ExprIsInteger: an integer literal that fits in 32 bits."
   (and (eq (car e) :lit) (integerp (second e)) (<= -2147483648 (second e) 2147483647)))
 
-(defun resolve-group-term (g rcols)
-  "GROUP BY accepts result-column numbers."
+(defun resolve-group-term (g rcols &optional (pos 1))
+  "GROUP BY accepts result-column numbers.  POS is the term's place in the
+GROUP BY list, for the error."
   (if (int32-literal-p g)
       (let ((k (second g)))
         (unless (<= 1 k (length rcols))
-          (sql-error "GROUP BY term out of range - should be between 1 and ~d" (length rcols)))
+          (sql-error "~a GROUP BY term out of range - should be between 1 and ~d"
+                     (ordinal pos) (length rcols)))
         (first (nth (1- k) rcols)))
       g))
 

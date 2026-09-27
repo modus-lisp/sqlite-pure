@@ -99,8 +99,14 @@
          (let ((local (local-size db psize nil)))
            (+ (- q p) n1 local (if (< local psize) 4 0))))))))
 
+(defun unborn-root-p (db root)
+  "True for the schema table of a database with no pages yet: SQLite reads
+an empty file as an empty schema, not a corrupt page 1."
+  (and (= root 1) (zerop (db-page-count db))))
+
 (defun map-table (db root fn &key start)
   "Call (FN rowid payload) for every row with rowid >= START, in order."
+  (when (unborn-root-p db root) (return-from map-table nil))
   (labels ((visit (pgno depth)
              (when (> depth 64) (corrupt "b-tree too deep"))
              (let* ((b (read-page db pgno))
@@ -131,6 +137,7 @@
 
 (defun map-table-reverse (db root fn)
   "Call (FN rowid payload) for every row, in descending rowid order."
+  (when (unborn-root-p db root) (return-from map-table-reverse nil))
   (labels ((visit (pgno depth)
              (when (> depth 64) (corrupt "b-tree too deep"))
              (let* ((b (read-page db pgno))
@@ -153,6 +160,7 @@
 
 (defun map-index-reverse (db root fn)
   "Call (FN values) for every index entry, in descending order."
+  (when (unborn-root-p db root) (return-from map-index-reverse nil))
   (labels ((visit (pgno depth)
              (when (> depth 64) (corrupt "b-tree too deep"))
              (let* ((b (read-page db pgno))
@@ -172,6 +180,7 @@
 
 (defun table-lookup (db root rowid)
   "Payload of ROWID, or NIL."
+  (when (unborn-root-p db root) (return-from table-lookup nil))
   (let ((pgno root))
     (loop repeat 64
           do (let* ((b (read-page db pgno))
@@ -203,6 +212,7 @@
     (corrupt "b-tree too deep")))
 
 (defun table-max-rowid (db root)
+  (when (unborn-root-p db root) (return-from table-max-rowid 0))
   (let ((pgno root))
     (loop repeat 64
           do (let* ((b (read-page db pgno))
@@ -220,6 +230,7 @@
 (defun map-index (db root fn &key probe cmp)
   "Call (FN values) for every index entry in order.  With PROBE, start at
 the first entry E for which (CMP E PROBE) >= 0."
+  (when (unborn-root-p db root) (return-from map-index nil))
   (labels ((start-pos (b off type n)
              (if probe
                  (lower-bound n (lambda (i) (>= (funcall cmp (raw-index-entry db b off type i) probe) 0)))
@@ -249,6 +260,7 @@ the first entry E for which (CMP E PROBE) >= 0."
 
 (defun btree-count (db root)
   "Number of entries in a b-tree, from cell counts alone."
+  (when (unborn-root-p db root) (return-from btree-count 0))
   (labels ((visit (pgno depth)
              (when (> depth 64) (corrupt "b-tree too deep"))
              (let* ((b (read-page db pgno))

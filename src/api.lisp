@@ -375,7 +375,11 @@ non-local exit.  Nested uses become savepoints."
     (not (member v '(0 "0" "off" "false" "no") :test #'equal))))
 
 (defun exec-pragma (db st)
-  (destructuring-bind (&key name value) (cdr st)
+  (destructuring-bind (&key name value schema) (cdr st)
+    ;; PRAGMA schema.name: the named database, which must exist
+    (when schema
+      (setf db (schema-db db schema nil))
+      (unless db (sql-error "unknown database ~a" schema)))
     (let ((n (string-downcase-ascii name)))
       (flet ((header-int (off) (header-u32 db off))
              (int-value () (value-to-integer (if (stringp value) (or (text-numeric-value value) 0) value))))
@@ -461,6 +465,12 @@ non-local exit.  Nested uses become savepoints."
                (progn (setf (db-foreign-keys (conn db)) (pragma-boolean value))
                       (values nil nil))
                (pragma-rows '("foreign_keys") (list (list (if (db-foreign-keys (conn db)) 1 0))))))
+          ((string= n "writable_schema")
+           (if value
+               (progn (setf (db-writable-schema (conn db)) (pragma-boolean value))
+                      (values nil nil))
+               (pragma-rows '("writable_schema")
+                            (list (list (if (db-writable-schema (conn db)) 1 0))))))
           ((string= n "recursive_triggers")
            (if value
                (progn (setf (db-recursive-triggers (conn db)) (pragma-boolean value))
@@ -491,7 +501,7 @@ non-local exit.  Nested uses become savepoints."
                         (list (list (case (db-secure-delete db) (:fast 2) ((nil) 0) (t 1))))))
           ((member n '("cache_size" "temp_store" "locking_mode"
                        "busy_timeout" "case_sensitive_like"
-                       "count_changes" "legacy_file_format" "writable_schema"
+                       "count_changes" "legacy_file_format"
                        "ignore_check_constraints" "defer_foreign_keys" "mmap_size" "optimize"
                        "shrink_memory" "automatic_index")
                    :test #'string=)
@@ -537,7 +547,9 @@ non-local exit.  Nested uses become savepoints."
               (assoc name (db-attached c) :test #'name=))
       (sql-error "database ~a is already in use" name))
     (when (db-explicit c) (sql-error "cannot ATTACH database within transaction"))
-    (let ((d (open-database file)))
+    ;; an attachment is opened with the connection's flags: read-only
+    ;; stays read-only
+    (let ((d (open-database file :readonly (db-readonly c))))
       (setf (db-name d) name (db-conn d) c)
       (setf (db-attached c) (append (db-attached c) (list (cons name d)))))))
 

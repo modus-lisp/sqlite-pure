@@ -10,7 +10,9 @@
 
 (define-condition sqlite-error (error)
   ((message :initarg :message :reader sqlite-error-message)
-   (code :initarg :code :initform :error :reader sqlite-error-code))
+   (code :initarg :code :initform :error :reader sqlite-error-code)
+   ;; character offset of the offending token in the SQL, when known
+   (offset :initarg :offset :initform nil :reader sqlite-error-offset))
   (:report (lambda (c s) (format s "SQLite ~(~a~): ~a"
                                  (sqlite-error-code c) (sqlite-error-message c)))))
 

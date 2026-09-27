@@ -330,7 +330,10 @@ on FTS3/4 tables; NIL for anything else."
              (compile-fts3-match (second (third e)) (first (third e)) scope e)
              (progn (compile-expr (second (third e)) scope)   ; "no such column", if that
                     (compile-expr (first (third e)) scope)
-                    (sql-error "unable to use function MATCH in the requested context"))))
+                    ;; SQLite's matchStub: an error only when a row reaches it
+                    (lambda (&rest args)
+                      (declare (ignore args))
+                      (sql-error "unable to use function MATCH in the requested context")))))
         ((and (eq (car e) :fn) (stringp (second e)) (compile-fts3-function (second e) (third e) scope)))
         ((and (eq (car e) :binary) (eq (second e) :eq))
          (flet ((hidden-p (x)

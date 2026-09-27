@@ -10,9 +10,14 @@
   kind value pos quoted end)
 
 (defun parse-error-at (sql pos fmt &rest args)
-  (error 'sqlite-parse-error
+  (error 'sqlite-parse-error :offset pos
          :message (format nil "~? (near ~s)" fmt args
                           (subseq sql (min pos (length sql)) (min (length sql) (+ pos 20))))))
+
+(defun unrecognized-token (sql start end)
+  "SQLite's TK_ILLEGAL report: the offending token's whole text."
+  (error 'sqlite-parse-error :offset start
+         :message (format nil "unrecognized token: \"~a\"" (subseq sql start (min end (length sql))))))
 
 (defun ident-start-p (c)
   (or (alpha-char-p c) (char= c #\_) (> (char-code c) 127)))
@@ -24,12 +29,12 @@
     (labels ((peekc (&optional (k 0)) (let ((j (+ i k))) (when (< j n) (char sql j))))
              (emit (kind value start &optional quoted)
                (push (make-tok kind value start quoted) toks))
-             (read-quoted (close)
+             (read-quoted (close &optional tok-start)
                ;; I points at the opening quote.
                (let ((start i) (out (make-string-output-stream)))
                  (incf i)
                  (loop
-                   (when (>= i n) (parse-error-at sql start "unterminated quoted string"))
+                   (when (>= i n) (unrecognized-token sql (or tok-start start) n))
                    (let ((c (char sql i)))
                      (cond ((char= c close)
                             (if (and (< (1+ i) n) (char= (char sql (1+ i)) close))
@@ -53,15 +58,15 @@
             ((char= c #\`) (emit :id (read-quoted #\`) start t))
             ((char= c #\[)
              (let ((end (position #\] sql :start i)))
-               (unless end (parse-error-at sql i "unterminated [identifier]"))
+               (unless end (unrecognized-token sql i n))
                (emit :id (subseq sql (1+ i) end) start t)
                (setf i (1+ end))))
             ;; blob literal
             ((and (char-equal c #\x) (eql (peekc 1) #\'))
              (incf i)
-             (let ((hex (read-quoted #\')))
+             (let ((hex (read-quoted #\' start)))
                (unless (and (evenp (length hex)) (every (lambda (h) (digit-char-p h 16)) hex))
-                 (parse-error-at sql start "malformed blob literal"))
+                 (unrecognized-token sql start i))
                (let ((b (make-octets (floor (length hex) 2))))
                  (dotimes (k (length b))
                    (setf (aref b k) (parse-integer hex :start (* 2 k) :end (+ 2 (* 2 k)) :radix 16)))
@@ -74,12 +79,13 @@
                    (loop while (and (< j n) (digit-char-p (char sql j) 16)) do (incf j))
                    (let ((v (parse-integer sql :start (+ i 2) :end j :radix 16)))
                      (when (> v #xffffffffffffffff)
-                       (parse-error-at sql start "hex literal too big"))
+                       (error 'sqlite-parse-error :offset start
+                              :message (format nil "hex literal too big: ~a" (subseq sql start j))))
                      (emit :integer (to-signed64 v) start)
                      (setf i j)))
                  (multiple-value-bind (r end int-syntax dbl) (scan-number sql i)
                    (when (and (< end n) (ident-char-p (char sql end)))
-                     (parse-error-at sql start "unrecognized token"))
+                     (unrecognized-token sql start (or (position-if-not #'ident-char-p sql :start end) n)))
                    (cond ((and int-syntax (i64-p r)) (emit :integer r start))
                          (int-syntax (emit :bigint (cons r dbl) start))
                          (t (emit :float dbl start)))
@@ -93,7 +99,7 @@
             ((member c '(#\: #\@ #\$))
              (let ((j (1+ i)))
                (loop while (and (< j n) (ident-char-p (char sql j))) do (incf j))
-               (when (= j (1+ i)) (parse-error-at sql start "bad parameter name"))
+               (when (= j (1+ i)) (unrecognized-token sql start j))
                (emit :param (subseq sql i j) start)
                (setf i j)))
             ;; identifiers / keywords
@@ -112,7 +118,7 @@
                       (emit :op two start) (incf i 2))
                      ((find c "+-*/%<>=(),;.&|~")
                       (emit :op (string c) start) (incf i))
-                     (t (parse-error-at sql start "unrecognized token"))))))
+                     (t (unrecognized-token sql start (1+ i)))))))
           (unless (eq toks before) (setf (tok-end (car toks)) i)))))
     (push (make-tok :eof nil n) toks)
     (coerce (nreverse toks) 'vector)))

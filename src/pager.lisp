@@ -65,6 +65,7 @@
   (attached '())             ; on the main database: alist name -> db, "temp" included
   (foreign-keys nil)         ; PRAGMA foreign_keys (on the connection)
   (recursive-triggers nil)   ; PRAGMA recursive_triggers (on the connection)
+  (writable-schema nil)      ; PRAGMA writable_schema: sqlite_ names may be created
   ;; user-defined SQL functions, aggregates and collations (on the connection)
   (user-functions (make-hash-table :test #'equal))   ; name -> (min max fn)
   (user-aggregates (make-hash-table :test #'equal))  ; name -> (min max ctor)

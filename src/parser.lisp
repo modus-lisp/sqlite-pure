@@ -41,7 +41,7 @@
            (error 'sqlite-parse-error :message "incomplete input"))
           ((and (equal fmt "syntax error") (tok-end tok))
            ;; SQLite's own wording: the offending token's text
-           (error 'sqlite-parse-error
+           (error 'sqlite-parse-error :offset (tok-pos tok)
                   :message (format nil "near \"~a\": syntax error"
                                    (subseq (ps-sql p) (tok-pos tok) (tok-end tok)))))
           (t (apply #'parse-error-at (ps-sql p) (tok-pos tok) fmt args)))))
@@ -950,11 +950,10 @@
 (defun parse-pragma (p)
   (expect-kw p "PRAGMA")
   (multiple-value-bind (name schema) (parse-qualified-name p)
-    (declare (ignore schema))
     (let ((value nil))
       (cond ((accept-op p "=") (setf value (parse-pragma-value p)))
             ((accept-op p "(") (setf value (parse-pragma-value p)) (expect-op p ")")))
-      (list :pragma :name name :value value))))
+      (list :pragma :name name :value value :schema schema))))
 
 (defun parse-pragma-value (p)
   (let ((tok (next-tok p)))

@@ -80,20 +80,23 @@ EndTable write it: a placeholder first, then the real record."
 (defun name-in-use-p (name)
   (let ((s (db-schema* *db*)))
     (or (gethash (schema-key name) (schema-tables s))
-        (gethash (schema-key name) (schema-indexes s))
-        (gethash (schema-key name) (schema-triggers s)))))
+        (gethash (schema-key name) (schema-indexes s)))))
 
 (defun check-new-name (name kind)
-  (when (and (>= (length name) 7) (name= (subseq name 0 7) "sqlite_"))
+  (when (and (>= (length name) 7) (name= (subseq name 0 7) "sqlite_")
+             (not (db-writable-schema (conn *db*))))
     (sql-error "object name reserved for internal use: ~a" name))
-  (when (name-in-use-p name)
-    (sql-error "~a ~a already exists"
-               (let ((s (db-schema* *db*)))
-                 (cond ((gethash (schema-key name) (schema-indexes s)) "index")
-                       ((gethash (schema-key name) (schema-triggers s)) "trigger")
-                       ((table-view-select (gethash (schema-key name) (schema-tables s))) "view")
-                       (t (string-downcase (string kind)))))
-               name)))
+  ;; sqlite3StartTable / sqlite3CreateIndex: tables and views share one
+  ;; namespace with indexes (triggers have their own), and the message
+  ;; says which kind of object is in the way
+  (let* ((s (db-schema* *db*))
+         (tb (gethash (schema-key name) (schema-tables s)))
+         (ix (gethash (schema-key name) (schema-indexes s))))
+    (if (eq kind :index)
+        (cond (ix (sql-error "index ~a already exists" name))
+              (tb (sql-error "there is already a table named ~a" name)))
+        (cond (tb (sql-error "~a ~a already exists" (if (table-view-select tb) "view" "table") name))
+              (ix (sql-error "there is already an index named ~a" name))))))
 
 ;;; SQL text as SQLite stores it: "CREATE TABLE " + the text from the name on.
 

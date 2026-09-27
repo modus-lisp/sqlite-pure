@@ -21,5 +21,5 @@
    ;; values
    #:+null+ #:null-value-p
    ;; errors
-   #:sqlite-error #:sqlite-error-message #:sqlite-error-code
+   #:sqlite-error #:sqlite-error-message #:sqlite-error-code #:sqlite-error-offset
    #:sqlite-constraint-error #:sqlite-parse-error #:sqlite-corrupt-error))
