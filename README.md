@@ -168,8 +168,35 @@ reinserts the contents of underfull nodes; queries prune by bounding box
 using the `WHERE` clause's constraints on coordinates, and look up `id =`
 directly.  Conflict handling, value coercions and error messages follow
 SQLite's, and `rtreecheck()` and `rtreenode()` are provided.  A database
-holding virtual tables of other modules (FTS5, say) opens; those tables
+holding virtual tables of other modules (FTS3/4, say) opens; those tables
 report "no such module", as in SQLite.
+
+**Full-text search (FTS5).** `CREATE VIRTUAL TABLE t USING fts5(...)` with
+`UNINDEXED` columns, `prefix=`, `tokenize=`, `content=` (external content
+and contentless `content=''`), `content_rowid=`, `columnsize=` and
+`detail=full/column/none`, in SQLite 3.40's on-disk format: the
+`_data` / `_idx` / `_content` / `_docsize` / `_config` shadow tables,
+prefix-compressed leaves, doclists and position lists, delete markers,
+the structure and averages records.  A statement's writes are flushed the
+way SQLite flushes them, so a small index is byte-for-byte the one SQLite
+writes; merges follow SQLite's automerge / crisismerge schedule and
+promotion rules (whole-level merges where SQLite's are incremental), and
+either side reads, writes and `integrity-check`s the other's indexes,
+including half-finished incremental merges and doclist indexes.
+Tokenizers: `unicode61` (character data extracted from SQLite itself;
+`remove_diacritics`, `tokenchars`, `separators`), `ascii`, `porter` and
+`trigram`.  The query language is FTS5's: implicit AND, `AND` / `OR` /
+`NOT`, `"phrases"`, `+`, prefix `*`, `^`, `NEAR(... , N)` and column
+filters (`col:`, `{a b}:`, `-col:`), with SQLite's error messages;
+queries are evaluated by a port of SQLite's expression iterator, so
+`bm25()`, `highlight()`, `snippet()` and the `rank` column (default or
+`rank MATCH 'bm25(...)'`, or the `rank` config option) see exactly the
+phrase instances SQLite's do.  `MATCH`, `t = 'query'`, `col MATCH` and
+`t('query'[, 'rank'])` are accepted; `INSERT INTO t(t) VALUES (...)` runs
+`optimize`, `merge`, `rebuild`, `delete`, `delete-all`, `integrity-check`
+and the `automerge` / `crisismerge` / `usermerge` / `pgsz` / `rank` /
+`hashsize` settings; `fts5vocab` tables (`row`, `col`, `instance`) are
+there too.
 
 **EXPLAIN QUERY PLAN** reports the plan this library chose, in SQLite
 3.40's words and tree shape: `SEARCH t USING COVERING INDEX i (a=? AND
@@ -185,9 +212,10 @@ equivalent here.
 
 ## Not implemented
 
-Virtual tables other than R-tree (FTS3/4/5, geopoly, R-tree `MATCH`
-geometry callbacks), plain `EXPLAIN` (bytecode listings), join reordering
-and automatic indexes. Durability depends on the Lisp's
+FTS3/4 and geopoly, R-tree `MATCH` geometry callbacks, user-defined FTS5
+tokenizers and auxiliary functions (there is no C-style extension API),
+FTS5's `*`-prefixed diagnostic queries, plain `EXPLAIN` (bytecode
+listings), join reordering and automatic indexes. Durability depends on the Lisp's
 `finish-output`; there is no portable `fsync`. File locks need SBCL
 (elsewhere they are no-ops, and cache validation still applies).
 
@@ -208,6 +236,9 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
+| `test/run-fts5-interop.sh` | FTS5 indexes shared through the file: SQLite-built multi-segment indexes (small pages, doclist indexes, unfinished merges) queried and modified here, ours queried and modified by SQLite, every step checked by SQLite's `integrity-check` |
+| `test/run-fts5fuzz.sh` | random documents and random FTS5 queries (every operator, column filters, NEAR, prefixes, detail modes) against SQLite: rowids, `bm25()`, `highlight()`, `snippet()` |
+| `test/run-fts5-tokens.sh` | every tokenizer configuration against SQLite's, token for token, over random text and a stemming word list |
 | `test/run-rtree.sh` | r-trees modified alternately by SQLite and by us, checked against a plain mirror table and by SQLite's `rtreecheck()`; auto-vacuum root moves on DROP; VACUUM |
 | `test/run-wal.sh` | WAL databases shared with live SQLite connections: each side reading the other's commits, snapshots surviving the other's writes and checkpoints, the write lock both ways, stale snapshots, log restart, two processes writing at once, last-one-out cleanup, crash recovery, rebuilding SQLite's index, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
 | `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |
@@ -234,6 +265,8 @@ src/
   dml        INSERT / UPDATE / DELETE, constraints, conflicts, upsert, RETURNING
   ddl        CREATE / DROP / ALTER and sqlite_schema maintenance
   rtree      the R*Tree virtual table module
+  fts5-*     FTS5: tokenizers and their Unicode data, the index, the query language
+  fts5       the FTS5 and fts5vocab virtual tables, bm25 / highlight / snippet
   eqp        EXPLAIN QUERY PLAN
   integrity  PRAGMA integrity_check
   api        public API, statements, transactions, ATTACH, PRAGMAs

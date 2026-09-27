@@ -76,6 +76,11 @@
   "The TABLE for a CREATE VIRTUAL TABLE row.  An unknown module still loads
 (as SQLite does); using the table then fails."
   (destructuring-bind (&key module args &allow-other-keys) (cdr ast)
+    (when (name= module "fts5vocab")
+      (return-from virtual-table-from-ast
+        (handler-case (fts5vocab-table-from-ast name ast sql)
+          (sqlite-error () (make-table :name name :root 0 :sql sql :columns #()
+                                       :vtab (list :unknown module))))))
     (when (name= module "fts5")
       (return-from virtual-table-from-ast
         (handler-case (fts5-table-from-ast name ast sql)
@@ -119,6 +124,8 @@
       (check-new-name name :table)
       (when (name= module "fts5")
         (return-from exec-create-virtual (exec-create-fts5 st)))
+      (when (name= module "fts5vocab")
+        (return-from exec-create-virtual (exec-create-fts5vocab st)))
       (unless (member module '("rtree" "rtree_i32") :test #'name=)
         (sql-error "no such module: ~a" module))
       (let* ((rt (rtree-spec module args))
@@ -565,17 +572,24 @@ Returns T, or :IGNORE if a constraint skipped the row."
         (let ((root (load-rnode 1))) (setf (rn-dirty root) t) (flush-rnodes)))
       (if cell (car cell) t))))
 
+(defun vtab-read-only-check (table)
+  (unless (or (fts5-p (table-vtab table)) (rtree-p (table-vtab table)))
+    (sql-error "table ~a may not be modified" (table-name table))))
+
 (defun vtab-insert (ctx row)
+  (vtab-read-only-check (wc-table ctx))
   (if (fts5-p (table-vtab (wc-table ctx)))
       (fts5-vtab-insert ctx row)
       (rtree-vtab-insert ctx row)))
 
 (defun vtab-update (ctx old new)
+  (vtab-read-only-check (wc-table ctx))
   (if (fts5-p (table-vtab (wc-table ctx)))
       (fts5-vtab-update ctx old new)
       (rtree-vtab-update ctx old new)))
 
 (defun vtab-delete (table row)
+  (vtab-read-only-check table)
   (if (fts5-p (table-vtab table))
       (fts5-vtab-delete table row)
       (rtree-vtab-delete table row)))
@@ -583,6 +597,7 @@ Returns T, or :IGNORE if a constraint skipped the row."
 (defun vtab-plan-access (fs li conjuncts scope)
   (let ((v (table-vtab (fsrc-table fs))))
     (cond ((fts5-p v) (fts5-plan-access fs li conjuncts scope))
+          ((fts5vocab-p v) (fts5vocab-plan-access fs li conjuncts scope))
           ((rtree-p v) (rtree-plan-access fs li conjuncts scope))
           (t (sql-error "no such module: ~a" (second v))))))
 

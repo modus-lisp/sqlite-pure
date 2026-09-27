@@ -333,7 +333,10 @@ that matches is the only one tried, whether or not its condition holds."
                      ((string= k "separators")
                       (setf (ftok-separators tok) (append (map 'list #'char-code v) (ftok-separators tok))
                             (ftok-token-chars tok) (set-difference (ftok-token-chars tok) (map 'list #'char-code v))))
-                     ((string= k "categories") nil)
+                     ;; only the default category set is supported
+                     ((string= k "categories")
+                      (unless (equal (sort (fts5-split-words v) #'string<) '("Co" "L*" "N*"))
+                        (sql-error "error in tokenizer constructor")))
                      (t (sql-error "error in tokenizer constructor")))))))
         ((string= name "ascii")
          (let ((tok (make-fts5-tokenizer :kind :ascii)))
