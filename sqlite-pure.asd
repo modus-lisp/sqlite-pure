@@ -39,6 +39,8 @@
      (:file "dml")
      (:file "ddl")
      (:file "rtree")
+     (:file "fts5-unicode-data")
+     (:file "fts5-token")
      (:file "integrity")
      (:file "api")
      (:file "vacuum"))))
