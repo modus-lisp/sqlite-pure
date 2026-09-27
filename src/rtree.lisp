@@ -99,6 +99,11 @@
         (handler-case (fts5-table-from-ast name ast sql)
           (sqlite-error () (make-table :name name :root 0 :sql sql :columns #()
                                        :vtab (list :unknown module))))))
+    (when (name= module "geopoly")
+      (return-from virtual-table-from-ast
+        (handler-case (geopoly-table-from-ast name args sql)
+          (sqlite-error () (make-table :name name :root 0 :sql sql :columns #()
+                                       :vtab (list :unknown module))))))
     (let ((rt (and (member module '("rtree" "rtree_i32") :test #'name=)
                    (ignore-errors (rtree-spec module args)))))
       (if rt
@@ -149,9 +154,11 @@
         (return-from exec-create-virtual nil))
       (when (name= module "fts5vocab")
         (return-from exec-create-virtual (exec-create-fts5vocab st)))
-      (unless (member module '("rtree" "rtree_i32") :test #'name=)
+      (unless (member module '("rtree" "rtree_i32" "geopoly") :test #'name=)
         (sql-error "no such module: ~a" module))
-      (let* ((rt (rtree-spec module args))
+      (let* ((rt (if (name= module "geopoly")
+                     (progn (geopoly-table-from-ast name args sql) (geopoly-spec args))
+                     (rtree-spec module args)))
              (q (substitute-string "\"" "\"\"" name)))
         (ensure-write-txn *db*)
         (add-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
@@ -625,10 +632,12 @@ Returns T, or :IGNORE if a constraint skipped the row."
           ((fts3tok-p v) (fts3tok-plan-access fs li conjuncts scope))
           ((dbstat-p v) (dbstat-plan-access fs li conjuncts scope))
           ((fts5vocab-p v) (fts5vocab-plan-access fs li conjuncts scope))
+          ((geo-p v) (geopoly-plan-access fs li conjuncts scope))
           ((rtree-p v) (rtree-plan-access fs li conjuncts scope))
           (t (sql-error "no such module: ~a" (second v))))))
 
 (defun rtree-vtab-insert (ctx row)
+  (when (geo-p (table-vtab (wc-table ctx))) (return-from rtree-vtab-insert (geopoly-vtab-insert ctx row)))
   (with-rtree ((wc-table ctx))
     (let* ((*rt-depth* (rtree-depth))
            (id (rtree-write ctx nil row)))
@@ -641,6 +650,7 @@ Returns T, or :IGNORE if a constraint skipped the row."
         t))))
 
 (defun rtree-vtab-update (ctx old new)
+  (when (geo-p (table-vtab (wc-table ctx))) (return-from rtree-vtab-update (geopoly-vtab-update ctx old new)))
   (with-rtree ((wc-table ctx))
     (let ((*rt-depth* (rtree-depth)))
       (unless (eq (rtree-write ctx old new) :ignore)
@@ -648,6 +658,7 @@ Returns T, or :IGNORE if a constraint skipped the row."
         t))))
 
 (defun rtree-vtab-delete (table row)
+  (when (geo-p (table-vtab table)) (return-from rtree-vtab-delete (geopoly-vtab-delete table row)))
   (with-rtree (table)
     (let ((*rt-depth* (rtree-depth)))
       (rtree-delete-id (rt-int64 (svref row 0)))
@@ -814,6 +825,9 @@ database dropping one moves another)."
   (let* ((d (if schema (schema-db *db* schema) *db*))
          (tb (lookup-table d name t))
          (problems '()))
+    ;; SQLite derives the dimensions from the column counts, which for a
+    ;; geopoly table come out as 0
+    (when (geo-p (table-vtab tb)) (return-from rtreecheck "Schema corrupt or not an rtree"))
     (flet ((note (fmt &rest args) (push (apply #'format nil fmt args) problems)))
       (with-rtree (tb)
         (let ((depth (rtree-depth)) (entries 0) (nodes 0))

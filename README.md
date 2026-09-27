@@ -63,6 +63,32 @@ functions. A collation may be named in a schema before it is registered —
 as in SQLite, using it is the error; give `:key` (a canonical form for
 strings equal under the collation) for `GROUP BY`/`DISTINCT` to group by it.
 
+**Tokenizers and FTS5 auxiliary functions** are Lisp functions too (the
+counterparts of `fts3_tokenizer()` and `fts5_api`):
+
+```lisp
+;; tokens are (text start end [position]), offsets in characters
+(sqlp:define-tokenizer db "words"
+  (lambda (text args)
+    (declare (ignore args))
+    (loop for start = 0 then (1+ end)
+          for end = (or (position #\Space text :start start) (length text))
+          when (< start end) collect (list (string-downcase (subseq text start end)) start end)
+          while (< end (length text)))))
+(sqlp:execute db "CREATE VIRTUAL TABLE f USING fts5(body, tokenize='words')")   ; or fts4(body, tokenize=words)
+(sqlp:define-fts5-function db "hits"
+  (lambda (api) (length (sqlp:fts5-api-instances api))))
+(sqlp:query db "SELECT rowid, hits(f) FROM f WHERE f MATCH 'lisp' ORDER BY hits(f) DESC")
+```
+
+The tokenizer gets the text and the table's tokenizer arguments; FTS5 may
+wrap it (`tokenize='porter words'`) and `fts3tokenize` tables accept it.
+An auxiliary function gets an API object for the current row and its
+extra arguments, and reads it with `fts5-api-rowid`, `-column-count`,
+`-column-text`, `-column-size`, `-row-count`, `-column-total-size`,
+`-phrase-count`, `-phrase-size`, `-instances` (`(phrase column offset)`
+triples, as `xInst` reports them) and `-tokenize`.
+
 Parameters are `?`, `?NNN`, `:name`, `@name`, `$name` (named parameters are
 numbered in order of first appearance, as SQLite does). Values map as
 **NULL** ↔ `:null` (a Lisp `nil` parameter also binds NULL), **INTEGER** ↔
@@ -167,9 +193,35 @@ can modify a tree the other built.  Insertion splits R*-style; deletion
 reinserts the contents of underfull nodes; queries prune by bounding box
 using the `WHERE` clause's constraints on coordinates, and look up `id =`
 directly.  Conflict handling, value coercions and error messages follow
-SQLite's, and `rtreecheck()` and `rtreenode()` are provided.  A database
-holding virtual tables of other modules (geopoly, say) opens; those tables
-report "no such module", as in SQLite.
+SQLite's, and `rtreecheck()` and `rtreenode()` are provided.  Trees built
+here are valid in either engine but not node-for-node the ones SQLite
+builds (its forced reinsertion on overflow is not reproduced), so the
+order of rows from an unordered scan can differ.  A database holding
+virtual tables of modules this library lacks opens; those tables report
+"no such module", as in SQLite.
+
+**Geopoly.** `CREATE VIRTUAL TABLE t USING geopoly(a, b, ...)` gives
+`t(_shape, a, b, ...)`, stored as SQLite stores it (a 2-D float r-tree of
+bounding boxes, the polygon in the `_rowid` table), and every function:
+`geopoly_area`, `_blob`, `_json`, `_svg`, `_bbox`, `_group_bbox`,
+`_contains_point`, `_within`, `_overlap`, `_xform`, `_regular`, `_ccw`.
+They compute in float32 wherever SQLite does, so results agree to the
+last bit, including SQLite's leniencies in parsing polygon JSON.
+`WHERE geopoly_overlap(_shape, ?)` and `geopoly_within(_shape, ?)` search
+the tree by bounding box, `rowid =` looks up directly, and `_shape` is
+checked, converted from JSON and left alone by updates that do not set
+it, as in SQLite.
+
+**DBSTAT.** The `dbstat` table (eponymous, `dbstat('schema', aggregate)`,
+or `CREATE VIRTUAL TABLE ... USING dbstat`) lists every page of every
+b-tree and overflow chain — path, type, cells, payload, unused bytes,
+offsets — or with `aggregate = 1` one row per b-tree, as SQLite's does.
+
+**Durability.** Commits `fsync` where SQLite does (the rollback journal
+before the database is written, the database before the journal is
+removed, the WAL at commit under `synchronous=FULL`, the WAL before and
+the database after a checkpoint); `PRAGMA synchronous` takes SQLite's
+values (`OFF`, `NORMAL`, `FULL`, `EXTRA`, 0-3) with FULL the default.
 
 **Full-text search (FTS5).** `CREATE VIRTUAL TABLE t USING fts5(...)` with
 `UNINDEXED` columns, `prefix=`, `tokenize=`, `content=` (external content
@@ -242,13 +294,14 @@ equivalent here.
 
 ## Not implemented
 
-Geopoly, R-tree `MATCH` geometry callbacks, user-defined FTS3/FTS5
-tokenizers and auxiliary functions (there is no C-style extension API, so
-no `fts3_tokenizer()` and no ICU tokenizer), FTS5's `*`-prefixed diagnostic
-queries, plain `EXPLAIN` (bytecode
-listings), join reordering and automatic indexes. Durability depends on the Lisp's
-`finish-output`; there is no portable `fsync`. File locks need SBCL
-(elsewhere they are no-ops, and cache validation still applies).
+R-tree `MATCH` geometry callbacks, the ICU tokenizer, FTS5's
+`*`-prefixed diagnostic queries, plain `EXPLAIN` (bytecode listings),
+join reordering and automatic indexes.  B-tree pages are filled as this
+library's own balancing leaves them rather than by a port of SQLite's
+`balance_nonroot`, so files are valid and interchangeable but page for
+page not SQLite's.  `fsync` and file locks need SBCL (elsewhere
+`finish-output` is the barrier and locks are no-ops, with cache
+validation still applied).
 
 ## Performance (SBCL, one core)
 
@@ -273,6 +326,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fts5-interop.sh` | FTS5 indexes shared through the file: SQLite-built multi-segment indexes (small pages, doclist indexes, unfinished merges) queried and modified here, ours queried and modified by SQLite, every step checked by SQLite's `integrity-check` |
 | `test/run-fts5fuzz.sh` | random documents and random FTS5 queries (every operator, column filters, NEAR, prefixes, detail modes) against SQLite: rowids, `bm25()`, `highlight()`, `snippet()` |
 | `test/run-fts5-tokens.sh` | every tokenizer configuration against SQLite's, token for token, over random text and a stemming word list |
+| `test/run-geopoly.sh` | geopoly against SQLite 3.40.1 built with GEOPOLY (`test/build-oracle.sh` builds it from the amalgamation): 2000 random rows of every function compared bit for bit, and a table built by each side read and modified by the other; also regenerates `test/cases-ext` (run by `run-tests.sh` from the committed `test/expected-ext.sexp`) |
 | `test/run-rtree.sh` | r-trees modified alternately by SQLite and by us, checked against a plain mirror table and by SQLite's `rtreecheck()`; auto-vacuum root moves on DROP; VACUUM |
 | `test/run-wal.sh` | WAL databases shared with live SQLite connections: each side reading the other's commits, snapshots surviving the other's writes and checkpoints, the write lock both ways, stale snapshots, log restart, two processes writing at once, last-one-out cleanup, crash recovery, rebuilding SQLite's index, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
 | `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |
@@ -299,6 +353,9 @@ src/
   dml        INSERT / UPDATE / DELETE, constraints, conflicts, upsert, RETURNING
   ddl        CREATE / DROP / ALTER and sqlite_schema maintenance
   rtree      the R*Tree virtual table module
+  geopoly    the Geopoly module and its functions
+  dbstat     the DBSTAT virtual table
+  extend-fts Lisp tokenizers and FTS5 auxiliary functions
   fts5-*     FTS5: tokenizers and their Unicode data, the index, the query language
   fts5       the FTS5 and fts5vocab virtual tables, bm25 / highlight / snippet
   fts3-*     FTS3/4: tokenizers and their Unicode data, the segment index and

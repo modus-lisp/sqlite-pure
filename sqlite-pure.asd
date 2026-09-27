@@ -52,6 +52,7 @@
      (:file "fts3-snippet")
      (:file "fts3")
      (:file "dbstat")
+     (:file "geopoly")
      (:file "extend-fts")
      (:file "integrity")
      (:file "api")

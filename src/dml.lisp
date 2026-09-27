@@ -252,6 +252,9 @@ same order)."
 ;;; ------------------------------------------------------------------
 ;;; Checks
 
+(defvar *update-columns* :all
+  "The column indexes an UPDATE assigns (for a virtual table's \"nochange\").")
+
 (defstruct (write-ctx (:conc-name wc-))
   table conflict checks-fns returning-fns returning-scope upsert (changes 0) returned)
 
@@ -645,6 +648,7 @@ same order)."
       (multiple-value-bind (ctx rnames) (make-ctx-for tb conflict returning alias)
         (dolist (old rows)
           (let ((new (copy-seq old))
+                (*update-columns* (loop for a in assigns append (car a)))
                 (env (row-env old)))
             (dolist (a assigns)
               (let ((v (funcall (cdr a) env)))

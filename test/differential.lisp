@@ -138,4 +138,9 @@ addresses, so only the tree's shape and wording are compared."
             pass fail *message-mismatches*)
     (zerop fail)))
 
-(defun run () (run-differential))
+(defun run ()
+  "The main cases, then those needing modules the system SQLite lacks
+(test/cases-ext, expectations from test/build-oracle.sh's library)."
+  (let ((main (run-differential))
+        (ext (run-differential :path (asdf:system-relative-pathname "sqlite-pure" "test/expected-ext.sexp"))))
+    (and main ext)))
