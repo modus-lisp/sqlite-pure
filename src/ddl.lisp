@@ -186,6 +186,7 @@ is repointed; roots are dropped largest first, as SQLite does."
     (check-new-name name :index)
     (let ((tb (find-table-in *db* table)))
       (when (table-view-select tb) (sql-error "views may not be indexed"))
+      (when (table-vtab tb) (sql-error "virtual tables may not be indexed"))
       (when (= (table-root tb) 1) (sql-error "table ~a may not be indexed" table))
       (let* ((sql (stored-create-sql text "INDEX"))
              (idx (index-from-ast st 0 sql tb)))
@@ -217,6 +218,7 @@ is repointed; roots are dropped largest first, as SQLite does."
   (destructuring-bind (&key name schema temp if-not-exists table &allow-other-keys) (cdr st)
    (let* ((tb (lookup-table *db* table t (unless temp schema)))
           (*db* (if temp (temp-db *db* t) (table-owner tb))))
+    (when (table-vtab tb) (sql-error "cannot create triggers on virtual tables"))
     (when (gethash (schema-key name) (schema-triggers (db-schema* *db*)))
       (if if-not-exists
           (return-from exec-create-trigger nil)
@@ -259,7 +261,8 @@ is repointed; roots are dropped largest first, as SQLite does."
          (when (= (table-root tb) 1) (sql-error "table ~a may not be dropped" name))
          (when (and (eq kind :table) (name= name "sqlite_sequence"))
            (sql-error "table sqlite_sequence may not be dropped"))
-         (unless (table-view-select tb)
+         (when (table-vtab tb) (vtab-drop tb))
+         (unless (or (table-view-select tb) (table-vtab tb))
            (drop-btrees (cons (table-root tb)
                               (loop for idx in (table-indexes tb)
                                     unless (index-pk-index idx) collect (index-root idx))))
@@ -310,6 +313,9 @@ is repointed; roots are dropped largest first, as SQLite does."
       (when (table-view-select tb) (sql-error "cannot alter view ~a" table))
       (when (and (>= (length table) 7) (name= (subseq table 0 7) "sqlite_"))
         (sql-error "table ~a may not be altered" table))
+      (when (table-vtab tb)
+        (cond (rename-column (sql-error "cannot rename columns of virtual table \"~a\"" table))
+              ((or add-column drop-column) (sql-error "virtual tables may not be altered"))))
       (cond
         (rename-to
          (when (name-in-use-p rename-to)
@@ -339,6 +345,7 @@ is repointed; roots are dropped largest first, as SQLite does."
                                          (setf done t)))
                                   rename-to t)))))
                (rewrite-schema-row r :name new-name :tbl rename-to :sql new-sql))))
+         (vtab-rename tb rename-to)
          (when (sequence-table)
            (let ((seq (sequence-table)))
              (dolist (row (scan-table-rows seq nil nil))

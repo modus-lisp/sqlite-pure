@@ -433,6 +433,8 @@ column may use one declared after it)."
 
 (defun update-one (ctx old new)
   "Replace row OLD by NEW (a full row vector, rowid slot possibly stale)."
+  (when (table-vtab (wc-table ctx))
+    (return-from update-one (vtab-update ctx old new)))
   (let* ((table (wc-table ctx))
          (n (length (table-columns table)))
          (alias (table-rowid-alias table)))
@@ -544,7 +546,8 @@ column may use one declared after it)."
             (dotimes (i ncols)
               (when (eq (svref row i) :unset)
                 (setf (svref row i) (column-default-value (aref (table-columns tb) i)))))
-            (apply-row-affinity tb row)
+            (unless (table-vtab tb)          ; a virtual table sees the raw values
+              (apply-row-affinity tb row))
             (compute-generated tb row)
             (cond
               (view
@@ -552,6 +555,7 @@ column may use one declared after it)."
                (incf (wc-changes ctx)))
               ((and triggers
                     (eq :ignore (fire-triggers tb :insert :before nil (before-insert-image tb row)))))
+              ((table-vtab tb) (vtab-insert ctx row))
               (t
                (finalize-rowid tb row)
                ;; SQLite advances the AUTOINCREMENT counter as soon as a rowid
@@ -615,7 +619,9 @@ column may use one declared after it)."
     (let* ((*ctes* *ctes*)
            (tb (progn (when with (register-ctes (make-sel :with (first with) :recursive (second with))))
                       (writable-table table :update schema)))
-           (view (table-view-select tb))
+           (view (progn (when (and returning (table-vtab tb))
+                          (sql-error "UPDATE RETURNING is not available on virtual tables"))
+                        (table-view-select tb)))
            (triggers (table-has-triggers-p tb))
            (changed (loop for (cols) in sets append cols))
            (scope (table-scope tb alias))
@@ -644,7 +650,7 @@ column may use one declared after it)."
               (view (fire-triggers tb :update :instead-of old new changed)
                     (incf (wc-changes ctx)))
               ;; the row may have been removed by an earlier REPLACE or trigger
-              ((not (or (table-without-rowid tb)
+              ((not (or (table-without-rowid tb) (table-vtab tb)
                         (table-lookup (table-owner tb) (table-root tb) (svref old (length (table-columns tb)))))))
               ((and triggers (eq :ignore (fire-triggers tb :update :before old new changed))))
               (t (when (and (eq (update-one ctx old new) t) triggers)
@@ -712,10 +718,12 @@ row once, from the last joined row that matched it."
     (let* ((*ctes* *ctes*)
            (tb (progn (when with (register-ctes (make-sel :with (first with) :recursive (second with))))
                       (writable-table table :delete schema)))
-           (view (table-view-select tb))
+           (view (progn (when (and returning (table-vtab tb))
+                          (sql-error "DELETE RETURNING is not available on virtual tables"))
+                        (table-view-select tb)))
            (triggers (table-has-triggers-p tb)))
       (multiple-value-bind (ctx rnames) (make-ctx-for tb nil returning alias)
-        (if (and (null where) (null returning) (not triggers) (not view)
+        (if (and (null where) (null returning) (not triggers) (not view) (not (table-vtab tb))
                  (not (and (fk-enabled-p) (referencing-keys tb))))
             ;; truncate: drop every page but the roots
             (let ((n 0))
@@ -732,6 +740,10 @@ row once, from the last joined row that matched it."
                 ((and triggers (eq :ignore (fire-triggers tb :delete :before row nil))))
                 ((and triggers (not (table-without-rowid tb))
                       (not (table-lookup (table-owner tb) (table-root tb) (svref row (length (table-columns tb)))))))
+                ((table-vtab tb)
+                 (vtab-delete tb row)
+                 (incf (wc-changes ctx))
+                 (collect-returning ctx row))
                 (t (fk-parent-delete tb row)
                    (delete-row tb row)
                    (incf (wc-changes ctx))

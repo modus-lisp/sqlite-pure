@@ -1,0 +1,166 @@
+== rtree-basics
+CREATE VIRTUAL TABLE rt USING rtree(id, x0, x1, y0, y1, +name, +extra);
+SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY rowid;
+INSERT INTO rt VALUES (1, 0.1, 0.2, 1, 5, 'n', 3);
+INSERT INTO rt(x0, x1, y0, y1) VALUES (-0.1, 1e40, 2, 2);
+SELECT * FROM rt ORDER BY id;
+SELECT hex(data) FROM rt_node;
+SELECT rtreenode(2, data) FROM rt_node;
+SELECT * FROM rt_rowid ORDER BY rowid;
+SELECT count(*) FROM rt_parent;
+PRAGMA table_info(rt);
+SELECT rowid, id FROM rt ORDER BY 1;
+SELECT typeof(id), typeof(x0), typeof(name) FROM rt ORDER BY id;
+SELECT rtreecheck('rt');
+SELECT rtreecheck('main', 'rt');
+
+== rtree-errors
+CREATE VIRTUAL TABLE bad USING rtree(a, b);
+CREATE VIRTUAL TABLE bad USING rtree(a, b, c, d);
+CREATE VIRTUAL TABLE bad USING rtree(a, b, c, +d, e, f);
+CREATE VIRTUAL TABLE bad USING rtree(a,b,c,d,e,f,g,h,i,j,k,l,m);
+CREATE VIRTUAL TABLE bad USING rtree;
+CREATE VIRTUAL TABLE bad USING rtree();
+CREATE VIRTUAL TABLE bad USING nosuch(a);
+CREATE VIRTUAL TABLE r USING rtree(id, a, b);
+CREATE VIRTUAL TABLE r USING rtree(id, a, b);
+CREATE VIRTUAL TABLE IF NOT EXISTS r USING rtree(id, a, b);
+CREATE INDEX ri ON r(a);
+CREATE TRIGGER rtr AFTER INSERT ON r BEGIN SELECT 1; END;
+ALTER TABLE r ADD COLUMN z;
+ALTER TABLE r RENAME COLUMN a TO q;
+INSERT INTO r VALUES (1, 5, 1);
+INSERT INTO r VALUES (1, 1, 5);
+INSERT INTO r VALUES (1, 1, 5);
+INSERT INTO r VALUES (1, 2);
+INSERT INTO r(id, a) VALUES (30, 1);
+INSERT OR IGNORE INTO r VALUES (1, 2, 2);
+INSERT OR IGNORE INTO r VALUES (2, 9, 2);
+INSERT OR REPLACE INTO r VALUES (1, 3, 4);
+INSERT OR REPLACE INTO r VALUES (3, 9, 4);
+REPLACE INTO r VALUES (4, 0, 0);
+UPDATE r SET a = 10 WHERE id = 1;
+SELECT * FROM r ORDER BY id;
+SELECT * FROM sqlite_master WHERE name = 'bad';
+PRAGMA table_list;
+
+== rtree-coercions
+CREATE VIRTUAL TABLE rt USING rtree(id, x0, x1, y0, y1);
+INSERT INTO rt VALUES (4, 'abc', NULL, 0, 0);
+INSERT INTO rt VALUES (5.5, 0, 1, 0, 1);
+INSERT INTO rt VALUES ('7', 0, 1, 0, 1);
+INSERT INTO rt VALUES ('x', 0, 1, 0, 1);
+INSERT INTO rt VALUES (NULL, 0, 1, 0, 1);
+INSERT INTO rt VALUES (9, '3', '4.5', X'00', 2);
+INSERT INTO rt VALUES ('1.5e3', '2e0x', '1e1', -1e-45, 1e-45);
+INSERT INTO rt VALUES (40, 1e40, 1e41, -1e40, 1e-50);
+INSERT INTO rt VALUES (41, 16777217, 16777217, -16777217, -16777217);
+INSERT INTO rt VALUES (42, 0.3, 0.3, -0.3, -0.3);
+INSERT INTO rt DEFAULT VALUES;
+SELECT * FROM rt ORDER BY id;
+SELECT last_insert_rowid();
+UPDATE rt SET id = 20 WHERE id = 1500;
+UPDATE rt SET id = 7 WHERE id = 20;
+UPDATE OR REPLACE rt SET id = 7 WHERE id = 20;
+UPDATE rt SET x1 = x1 + 1, y1 = 100 WHERE id IN (5, 7, 9);
+SELECT * FROM rt ORDER BY id;
+SELECT changes();
+DELETE FROM rt WHERE id = 9;
+DELETE FROM rt WHERE x0 > 1000;
+SELECT id FROM rt ORDER BY id;
+INSERT INTO rt VALUES (100, 1, 2, 3, 4) RETURNING *;
+CREATE VIRTUAL TABLE ri USING rtree_i32(id, a, b);
+INSERT INTO ri VALUES (1, 1.7, 2.9);
+INSERT INTO ri VALUES (2, -1.7, 3e9);
+INSERT INTO ri VALUES (3, '12abc', '4');
+INSERT INTO ri VALUES (4, '-2.9', 9223372036854775807);
+INSERT INTO ri VALUES (5, -2147483648, 2147483647);
+SELECT *, typeof(a) FROM ri ORDER BY id;
+SELECT hex(data) FROM ri_node;
+PRAGMA table_info(ri);
+
+== rtree-queries
+CREATE VIRTUAL TABLE box USING rtree(id, minx, maxx, miny, maxy);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
+  INSERT INTO box SELECT i, (i * 7919) % 1000, (i * 7919) % 1000 + (i % 17), (i * 104729) % 1000, (i * 104729) % 1000 + (i % 13) FROM n;
+SELECT count(*), sum(minx), sum(maxy), min(miny), max(maxx) FROM box;
+SELECT rtreecheck('box');
+SELECT count(*) FROM box_rowid;
+SELECT id FROM box WHERE minx >= 100 AND maxx <= 120 AND miny >= 500 AND maxy <= 560 ORDER BY id;
+SELECT count(*), sum(id) FROM box WHERE maxx >= 400 AND minx <= 410;
+SELECT count(*), sum(id) FROM box WHERE minx > 990 OR maxy < 3;
+SELECT count(*) FROM box WHERE minx = 500;
+SELECT id, minx FROM box WHERE minx = 500.0 ORDER BY id;
+SELECT count(*) FROM box WHERE minx > '995';
+SELECT count(*) FROM box WHERE minx < 'abc';
+SELECT count(*) FROM box WHERE minx > NULL;
+SELECT * FROM box WHERE id = 1234;
+SELECT * FROM box WHERE rowid = 2999;
+SELECT * FROM box WHERE id = '17';
+SELECT * FROM box WHERE id = 17.5;
+SELECT * FROM box WHERE id = NULL;
+SELECT count(*) FROM box WHERE id BETWEEN 100 AND 199;
+SELECT b.id FROM box AS a JOIN box AS b ON b.minx >= a.minx AND b.maxx <= a.maxx AND b.miny >= a.miny AND b.maxy <= a.maxy WHERE a.id = 7 ORDER BY b.id;
+SELECT count(*) FROM (SELECT 5 AS lo, 7 AS hi) q, box WHERE box.minx BETWEEN q.lo AND q.hi;
+CREATE TABLE pts(pid INTEGER PRIMARY KEY, x, y);
+INSERT INTO pts VALUES (1, 10.5, 20.5), (2, 500, 500), (3, -5, -5);
+SELECT pid, count(box.id) FROM pts LEFT JOIN box ON box.minx <= pts.x AND box.maxx >= pts.x AND box.miny <= pts.y AND box.maxy >= pts.y GROUP BY pid ORDER BY pid;
+SELECT pid, (SELECT count(*) FROM box WHERE minx <= x AND maxx >= x) FROM pts ORDER BY pid;
+CREATE VIEW v AS SELECT id, maxx - minx AS w FROM box;
+SELECT sum(w), count(*) FROM v WHERE id < 100;
+
+== rtree-churn
+CREATE VIRTUAL TABLE t USING rtree(id, a, b, c, d, e, f, +tag);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2500)
+  INSERT INTO t SELECT i, i % 97, i % 97 + 3, (i * 31) % 211, (i * 31) % 211 + 1, i % 7, i % 7 + i % 5, 'tag' || i FROM n;
+SELECT rtreecheck('t');
+DELETE FROM t WHERE id % 3 = 0;
+SELECT rtreecheck('t');
+SELECT count(*), sum(a), sum(f), count(tag) FROM t;
+UPDATE t SET a = a + 1000, b = b + 1000 WHERE id % 5 = 1;
+SELECT rtreecheck('t');
+SELECT count(*), sum(id) FROM t WHERE a >= 1000;
+DELETE FROM t WHERE id > 100;
+SELECT rtreecheck('t');
+SELECT count(*), sum(id), group_concat(tag) FROM (SELECT * FROM t ORDER BY id);
+DELETE FROM t WHERE id > 5;
+SELECT rtreecheck('t'), (SELECT count(*) FROM t_parent), (SELECT count(*) FROM t_node);
+DELETE FROM t;
+SELECT rtreecheck('t'), (SELECT count(*) FROM t_node), (SELECT hex(substr(data, 1, 4)) FROM t_node);
+INSERT INTO t VALUES (1, 0, 1, 0, 1, 0, 1, 'again');
+SELECT * FROM t;
+
+== rtree-ddl
+CREATE VIRTUAL TABLE "Rt" USING rtree(id, "x 0", x1, +aux);
+INSERT INTO rt VALUES (1, 2, 3, 4);
+ALTER TABLE rt RENAME TO r2;
+SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid;
+SELECT * FROM r2;
+PRAGMA table_info(r2);
+PRAGMA table_list;
+CREATE VIRTUAL TABLE w2 USING rtree(a int, b real, c text);
+PRAGMA table_info(w2);
+CREATE VIRTUAL TABLE main.w3 USING rtree(a, b, c);
+SELECT sql FROM sqlite_master WHERE name = 'w3';
+CREATE VIRTUAL TABLE temp.tt USING rtree(a, b, c);
+SELECT name, sql FROM sqlite_temp_master ORDER BY rowid;
+INSERT INTO tt VALUES (1, 2, 3);
+SELECT * FROM tt;
+DROP TABLE r2;
+SELECT name FROM sqlite_master ORDER BY rowid;
+CREATE VIRTUAL TABLE w4 USING rtree(a,b,c,d,e,f,g,h,i,j,k);
+SELECT length(data) FROM w4_node;
+DROP TABLE w4;
+DROP TABLE w3;
+SELECT name FROM sqlite_master ORDER BY rowid;
+DELETE FROM w2_node;
+SELECT * FROM w2;
+
+== rtree-returning
+CREATE VIRTUAL TABLE rt USING rtree(id, a, b);
+INSERT INTO rt(a, b) VALUES (0.1, 2) RETURNING *;
+INSERT INTO rt VALUES ('5x', 1, 2) RETURNING id, rowid, a;
+SELECT last_insert_rowid();
+DELETE FROM rt WHERE id = 1 RETURNING *;
+UPDATE rt SET a = 0 RETURNING *;
+SELECT * FROM rt ORDER BY id;

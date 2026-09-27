@@ -20,8 +20,9 @@
       ;; tables (sqlite_sequence is created by AUTOINCREMENT tables)
       (dolist (r rows)
         (destructuring-bind (rowid type name tbl root sql &rest ignore) r
-          (declare (ignore rowid tbl root ignore))
-          (when (and (equal type "table") (stringp sql) (not (name= name "sqlite_sequence")))
+          (declare (ignore rowid tbl ignore))
+          (when (and (equal type "table") (stringp sql) (not (name= name "sqlite_sequence"))
+                     (not (eql root 0)))
             (run sql))))
       ;; contents, rowids included
       (dolist (r rows)
@@ -30,7 +31,7 @@
           (when (equal type "table")
             (let* ((tb (find-table-in db name))
                    (target (find-table-in new name)))
-              (when (and target (not (table-view-select tb)))
+              (when (and target (not (table-view-select tb)) (not (table-vtab tb)))
                 (with-transaction (new)
                   (let ((*db* db) (*encoding* (db-encoding db)))
                     (map-table-rows
@@ -42,9 +43,14 @@
       ;; indexes, views, triggers, in their original order
       (dolist (r rows)
         (destructuring-bind (rowid type name tbl root sql &rest ignore) r
-          (declare (ignore rowid name tbl root ignore))
-          (when (and (member type '("index" "view" "trigger") :test #'equal) (stringp sql))
-            (run sql))))
+          (declare (ignore rowid))
+          (cond ((and (member type '("index" "view" "trigger") :test #'equal) (stringp sql))
+                 (run sql))
+                ;; virtual tables: the schema row itself, as SQLite copies it
+                ((and (equal type "table") (eql root 0))
+                 (let ((*db* new))
+                   (with-transaction (new) (add-schema-row type name tbl 0 sql))
+                   (setf (db-schema new) nil))))))
       (let ((h (read-page db 1)) (nh (let ((*db* new)) (page-for-write new 1))))
         (dolist (off (list +hdr-user-version+ +hdr-application-id+ 48))
           (put-u32 nh off (get-u32 h off)))

@@ -154,9 +154,22 @@ only the best rows. Only referenced columns are decoded; `count(*)` comes
 from cell counts. Every `WHERE` term is still evaluated as a filter, so a
 plan can only narrow the candidate rows, never change the answer.
 
+**R-trees.** `CREATE VIRTUAL TABLE t USING rtree(id, minX, maxX, ...)` and
+`rtree_i32`, 1 to 5 dimensions plus `+auxiliary` columns, stored exactly as
+SQLite 3.40 stores them (the `_node` / `_rowid` / `_parent` shadow tables,
+fixed-size node blobs, float32 coordinates rounded outward), so either side
+can modify a tree the other built.  Insertion splits R*-style; deletion
+reinserts the contents of underfull nodes; queries prune by bounding box
+using the `WHERE` clause's constraints on coordinates, and look up `id =`
+directly.  Conflict handling, value coercions and error messages follow
+SQLite's, and `rtreecheck()` and `rtreenode()` are provided.  A database
+holding virtual tables of other modules (FTS5, say) opens; those tables
+report "no such module", as in SQLite.
+
 ## Not implemented
 
-Virtual tables (FTS, R-tree), `EXPLAIN`. Durability depends on the Lisp's
+Virtual tables other than R-tree (FTS3/4/5, geopoly, R-tree `MATCH`
+geometry callbacks), `EXPLAIN`. Durability depends on the Lisp's
 `finish-output`; there is no portable `fsync`. File locks need SBCL
 (elsewhere they are no-ops, and cache validation still applies).
 
@@ -177,6 +190,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
+| `test/run-rtree.sh` | r-trees modified alternately by SQLite and by us, checked against a plain mirror table and by SQLite's `rtreecheck()`; auto-vacuum root moves on DROP; VACUUM |
 | `test/run-wal.sh` | WAL databases shared with live SQLite connections: each side reading the other's commits, snapshots surviving the other's writes and checkpoints, the write lock both ways, stale snapshots, log restart, two processes writing at once, last-one-out cleanup, crash recovery, rebuilding SQLite's index, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
 | `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |
 
@@ -201,6 +215,7 @@ src/
   fkeys      foreign key enforcement
   dml        INSERT / UPDATE / DELETE, constraints, conflicts, upsert, RETURNING
   ddl        CREATE / DROP / ALTER and sqlite_schema maintenance
+  rtree      the R*Tree virtual table module
   integrity  PRAGMA integrity_check
   api        public API, statements, transactions, ATTACH, PRAGMAs
   vacuum     VACUUM

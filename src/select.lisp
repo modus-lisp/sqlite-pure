@@ -319,6 +319,8 @@ source[LI].col = expr where expr references only earlier sources."
 
 (defun plan-table-access (fs li conjuncts scope)
   "Return an iterate function for a stored table."
+  (when (table-vtab (fsrc-table fs))
+    (return-from plan-table-access (vtab-plan-access fs li conjuncts scope)))
   (let* ((table (fsrc-table fs))
          (src (fsrc-src fs))
          (eqs (equality-candidates conjuncts li scope)))
@@ -515,7 +517,7 @@ narrowest, newest on ties), or NIL."
   "Can the rows of this single-table query be produced in ORDER BY order?"
   (let* ((fs (first fsrcs))
          (table (and fs (null (cdr fsrcs)) (fsrc-table fs))))
-    (when (and table order
+    (when (and table order (not (table-vtab table))
                (every (lambda (o) (null (fourth o))) order))    ; default NULLS placement
       (let ((cols (mapcar (lambda (o) (order-term-source-column (first o) rcols scope)) order))
             (colls (mapcar (lambda (o)
@@ -988,7 +990,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                (null (cdr (assoc (second (getf (first from) :source)) *ctes* :test #'name=))))
       (let ((table (lookup-table *db* (second (getf (first from) :source)) nil
                                  (fourth (getf (first from) :source)))))
-        (when (and table (not (table-view-select table)))
+        (when (and table (not (table-view-select table)) (not (table-vtab table)))
           (let ((c (first cols)))
             (values (lambda (parent-env)
                       (declare (ignore parent-env))

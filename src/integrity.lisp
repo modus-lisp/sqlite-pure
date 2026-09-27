@@ -119,7 +119,7 @@
               (maphash
                (lambda (k tb)
                  (unless (or (string= k "sqlite_master") (string= k "sqlite_schema")
-                             (table-view-select tb))
+                             (table-view-select tb) (table-vtab tb))
                    (let* ((pk (find-if #'index-pk-index (table-indexes tb)))
                           (nrows (tree (table-root tb) (table-name tb)
                                        (and pk (index-full-cmp tb pk))))

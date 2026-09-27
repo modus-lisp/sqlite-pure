@@ -37,6 +37,7 @@
      (:file "fkeys")
      (:file "dml")
      (:file "ddl")
+     (:file "rtree")
      (:file "integrity")
      (:file "api")
      (:file "vacuum"))))

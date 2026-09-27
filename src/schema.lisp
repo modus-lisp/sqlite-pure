@@ -20,6 +20,7 @@
   checks                 ; list of (name . expr)
   indexes                ; list of INDEX
   strict
+  vtab                   ; an RTREE, or (:unknown module), for CREATE VIRTUAL TABLE
   view-select            ; SEL, for views
   view-columns
   (unique-constraints '()) ; list of (col-idxs collations conflict) in declaration order
@@ -232,7 +233,9 @@
         (cond ((and (equal type "table") (stringp sql))
                (let ((ast (car (first (parse-sql sql)))))
                  (setf (gethash (schema-key name) (schema-tables schema))
-                       (table-from-ast name ast root sql))))
+                       (if (eq (car ast) :create-virtual)
+                           (virtual-table-from-ast name ast sql)
+                           (table-from-ast name ast root sql)))))
               ((and (equal type "view") (stringp sql))
                (let ((ast (car (first (parse-sql sql)))))
                  (setf (gethash (schema-key name) (schema-tables schema))
