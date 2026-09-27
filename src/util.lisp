@@ -3,6 +3,8 @@
 
 (in-package #:sqlite-pure)
 
+(defvar *db* nil "The database a statement is running against.")
+
 ;;; ------------------------------------------------------------------
 ;;; Conditions
 

@@ -93,16 +93,18 @@ hot-journal recovery only under the lock, and page-cache validation against
 the header change counter at every read transaction — so SQLite processes
 and this library can use a file concurrently.
 
-**WAL databases** are read concurrently with nothing held. Writing takes an
-exclusive session: SQLite's WAL connections share an index in `-shm` that
-every writer must keep current, and rather than maintain it, the first
-write locks the main file exclusively and write-locks the `-shm` byte that
-every attached SQLite connection holds a read lock on. While any SQLite
-connection is attached, writing fails with "database is locked" (and while
-the session lasts, SQLite gets "database is locked"). A crash leaves a
-valid log that SQLite recovers; closing — or `PRAGMA wal_checkpoint` —
-copies the log into the main file and removes `-wal` and `-shm`, as
-SQLite's last connection does.
+**WAL databases** are shared with SQLite processes the way SQLite shares
+them among its own connections: through the wal-index in `-shm`, spoken
+exactly (header copies and checksums, hash tables, reader marks, and the
+WRITE / CKPT / RECOVER / READ locks).  Readers and a writer run at the same
+time and each reader keeps its snapshot; a writer whose snapshot went stale
+gets "database is locked", as in SQLite.  Checkpoints (`PRAGMA
+wal_checkpoint`, passive) never pass a reader's mark; a wholly checkpointed
+log is restarted instead of growing; a missing or damaged index is rebuilt
+from the log; a crash leaves a log either side recovers; and the last
+connection to close checkpoints and removes `-wal` and `-shm`.  Leaving WAL
+mode needs the database to ourselves.  (fcntl locks belong to a process, so
+two connections inside one Lisp do not exclude each other.)
 
 **SQL.** `SELECT` with every join type (inner, `LEFT`, `RIGHT`, `FULL`,
 cross, `USING`, `NATURAL`), `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY` (`NULLS
@@ -154,8 +156,7 @@ plan can only narrow the candidate rows, never change the answer.
 
 ## Not implemented
 
-Virtual tables (FTS, R-tree), writing to
-a WAL database while SQLite connections are attached to it, `EXPLAIN`. Durability depends on the Lisp's
+Virtual tables (FTS, R-tree), `EXPLAIN`. Durability depends on the Lisp's
 `finish-output`; there is no portable `fsync`. File locks need SBCL
 (elsewhere they are no-ops, and cache validation still applies).
 
@@ -176,7 +177,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
-| `test/run-wal.sh` | WAL writes next to SQLite processes: exclusion both ways, rollback, clean close, crash recovery (a process killed mid-transaction), continuing a log SQLite left, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
+| `test/run-wal.sh` | WAL databases shared with live SQLite connections: each side reading the other's commits, snapshots surviving the other's writes and checkpoints, the write lock both ways, stale snapshots, log restart, two processes writing at once, last-one-out cleanup, crash recovery, rebuilding SQLite's index, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
 | `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |
 
 ## Layout
@@ -184,8 +185,9 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 ```
 src/
   util       conditions, octets, big-endian ints, varints, UTF-8/16, IEEE doubles
-  pager      pages, header, freelist, transactions, savepoints, journals, WAL read
+  pager      pages, header, freelist, transactions, savepoints, journals
   locking    SQLite's file locks and cache validation
+  wal        write-ahead log and the shared wal-index (-shm)
   record     the record format
   btree      b-trees: traversal (both directions), insert with splits, delete with merges
   values     storage classes, comparison, collation, affinity, CAST, SQLite's AtoF

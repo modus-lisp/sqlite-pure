@@ -62,6 +62,7 @@ a conflicting lock."
       (sleep 0.005))))
 
 (defun lock-shared (db)
+  (when (db-wal db) (return-from lock-shared (wal-begin-read db)))
   (when (and (lockable-p db) (eq (db-lock db) :none))
     (busy-wait
                (lambda ()
@@ -74,6 +75,7 @@ a conflicting lock."
     (validate-cache db)))
 
 (defun lock-reserved (db)
+  (when (db-wal db) (return-from lock-reserved (wal-begin-write db)))
   (when (lockable-p db)
     (lock-shared db)
     (when (eq (db-lock db) :shared)
@@ -91,6 +93,7 @@ a conflicting lock."
 
 (defun unlock-to (db level)
   "Drop to :SHARED or :NONE."
+  (when (db-wal db) (return-from unlock-to (wal-unlock db level)))
   (when (and (lockable-p db) (not (eq (db-lock db) :none)))
     (ecase level
       (:shared

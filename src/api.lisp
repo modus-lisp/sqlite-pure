@@ -153,6 +153,11 @@
             (unwind-protect
                  (progn
                    (dolist (d (conn-dbs db)) (lock-shared d))
+                   ;; WAL: a writing statement takes the write lock before it
+                   ;; reads, so its snapshot cannot go stale underneath it
+                   (when (write-statement-p (car s))
+                     (dolist (d (conn-dbs db))
+                       (when (and (db-wal d) (not (db-readonly d))) (lock-reserved d))))
                    (multiple-value-setq (rows cols) (exec-ast db (car s) (cdr s))))
               ;; outside a transaction every statement is its own read transaction
               (unless (db-explicit db)
@@ -407,9 +412,10 @@ non-local exit.  Nested uses become savepoints."
            (values nil nil))
           ((string= n "wal_checkpoint")
            (pragma-rows '("busy" "log" "checkpointed")
-                        (list (if (db-wal db)
-                                  (let ((k (wal-checkpoint db))) (list 0 k k))
-                                  (list 0 -1 -1)))))
+                        (list (cond ((null (db-wal db)) (list 0 -1 -1))
+                                    ((db-explicit (conn db)) (sql-error "database table is locked"))
+                                    (t (wal-unlock db :none)
+                                       (multiple-value-list (wal-checkpoint db)))))))
           ((string= n "foreign_keys")
            (if value
                (progn (setf (db-foreign-keys (conn db)) (pragma-boolean value))

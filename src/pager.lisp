@@ -144,6 +144,7 @@
     (dolist (k victims) (remhash k cache))))
 
 (defun read-page (db pgno)
+  (when (db-wal db) (setf (wal-fresh (db-wal db)) nil))   ; the snapshot is now in use
   (when (or (< pgno 1) (> pgno (max (db-page-count db) 1)))
     (corrupt "page ~d out of range (database has ~d)" pgno (db-page-count db)))
   (or (gethash pgno (db-cache db))
@@ -161,9 +162,7 @@
   (when (db-readonly db)
     (error 'sqlite-error :code :readonly :message "attempt to write a readonly database"))
   (unless (db-txn db)
-    (if (db-wal db)
-        (wal-begin-session db)          ; before any page is dirtied
-        (lock-reserved db))
+    (lock-reserved db)                  ; before any page is dirtied
     (begin-write db :auto)))
 
 (defun page-for-write (db pgno)
@@ -257,8 +256,8 @@
                              hdr-count
                              (ceiling len ps))))
                  (when (> (aref h 18) 1)
-                   ;; WAL mode: fold committed WAL frames into the cache.
-                   (load-wal db)))))))))
+                   ;; WAL mode: join the shared wal-index
+                   (wal-open db)))))))))
 
 (defun open-database (path &key readonly)
   "Open (creating if necessary) the database at PATH.  PATH may be

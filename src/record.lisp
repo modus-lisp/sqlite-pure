@@ -11,7 +11,6 @@
 (in-package #:sqlite-pure)
 
 (defvar *encoding* :utf-8 "Text encoding of the database being read/written.")
-(defvar *db* nil "The database a statement is running against.")
 
 (defun encode-text (s)
   (ecase *encoding*
