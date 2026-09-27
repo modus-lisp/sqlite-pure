@@ -125,3 +125,28 @@ c.commit()" path))
         (check "auto-vacuum drop: z intact" (sqlite path "select sum(y) from z") "[(3,)]")))
     (format t "rtree interop: ~:[FAILED~;passed~]~%" ok)
     ok))
+
+;;; Structure: the same statements must leave the shadow tables byte for
+;;; byte as SQLite leaves them (test/rtree-fuzz.py drives this).
+
+(defun rtree-shadow-dump (db table)
+  (handler-case
+      (format nil "~{~a~}~{~a~}~{~a~}"
+              (mapcar (lambda (r) (format nil "~d:~a;" (first r) (second r)))
+                      (s:query db (format nil "SELECT nodeno, hex(data) FROM ~a_node ORDER BY 1" table)))
+              (mapcar (lambda (r) (format nil "~d>~d;" (first r) (second r)))
+                      (s:query db (format nil "SELECT nodeno, parentnode FROM ~a_parent ORDER BY 1" table)))
+              (mapcar (lambda (r) (format nil "~d@~d;" (first r) (second r)))
+                      (s:query db (format nil "SELECT rowid, nodeno FROM ~a_rowid ORDER BY 1" table))))
+    (s:sqlite-error () "")))
+
+(defun rtree-step-dumps (sql-path out-path table)
+  "Run each line of SQL-PATH; after each, write ERR (if it failed) and the dump."
+  (s:with-database (db ":memory:")
+    (with-open-file (in sql-path)
+      (with-open-file (out out-path :direction :output :if-exists :supersede)
+        (loop for line = (read-line in nil) while line
+              unless (zerop (length (string-trim " " line)))
+                do (let ((err (handler-case (progn (s:execute db line) "")
+                                (s:sqlite-error () "ERR"))))
+                     (format out "~a~a~%" err (rtree-shadow-dump db table))))))))

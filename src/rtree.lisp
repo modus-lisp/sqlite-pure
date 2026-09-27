@@ -256,7 +256,9 @@
   no                     ; node number
   cells                  ; list of (id . coords-vector)
   parent                 ; parent node number, or NIL if not yet known
-  dirty)
+  dirty
+  raw)                   ; the node blob, changed byte for byte as rtree.c changes it
+                         ; (so bytes past the last cell stay as SQLite leaves them)
 
 (defvar *rt* nil "The r-tree being operated on: (table rtree node-table rowid-table parent-table).")
 (defvar *rt-nodes* nil "Nodes loaded by this operation: nodeno -> RNODE.")
@@ -295,7 +297,7 @@
          (n (get-u16 blob 2)))
     (unless (and (blobp blob) (= (length blob) (rt-node-size)) (<= n (rtree-max-cells)))
       (corrupt "database disk image is malformed"))
-    (make-rnode :no no
+    (make-rnode :no no :raw (copy-seq blob)
                 :cells (loop for i below n
                              for off = (+ 4 (* i bpc))
                              collect (cons (let ((u (logior (ash (get-u32 blob off) 32) (get-u32 blob (+ off 4)))))
@@ -309,19 +311,33 @@
                                                            (f32-from-bits u)))))))))))
 
 (defun encode-rnode (node depth)
-  (let* ((rt (rt-spec)) (bpc (rtree-bytes-per-cell))
-         (blob (make-octets (rt-node-size))))
-    (put-u16 blob 0 (if (= (rn-no node) 1) depth 0))
-    (put-u16 blob 2 (length (rn-cells node)))
-    (loop for (id . c) in (rn-cells node)
-          for off from 4 by bpc
-          do (let ((u (ldb (byte 64 0) id)))
-               (put-u32 blob off (ldb (byte 32 32) u))
-               (put-u32 blob (+ off 4) (ldb (byte 32 0) u)))
-             (dotimes (k (length c))
-               (put-u32 blob (+ off 8 (* 4 k))
-                        (if (rtree-int-p rt) (ldb (byte 32 0) (svref c k)) (f32-bits (svref c k))))))
+  (let ((blob (copy-seq (or (rn-raw node) (make-octets (rt-node-size))))))
+    (when (= (rn-no node) 1) (put-u16 blob 0 depth))
     blob))
+
+(defun rn-raw* (node)
+  (or (rn-raw node) (setf (rn-raw node) (make-octets (rt-node-size)))))
+
+(defun rn-put-cell (node cell &optional (idx (position cell (rn-cells node))))
+  "nodeOverwriteCell: CELL's bytes at slot IDX of NODE's blob."
+  (let* ((rt (rt-spec)) (raw (rn-raw* node))
+         (off (+ 4 (* idx (rtree-bytes-per-cell))))
+         (u (ldb (byte 64 0) (car cell))) (c (cdr cell)))
+    (put-u32 raw off (ldb (byte 32 32) u))
+    (put-u32 raw (+ off 4) (ldb (byte 32 0) u))
+    (dotimes (k (length c))
+      (put-u32 raw (+ off 8 (* 4 k))
+               (if (rtree-int-p rt) (ldb (byte 32 0) (svref c k)) (f32-bits (svref c k)))))
+    (setf (rn-dirty node) t)))
+
+(defun rn-set-count (node)
+  (put-u16 (rn-raw* node) 2 (length (rn-cells node)))
+  (setf (rn-dirty node) t))
+
+(defun rn-zero (node &optional (start 2))
+  "nodeZero (from byte 2) or memset of the whole blob (START 0)."
+  (fill (rn-raw* node) 0 :start start)
+  (setf (rn-cells node) nil (rn-dirty node) t))
 
 (defun rtree-depth ()
   (let ((blob (first (shadow-get (rt-node-table) 1))))
@@ -348,11 +364,18 @@
               (or (first (shadow-get (rt-parent-table) (rn-no node)))
                   (corrupt "database disk image is malformed"))))))
 
-(defun new-rnode ()
-  (let ((no (or *rt-next-node*
-                (1+ (or (table-max-rowid (table-owner (rt-node-table)) (table-root (rt-node-table))) 0)))))
-    (setf *rt-next-node* (1+ no))
-    (setf (gethash no *rt-nodes*) (make-rnode :no no :dirty t))))
+(defun node-number-for-new ()
+  "The number SQLite's nodeWrite gives a new node: INSERT with a NULL key,
+so one past the largest node number in <t>_node at that moment."
+  (1+ (or (table-max-rowid (table-owner (rt-node-table)) (table-root (rt-node-table))) 0)))
+
+(defun write-new-rnode (node)
+  "nodeWrite for a node without a number: number it and write it now."
+  (let ((no (node-number-for-new)))
+    (setf (rn-no node) no (gethash no *rt-nodes*) node)
+    (shadow-put (rt-node-table) no (list (encode-rnode node *rt-depth*)))
+    (setf (rn-dirty node) nil)
+    node))
 
 (defun flush-rnodes ()
   (maphash (lambda (no n)
@@ -361,171 +384,305 @@
                (setf (rn-dirty n) nil)))
            *rt-nodes*))
 
-(defun set-mapping (cell node height)
-  "Record where CELL now lives: an entry's leaf, or a child node's parent."
+(defun write-mapping (id nodeno height)
+  "rowidWrite / parentWrite: record where entry or child node ID lives."
   (if (zerop height)
-      (let ((old (shadow-get (rt-rowid-table) (car cell))))
-        (shadow-put (rt-rowid-table) (car cell)
-                    (cons (rn-no node)
-                          (if old (rest old) (make-list (rtree-naux (rt-spec)) :initial-element :null)))))
-      (progn
-        (shadow-put (rt-parent-table) (car cell) (list (rn-no node)))
-        (let ((child (gethash (car cell) *rt-nodes*)))
-          (when child (setf (rn-parent child) (rn-no node)))))))
+      (let ((old (shadow-get (rt-rowid-table) id)))
+        (shadow-put (rt-rowid-table) id
+                    (cons nodeno (if old (rest old) (make-list (rtree-naux (rt-spec)) :initial-element :null)))))
+      (shadow-put (rt-parent-table) id (list nodeno))))
+
+(defun update-mapping (id node height)
+  (when (plusp height)
+    (let ((child (gethash id *rt-nodes*)))
+      (when child (setf (rn-parent child) (rn-no node)))))
+  (write-mapping id (rn-no node) height))
+
+;;; SQLite's forced-reinsertion state (Rtree.iReinsertHeight) lives as long
+;;; as the connection's virtual table object: 0 when first connected, -1 at
+;;; the start of each insert, raised by each forced reinsertion.
+
+(defun rt-state-table ()
+  (let ((c (conn *db*)))
+    (or (getf (db-vtab-state c) :rtree)
+        (setf (getf (db-vtab-state c) :rtree) (make-hash-table :test #'equal)))))
+
+(defun rt-state-key (table) (list (table-owner table) (string-downcase (table-name table))))
+
+(defun rt-reinsert-height ()
+  (gethash (rt-state-key (rt-table)) (rt-state-table) 0))
+
+(defun (setf rt-reinsert-height) (h)
+  (setf (gethash (rt-state-key (rt-table)) (rt-state-table)) h))
+
+(defun rtree-forget-state (table)
+  (remhash (rt-state-key table) (rt-state-table)))
 
 ;;; ------------------------------------------------------------------
-;;; Geometry (on coordinate vectors: min0 max0 min1 max1 ...)
+;;; Geometry, as rtree.c computes it: coordinate vectors (min0 max0 min1
+;;; max1 ...), float32 values held as doubles or int32 values as integers.
 
-(defun box-union (a b)
+(defun f32 (d)
+  "D rounded to float32 (as a double)."
+  #+sbcl (if (and (= d d) (or (zerop d) (<= 1.1754944d-38 (abs d) 3.4028234d38)))
+             (float (float d 1f0) 1d0)
+             (round-f32 d))
+  #-sbcl (round-f32 d))
+
+(declaim (inline dcoord))
+(defun dcoord (x) (float x 1d0))
+
+(defun cell-area (c)
+  "cellArea: the product, last dimension first, of each extent (a float32
+subtraction for rtree, an integer one for rtree_i32)."
+  (let ((area 1d0) (int-p (rtree-int-p (rt-spec))))
+    (loop for k downfrom (- (length c) 2) to 0 by 2
+          do (setf area (* area (if int-p
+                                    (dcoord (- (svref c (1+ k)) (svref c k)))
+                                    (f32 (- (svref c (1+ k)) (svref c k)))))))
+    area))
+
+(defun cell-margin (c)
+  (let ((m 0d0))
+    (loop for k downfrom (- (length c) 2) to 0 by 2
+          do (setf m (+ m (- (dcoord (svref c (1+ k))) (dcoord (svref c k))))))
+    m))
+
+(defun cell-union (a b)
   (let ((c (copy-seq a)))
     (loop for k from 0 below (length a) by 2
           do (setf (svref c k) (min (svref a k) (svref b k))
                    (svref c (1+ k)) (max (svref a (1+ k)) (svref b (1+ k)))))
     c))
 
-(defun cells-box (cells)
-  (reduce #'box-union (mapcar #'cdr cells)))
-
-(defun box-area (a)
-  (loop with p = 1d0
-        for k from 0 below (length a) by 2
-        do (setf p (* p (float (- (svref a (1+ k)) (svref a k)) 1d0)))
-        finally (return p)))
-
-(defun box-margin (a)
+(defun cell-contains-p (a b)
+  "Does box A cover box B?"
   (loop for k from 0 below (length a) by 2
-        sum (float (- (svref a (1+ k)) (svref a k)) 1d0)))
+        never (or (< (svref b k) (svref a k)) (> (svref b (1+ k)) (svref a (1+ k))))))
 
-(defun box-overlap (a b)
-  (loop with p = 1d0
-        for k from 0 below (length a) by 2
-        do (let ((lo (max (svref a k) (svref b k))) (hi (min (svref a (1+ k)) (svref b (1+ k)))))
-             (if (< hi lo) (return 0d0) (setf p (* p (float (- hi lo) 1d0)))))
-        finally (return p)))
+(defun cell-growth (c new) (- (cell-area (cell-union c new)) (cell-area c)))
 
-(defun box-contains-p (outer inner)
-  (loop for k from 0 below (length outer) by 2
-        always (and (<= (svref outer k) (svref inner k))
-                    (>= (svref outer (1+ k)) (svref inner (1+ k))))))
+(defun cell-overlap (a b)
+  (let ((o 1d0))
+    (loop for k from 0 below (length a) by 2
+          do (let ((x1 (max (dcoord (svref a k)) (dcoord (svref b k))))
+                   (x2 (min (dcoord (svref a (1+ k))) (dcoord (svref b (1+ k))))))
+               (if (< x2 x1) (return-from cell-overlap 0d0) (setf o (* o (- x2 x1))))))
+    o))
+
+(defun rt-merge-sort (idx less)
+  "The top-down merge sort rtree.c uses (SortByDimension / SortByDistance):
+a left element is taken only when strictly LESS than the right one."
+  (let ((n (length idx)))
+    (if (<= n 1)
+        idx
+        (let* ((nl (floor n 2))
+               (l (rt-merge-sort (subseq idx 0 nl) less))
+               (r (rt-merge-sort (subseq idx nl) less))
+               (out (make-array n)) (i 0) (j 0))
+          (loop while (or (< i nl) (< j (- n nl)))
+                do (if (and (< i nl) (or (= j (- n nl)) (funcall less (svref l i) (svref r j))))
+                       (progn (setf (svref out (+ i j)) (svref l i)) (incf i))
+                       (progn (setf (svref out (+ i j)) (svref r j)) (incf j))))
+          out))))
 
 ;;; ------------------------------------------------------------------
-;;; Insertion
+;;; Insertion (ChooseLeaf, rtreeInsertCell, SplitNode, Reinsert)
 
-(defun choose-node (box height)
-  "Descend from the root to the node at HEIGHT that least needs enlarging."
+(defun choose-leaf (box height)
+  "Descend from the root to the node at HEIGHT whose box grows least
+(ties: the smaller box)."
   (let ((node (load-rnode 1)))
-    (loop for h downfrom *rt-depth* above height
-          do (let ((best nil) (best-growth 0d0) (best-area 0d0))
+    (loop repeat (- *rt-depth* height)
+          do (let ((best nil) (min-growth 0d0) (min-area 0d0) (first t))
                (dolist (c (rn-cells node))
-                 (let* ((area (box-area (cdr c)))
-                        (growth (- (box-area (box-union (cdr c) box)) area)))
-                   (when (or (null best) (< growth best-growth)
-                             (and (= growth best-growth) (< area best-area)))
-                     (setf best c best-growth growth best-area area))))
+                 (let ((growth (cell-growth (cdr c) box)) (area (cell-area (cdr c))))
+                   (when (or first (< growth min-growth) (and (= growth min-growth) (< area min-area)))
+                     (setf min-growth growth min-area area best c)))
+                 (setf first nil))
                (unless best (corrupt "database disk image is malformed"))
                (setf node (load-rnode (car best) (rn-no node)))))
     node))
 
-(defun fix-boxes (node)
-  "Make every ancestor's cell for NODE the exact bounding box of its cells."
-  (loop until (= (rn-no node) 1)
-        do (let* ((parent (load-rnode (rnode-parent node)))
-                  (cell (or (assoc (rn-no node) (rn-cells parent))
-                            (corrupt "database disk image is malformed")))
-                  (box (and (rn-cells node) (cells-box (rn-cells node)))))
-             (when (or (null box) (equalp box (cdr cell))) (return))
-             (setf (cdr cell) box (rn-dirty parent) t node parent))))
-
-(defun insert-cell (node cell height)
-  "Add CELL to NODE (at HEIGHT), splitting as needed."
-  (setf (rn-cells node) (append (rn-cells node) (list cell))
-        (rn-dirty node) t)
-  (if (<= (length (rn-cells node)) (rtree-max-cells))
-      (progn (set-mapping cell node height)
-             (fix-boxes node))
-      (rtree-split-node node height)))
-
-(defun split-cells (cells)
-  "R*-tree split: the axis with the least total margin, then the division
-with the least overlap (then least area).  Returns (values left right)."
-  (let* ((n (length cells))
-         (m (max 1 (min (rtree-min-cells) (floor n 2))))
-         (v (coerce cells 'vector))
-         (nd (length (cdr (first cells))))
-         (best-axis nil) (best-margin nil))
-    (flet ((sorted (k)
-             (sort (copy-seq v) (lambda (a b)
-                                  (let ((a0 (svref (cdr a) (* 2 k))) (b0 (svref (cdr b) (* 2 k))))
-                                    (or (< a0 b0)
-                                        (and (= a0 b0) (< (svref (cdr a) (1+ (* 2 k)))
-                                                          (svref (cdr b) (1+ (* 2 k)))))))))))
-      (dotimes (k (floor nd 2))
-        (let ((s (sorted k)) (margin 0d0))
-          (loop for i from m to (- n m)
-                do (incf margin (+ (box-margin (cells-box (coerce (subseq s 0 i) 'list)))
-                                   (box-margin (cells-box (coerce (subseq s i) 'list))))))
-          (when (or (null best-margin) (< margin best-margin))
-            (setf best-margin margin best-axis s))))
-      (let ((best-i nil) (best-overlap 0d0) (best-area 0d0))
-        (loop for i from m to (- n m)
-              do (let* ((l (cells-box (coerce (subseq best-axis 0 i) 'list)))
-                        (r (cells-box (coerce (subseq best-axis i) 'list)))
-                        (overlap (box-overlap l r))
-                        (area (+ (box-area l) (box-area r))))
-                   (when (or (null best-i) (< overlap best-overlap)
-                             (and (= overlap best-overlap) (< area best-area)))
-                     (setf best-i i best-overlap overlap best-area area))))
-        (values (coerce (subseq best-axis 0 best-i) 'list)
-                (coerce (subseq best-axis best-i) 'list))))))
-
-(defun rtree-split-node (node height)
-  (multiple-value-bind (left right) (split-cells (rn-cells node))
-    (if (= (rn-no node) 1)
-        ;; the root stays node 1: its contents move down into two new nodes
-        (let ((l (new-rnode)) (r (new-rnode)))
-          (setf (rn-cells l) left (rn-cells r) right
-                (rn-parent l) 1 (rn-parent r) 1
-                (rn-cells node) (list (cons (rn-no l) (cells-box left))
-                                      (cons (rn-no r) (cells-box right)))
-                (rn-dirty node) t)
-          (incf *rt-depth*)
-          (dolist (c left) (set-mapping c l height))
-          (dolist (c right) (set-mapping c r height))
-          (set-mapping (first (rn-cells node)) node (1+ height))
-          (set-mapping (second (rn-cells node)) node (1+ height)))
-        (let ((r (new-rnode))
-              (parent (load-rnode (rnode-parent node))))
-          (setf (rn-cells node) left (rn-cells r) right)
-          (dolist (c left) (set-mapping c node height))
-          (dolist (c right) (set-mapping c r height))
-          (fix-boxes node)
-          (insert-cell parent (cons (rn-no r) (cells-box right)) (1+ height))))))
-
-(defun insert-at-height (cell height)
-  (insert-cell (choose-node (cdr cell) height) cell height))
-
-;;; ------------------------------------------------------------------
-;;; Deletion
-
-(defvar *rt-reinsert* nil "(cells . height) of nodes removed as underfull.")
-
-(defun delete-cell (node cell height)
-  (setf (rn-cells node) (remove cell (rn-cells node)) (rn-dirty node) t)
-  (unless (= (rn-no node) 1)
-    (if (< (length (rn-cells node)) (rtree-min-cells))
-        (remove-rnode node height)
-        (fix-boxes node))))
-
-(defun remove-rnode (node height)
-  "Unlink NODE from the tree; its cells are queued for reinsertion."
+(defun parent-cell (node)
+  "NODE's parent and the parent's cell for NODE."
   (let* ((parent (load-rnode (rnode-parent node)))
          (cell (or (assoc (rn-no node) (rn-cells parent))
                    (corrupt "database disk image is malformed"))))
-    (delete-cell parent cell (1+ height))
-    (shadow-del (rt-node-table) (rn-no node))
-    (shadow-del (rt-parent-table) (rn-no node))
-    (remhash (rn-no node) *rt-nodes*)
-    (push (cons (rn-cells node) height) *rt-reinsert*)))
+    (values parent cell)))
+
+(defun adjust-tree (node cell)
+  "AdjustTree: widen each ancestor's box to take in CELL."
+  (loop until (= (rn-no node) 1)
+        do (multiple-value-bind (parent pc) (parent-cell node)
+             (unless (cell-contains-p (cdr pc) (cdr cell))
+               (setf (cdr pc) (cell-union (cdr pc) (cdr cell)))
+               (rn-put-cell parent pc))
+             (setf node parent))))
+
+(defun fix-bounding-box (node)
+  "fixBoundingBox: each ancestor's box for NODE becomes exactly NODE's extent."
+  (loop until (= (rn-no node) 1)
+        do (multiple-value-bind (parent pc) (parent-cell node)
+             (setf (cdr pc) (if (rn-cells node)
+                                (reduce #'cell-union (mapcar #'cdr (rn-cells node)))
+                                (make-array (rtree-ndim2 (rt-spec)) :initial-element 0)))
+             (rn-put-cell parent pc)
+             (setf node parent))))
+
+(defun node-insert-cell (node cell)
+  "nodeInsertCell: append CELL, or return true (and leave NODE) if full."
+  (if (< (length (rn-cells node)) (rtree-max-cells))
+      (progn (setf (rn-cells node) (append (rn-cells node) (list cell)))
+             (rn-put-cell node cell (1- (length (rn-cells node))))
+             (rn-set-count node)
+             nil)
+      t))
+
+(defun rtree-insert-cell (node cell height)
+  (when (plusp height)
+    (let ((child (gethash (car cell) *rt-nodes*)))
+      (when child (setf (rn-parent child) (rn-no node)))))
+  (if (node-insert-cell node cell)
+      (if (or (<= height (rt-reinsert-height)) (= (rn-no node) 1))
+          (rtree-split-node node cell height)
+          (progn (setf (rt-reinsert-height) height)
+                 (reinsert node cell height)))
+      (progn (adjust-tree node cell)
+             (write-mapping (car cell) (rn-no node) height))))
+
+(defun split-startree (cells)
+  "splitNodeStartree: (values left-cells right-cells left-box right-box)."
+  (let* ((v (coerce cells 'vector)) (n (length v))
+         (ndim (floor (rtree-ndim2 (rt-spec)) 2))
+         (mincells (rtree-min-cells))
+         (sorted (make-array ndim))
+         (best-dim 0) (best-split 0) (best-margin 0d0))
+    (flet ((box (i) (cdr (svref v i))))
+      (dotimes (d ndim)
+        (setf (svref sorted d)
+              (rt-merge-sort (coerce (loop for i below n collect i) 'vector)
+                             (lambda (a b)
+                               (let ((a1 (dcoord (svref (box a) (* 2 d)))) (b1 (dcoord (svref (box b) (* 2 d)))))
+                                 (or (< a1 b1)
+                                     (and (= a1 b1) (< (dcoord (svref (box a) (1+ (* 2 d))))
+                                                       (dcoord (svref (box b) (1+ (* 2 d))))))))))))
+      (dotimes (d ndim)
+        (let ((s (svref sorted d)) (margin 0d0) (best-overlap 0d0) (best-area 0d0) (best-left 0))
+          (loop for nleft from mincells to (- n mincells)
+                do (let ((left (copy-seq (box (svref s 0)))) (right (copy-seq (box (svref s (1- n))))))
+                     (loop for kk from 1 below (1- n)
+                           do (if (< kk nleft)
+                                  (setf left (cell-union left (box (svref s kk))))
+                                  (setf right (cell-union right (box (svref s kk))))))
+                     (setf margin (+ margin (cell-margin left)))
+                     (setf margin (+ margin (cell-margin right)))
+                     (let ((overlap (cell-overlap left right))
+                           (area (+ (cell-area left) (cell-area right))))
+                       (when (or (= nleft mincells) (< overlap best-overlap)
+                                 (and (= overlap best-overlap) (< area best-area)))
+                         (setf best-left nleft best-overlap overlap best-area area)))))
+          (when (or (zerop d) (< margin best-margin))
+            (setf best-dim d best-margin margin best-split best-left))))
+      (let* ((s (svref sorted best-dim))
+             (lc (loop for i below best-split collect (svref v (svref s i))))
+             (rc (loop for i from best-split below n collect (svref v (svref s i)))))
+        (values lc rc
+                (reduce #'cell-union (mapcar #'cdr lc) :initial-value (copy-seq (box (svref s 0))))
+                (reduce #'cell-union (mapcar #'cdr rc) :initial-value (copy-seq (box (svref s best-split)))))))))
+
+(defun rtree-split-node (node cell height)
+  (let* ((cells (append (rn-cells node) (list cell)))
+         (root-p (= (rn-no node) 1))
+         (left (if root-p (make-rnode :parent 1) node))
+         (right (make-rnode :parent (if root-p 1 (rnode-parent node)))))
+    (rn-zero node)
+    (rn-zero left 0)
+    (rn-zero right 0)
+    (when root-p (incf *rt-depth*))
+    (multiple-value-bind (lc rc lbox rbox) (split-startree cells)
+      (dolist (c lc) (node-insert-cell left c))
+      (dolist (c rc) (node-insert-cell right c))
+      ;; node numbers: the right half first, as nodeWrite hands them out
+      (write-new-rnode right)
+      (when root-p (write-new-rnode left))
+      (if root-p
+          (rtree-insert-cell node (cons (rn-no left) lbox) (1+ height))
+          (multiple-value-bind (parent pc) (parent-cell left)
+            (setf (cdr pc) lbox)
+            (rn-put-cell parent pc)
+            (adjust-tree parent (cons (rn-no left) lbox))))
+      (rtree-insert-cell (load-rnode (rn-parent right)) (cons (rn-no right) rbox) (1+ height))
+      (let ((new-right nil))
+        (dolist (c (rn-cells right))
+          (update-mapping (car c) right height)
+          (when (eql (car c) (car cell)) (setf new-right t)))
+        (cond (root-p (dolist (c (rn-cells left)) (update-mapping (car c) left height)))
+              ((not new-right) (update-mapping (car cell) left height)))))))
+
+(defun reinsert (node cell height)
+  "Reinsert: keep the cells nearest NODE's centre, reinsert the others from
+the root."
+  (let* ((cells (coerce (append (rn-cells node) (list cell)) 'vector))
+         (n (length cells))
+         (ndim (floor (rtree-ndim2 (rt-spec)) 2))
+         (center (make-array ndim :initial-element 0d0))
+         (dist (make-array n :initial-element 0d0)))
+    (dotimes (i n)
+      (let ((c (cdr (svref cells i))))
+        (dotimes (d ndim)
+          (incf (svref center d) (dcoord (svref c (* 2 d))))
+          (incf (svref center d) (dcoord (svref c (1+ (* 2 d))))))))
+    (dotimes (d ndim) (setf (svref center d) (/ (svref center d) (* n 2d0))))
+    (dotimes (i n)
+      (let ((c (cdr (svref cells i))))
+        (dotimes (d ndim)
+          (let ((coord (- (dcoord (svref c (1+ (* 2 d)))) (dcoord (svref c (* 2 d))))))
+            (incf (svref dist i) (* (- coord (svref center d)) (- coord (svref center d))))))))
+    (let ((order (rt-merge-sort (coerce (loop for i below n collect i) 'vector)
+                                (lambda (a b) (< (svref dist a) (svref dist b)))))
+          (keep (- n (1+ (rtree-min-cells)))))
+      (rn-zero node)
+      (dotimes (i keep)
+        (let ((p (svref cells (svref order i))))
+          (node-insert-cell node p)
+          (when (eql (car p) (car cell)) (write-mapping (car p) (rn-no node) height))))
+      (fix-bounding-box node)
+      (loop for i from keep below n
+            do (let ((p (svref cells (svref order i))))
+                 (rtree-insert-cell (choose-leaf (cdr p) height) p height))))))
+
+(defun insert-at-height (cell height)
+  "Insert a new entry (HEIGHT 0), as rtreeUpdate does."
+  (let ((leaf (choose-leaf (cdr cell) height)))
+    (setf (rt-reinsert-height) -1)
+    (rtree-insert-cell leaf cell height)))
+
+;;; ------------------------------------------------------------------
+;;; Deletion (deleteCell, removeNode, rtreeDeleteRowid)
+
+(defvar *rt-reinsert* nil "(cells . height) of nodes removed as underfull, newest first.")
+
+(defun delete-cell (node cell height)
+  ;; nodeDeleteCell: the later cells move down; the old last slot keeps its bytes
+  (let* ((idx (position cell (rn-cells node))) (bpc (rtree-bytes-per-cell))
+         (raw (rn-raw* node)) (n (length (rn-cells node))))
+    (replace raw raw :start1 (+ 4 (* idx bpc)) :start2 (+ 4 (* (1+ idx) bpc)) :end2 (+ 4 (* n bpc)))
+    (setf (rn-cells node) (remove cell (rn-cells node) :count 1))
+    (rn-set-count node))
+  (unless (= (rn-no node) 1)
+    (if (< (length (rn-cells node)) (rtree-min-cells))
+        (remove-rnode node height)
+        (fix-bounding-box node))))
+
+(defun remove-rnode (node height)
+  "Unlink NODE from the tree; its cells are queued for reinsertion."
+  (multiple-value-bind (parent cell) (parent-cell node)
+    (delete-cell parent cell (1+ height)))
+  (shadow-del (rt-node-table) (rn-no node))
+  (shadow-del (rt-parent-table) (rn-no node))
+  (remhash (rn-no node) *rt-nodes*)
+  (push (cons (rn-cells node) height) *rt-reinsert*))
 
 (defun rtree-delete-id (id)
   "Remove entry ID; true if it existed."
@@ -534,9 +691,9 @@ with the least overlap (then least area).  Returns (values left right)."
       (let* ((*rt-reinsert* '())
              (leaf (load-rnode leafno))
              (cell (or (assoc id (rn-cells leaf)) (corrupt "database disk image is malformed"))))
-        (shadow-del (rt-rowid-table) id)
         (delete-cell leaf cell 0)
-        ;; a root with one child: bring the child's contents up
+        (shadow-del (rt-rowid-table) id)
+        ;; a root with one child: the child's contents move up
         (let ((root (load-rnode 1)))
           (when (and (plusp *rt-depth*) (= (length (rn-cells root)) 1))
             (let ((child (load-rnode (car (first (rn-cells root))) 1)))
@@ -545,7 +702,8 @@ with the least overlap (then least area).  Returns (values left right)."
               (setf (rn-dirty root) t))))
         (loop while *rt-reinsert*
               do (destructuring-bind (cells . height) (pop *rt-reinsert*)
-                   (dolist (c cells) (insert-at-height c height))))
+                   (dolist (c cells)
+                     (rtree-insert-cell (choose-leaf (cdr c) height) c height))))
         t))))
 
 ;;; ------------------------------------------------------------------
@@ -766,6 +924,7 @@ walking the tree past subtrees the coordinate constraints rule out."
   "Drop a virtual table's shadow tables (all roots at once: in an auto-vacuum
 database dropping one moves another)."
   (progn
+    (when (rtree-p (table-vtab table)) (rtree-forget-state table))
     (let ((shadows (loop for suffix in (vtab-shadow-suffixes table)
                          for sh = (find-table-in *db* (shadow-name table suffix))
                          when sh collect sh)))

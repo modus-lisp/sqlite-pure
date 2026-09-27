@@ -189,14 +189,14 @@ plan can only narrow the candidate rows, never change the answer.
 `rtree_i32`, 1 to 5 dimensions plus `+auxiliary` columns, stored exactly as
 SQLite 3.40 stores them (the `_node` / `_rowid` / `_parent` shadow tables,
 fixed-size node blobs, float32 coordinates rounded outward), so either side
-can modify a tree the other built.  Insertion splits R*-style; deletion
-reinserts the contents of underfull nodes; queries prune by bounding box
+can modify a tree the other built.  Insertion and deletion are ports of
+rtree.c's (least-enlargement descent, R*-tree split, forced reinsertion,
+underfull-node removal and reinsertion, node numbering), so the same
+statements leave the shadow tables byte for byte as SQLite leaves them;
+queries prune by bounding box
 using the `WHERE` clause's constraints on coordinates, and look up `id =`
 directly.  Conflict handling, value coercions and error messages follow
-SQLite's, and `rtreecheck()` and `rtreenode()` are provided.  Trees built
-here are valid in either engine but not node-for-node the ones SQLite
-builds (its forced reinsertion on overflow is not reproduced), so the
-order of rows from an unordered scan can differ.  A database holding
+SQLite's, and `rtreecheck()` and `rtreenode()` are provided.  A database holding
 virtual tables of modules this library lacks opens; those tables report
 "no such module", as in SQLite.
 
@@ -327,6 +327,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fts5fuzz.sh` | random documents and random FTS5 queries (every operator, column filters, NEAR, prefixes, detail modes) against SQLite: rowids, `bm25()`, `highlight()`, `snippet()` |
 | `test/run-fts5-tokens.sh` | every tokenizer configuration against SQLite's, token for token, over random text and a stemming word list |
 | `test/run-geopoly.sh` | geopoly against SQLite 3.40.1 built with GEOPOLY (`test/build-oracle.sh` builds it from the amalgamation): 2000 random rows of every function compared bit for bit, and a table built by each side read and modified by the other; also regenerates `test/cases-ext` (run by `run-tests.sh` from the committed `test/expected-ext.sexp`) |
+| `test/run-rtree-fuzz.sh [FIRST N]` | random r-tree workloads (1-5 dimensions, `rtree_i32`, auxiliary columns, page sizes, REPLACE, rowid changes, rollbacks): after every statement the shadow tables must be byte for byte SQLite's |
 | `test/run-rtree.sh` | r-trees modified alternately by SQLite and by us, checked against a plain mirror table and by SQLite's `rtreecheck()`; auto-vacuum root moves on DROP; VACUUM |
 | `test/run-wal.sh` | WAL databases shared with live SQLite connections: each side reading the other's commits, snapshots surviving the other's writes and checkpoints, the write lock both ways, stale snapshots, log restart, two processes writing at once, last-one-out cleanup, crash recovery, rebuilding SQLite's index, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
 | `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |

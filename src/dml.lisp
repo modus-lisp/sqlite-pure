@@ -743,7 +743,14 @@ row once, from the last joined row that matched it."
                 (unless (index-pk-index idx)
                   (clear-btree (table-owner tb) (index-root idx) :keep-root t)))
               (setf (wc-changes ctx) n))
-            (dolist (row (scan-table-rows tb alias where))
+            (dolist (row (let ((rows (scan-table-rows tb alias where)))
+                           (if (and (table-vtab tb) (not view))
+                               ;; SQLite collects a virtual table's rowids in a
+                               ;; RowSet and deletes them in ascending order
+                               (let ((n (length (table-columns tb))))
+                                 (remove-duplicates (stable-sort rows #'< :key (lambda (r) (rt-int64 (svref r n))))
+                                                    :key (lambda (r) (rt-int64 (svref r n))) :from-end t))
+                               rows)))
               (cond
                 (view (fire-triggers tb :delete :instead-of row nil)
                       (incf (wc-changes ctx)))

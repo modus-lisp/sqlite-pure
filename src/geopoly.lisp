@@ -19,8 +19,6 @@
 
 (defun geo-p (v) (and (rtree-p v) (equal (rtree-module v) "geopoly")))
 
-(defun f32 (d) (round-f32 d))
-
 ;;; ------------------------------------------------------------------
 ;;; Polygons
 
