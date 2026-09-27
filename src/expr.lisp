@@ -103,12 +103,14 @@
     (:cast (type-affinity (third e)))
     (:collate (expr-affinity (second e) scope))
     (:subquery (select-first-affinity (second e) scope))
+    (:affine (third e))
     (t nil)))
 
 (defun expr-collation (e scope)
   "Return (values collation explicit-p); collation NIL when none."
   (case (car e)
     (:collate (values (collation-keyword (third e)) t))
+    (:affine (values (fourth e) nil))
     (:srccol (let ((s (nth (second e) (scope-srcs scope))) (ci (third e)))
                (values (if (eq ci :rowid) :binary (svref (src-collations s) ci)) nil)))
     (:col (multiple-value-bind (depth si ci s) (resolve-column scope (second e) (third e))
@@ -400,7 +402,12 @@ on FTS3/4 tables; NIL for anything else."
     (:subquery (compile-scalar-subquery (second e) scope))
     (:exists (compile-exists (second e) scope))
     (:rowvalue (sql-error "row value misused"))
-    (:raise (compile-raise e scope))))
+    (:raise (compile-raise e scope))
+    ;; a column fixed to a constant by constant propagation: (:affine const affinity collation)
+    (:affine (let ((f (compile-expr (second e) scope)) (aff (third e)))
+               (if (member aff '(nil :blob))
+                   f
+                   (lambda (env) (apply-affinity (funcall f env) aff)))))))
 
 (defun compile-coalesced (key scope)
   "The column shared through USING by a RIGHT or FULL JOIN reads as

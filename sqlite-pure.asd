@@ -29,6 +29,7 @@
      (:file "eqp")
      (:file "expr")
      (:file "select")
+     (:file "where")
      (:file "window")
      (:file "functions")
      (:file "printf")

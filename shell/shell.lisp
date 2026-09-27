@@ -612,7 +612,20 @@ sqlite3_prepare would take them one after another."
   "Where in SQL the error points (sqlite3_error_offset), or NIL."
   (or (sqlite-pure:sqlite-error-offset c)
       (let ((msg (sqlite-pure:sqlite-error-message c)))
-        (flet ((find-ident (name &optional before-paren (update-p (string-prefix-ci-p "UPDATE" (string-left-trim " " sql))))
+        (flet ((find-qualified (qual col)
+                 ;; QUAL . COL as three tokens: the position of QUAL
+                 (let ((toks (ignore-errors (sqlite-pure::tokenize sql))))
+                   (when toks
+                     (flet ((tok= (k name)
+                              (and (< k (length toks))
+                                   (member (sqlite-pure::tok-kind (aref toks k)) '(:id :string))
+                                   (string-equal (princ-to-string (sqlite-pure::tok-value (aref toks k))) name))))
+                       (loop for k below (- (length toks) 2)
+                             when (and (tok= k qual)
+                                       (equal (sqlite-pure::tok-value (aref toks (1+ k))) ".")
+                                       (tok= (+ k 2) col))
+                               return (sqlite-pure::tok-pos (aref toks k)))))))
+               (find-ident (name &optional before-paren (update-p (string-prefix-ci-p "UPDATE" (string-left-trim " " sql))))
                  (let ((toks (ignore-errors (sqlite-pure::tokenize sql))))
                    (when toks
                      (loop for k below (length toks)
@@ -631,7 +644,8 @@ sqlite3_prepare would take them one after another."
                  (let* ((name (subseq msg 16)) (dot (position #\. name :from-end t)))
                    (let ((pos (find-ident (if dot (subseq name (1+ dot)) name))))
                      (if (and pos dot)
-                         (or (find-ident (subseq name 0 dot)) pos)
+                         (or (find-qualified (subseq name 0 dot) (subseq name (1+ dot)))
+                             (find-ident (subseq name 0 dot)) pos)
                          pos))))
                 ((and (search " already exists" msg)
                       (some (lambda (k) (starts-with-p msg k)) '("table " "view " "trigger ")))
@@ -1875,6 +1889,7 @@ its phase prefix and context, as save_err_msg builds it)."
 
 (defun toplevel ()
   "Entry point for a saved image or a script: arguments from the command line."
+  (setf sqlite-pure::*where-trace* (sb-ext:posix-getenv "SQLP_WHERETRACE"))
   (let* ((argv sb-ext:*posix-argv*)
          (pos (position "--end-toplevel-options" argv :test #'string=))
          (name (or (sb-ext:posix-getenv "SQLP_ARGV0") (first argv) "sqlp"))

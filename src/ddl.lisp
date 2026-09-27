@@ -131,6 +131,7 @@ EndTable write it: a placeholder first, then the real record."
          (row (add-placeholder-schema-row)))
     (loop for u in (table-unique-constraints tb)
           for k from 1
+          unless (and (third u) (table-without-rowid tb))
           do (let ((iroot (create-btree *db* +leaf-index+)))
                (add-schema-row "index" (format nil "sqlite_autoindex_~a_~d" name k) name iroot nil)))
     (rewrite-placeholder row "table" name name root sql)

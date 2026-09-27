@@ -17,6 +17,23 @@ that way would produce the rows in ORDER BY order.")
 (defvar *order-satisfied* nil
   "Set by the planner when it adopted *ORDER-HINT*.")
 
+;;; the planner's (where.lisp) dynamic state
+(defvar *query-loop* 0
+  "Parse.nQueryLoop: the estimated number of times (LogEst) the code being
+compiled runs, raised by each loop while its body is compiled.")
+
+(defvar *plan-request* nil
+  "Set by the SELECT compiler for the FROM clause about to be planned:
+plist of :order-by (OBTERMs), :flags, :limit, :distinct-list.")
+
+(defvar *plan-result* nil "The WPLAN of the FROM clause just planned.")
+(defvar *fixed-cols* nil "Column nodes fixed to a constant by constant propagation (EP_FixedCol).")
+
+(defvar *avail-mask* nil
+  "While a loop's access path is planned: bitmask of the sources bound by
+the loops outside it (NIL: sources before it in FROM order).")
+
+
 
 (defstruct cte name columns sel (rows nil) (done nil) recursive-rows affinities env
   error                      ; the error a reference to it raises, if its definition is bad
@@ -108,7 +125,10 @@ columns are decoded; the others read as NULL."
   index-hint      ; NOT INDEXED -> :not; INDEXED BY i -> the INDEX
   vtab-args       ; t('query', ...) on an FTS5 table: the argument ASTs
   label           ; EXPLAIN QUERY PLAN: what a non-table source's loop is called
-  scan-index)     ; EQP: thunk -> the index (or :rowid) a full scan reads in order, if any
+  scan-index      ; EQP: thunk -> the index (or :rowid) a full scan reads in order, if any
+  row-est         ; a derived source's estimated row count (LogEst): its nSelectRow
+  correlated      ; a derived source that reads the enclosing query
+  recursive-ref)  ; a recursive CTE's reference to itself
 
 (defun make-table-src (table &optional alias)
   (let ((cols (table-columns table)))
@@ -145,6 +165,8 @@ columns are decoded; the others read as NULL."
            (src (derived-src alias names (mapcar #'second cols) (mapcar #'third cols)))
            (cache nil))
       (make-fsrc :src src
+                 :row-est *select-row-est*
+                 :correlated correlated
                  :rows-fn (lambda (env)
                             (if cache
                                 (cdr cache)
@@ -173,7 +195,13 @@ columns are decoded; the others read as NULL."
                 (compile-select (make-sel :cores (butlast (sel-cores sel)) :ops (butlast (sel-ops sel)))
                                 (make-scope)))
               (with-eqp-node ("RECURSIVE STEP")
-                (compile-select (make-sel :cores (last (sel-cores sel))) (make-scope))))
+                ;; compiled as the recursion compiles it: its self-reference
+                ;; is the one-row queue
+                (let ((saved (cte-done cte)))
+                  (setf (cte-done cte) :working)
+                  (unwind-protect
+                       (compile-select (make-sel :cores (last (sel-cores sel))) (make-scope))
+                    (setf (cte-done cte) saved)))))
             (compile-select (cte-sel cte) (make-scope)))))))
 
 (defun check-cte-shape (cte)
@@ -215,6 +243,8 @@ each other."
                            (make-list (length (cte-columns cte)) :initial-element :binary))))
     (make-fsrc :src src
                :label (or alias (cte-name cte))
+               ;; the recursive step's reference to its own CTE: one row at a time
+               :recursive-ref (eq (cte-done cte) :working)
                :rows-fn (lambda (env)
                           (declare (ignore env))
                           (case (cte-done cte)
@@ -407,7 +437,7 @@ source[LI].col = expr where expr references only earlier sources."
                     (:srccol (values 0 (second a*) (third a*))))
                 (when (and depth (= depth 0) (= si li))
                   (let ((refs (expr-refs b scope)))
-                    (when (or (and (listp refs) (every (lambda (r) (< r li)) refs))
+                    (when (or (and (listp refs) (refs-available-p refs li))
                               (uncorrelated-subquery-p b scope))
                       (push (list ci b (binary-collation a b scope) (second c)) out))))))))))))
 
@@ -433,7 +463,7 @@ be evaluated before any loop)?"
                      (let ((table (src-table (nth li (scope-srcs scope)))))
                        (when (and table (or (eq ci :rowid) (eql ci (table-rowid-alias table))))
                          (let ((refs (expr-refs b scope)))
-                           (when (and (listp refs) (every (lambda (r) (< r li)) refs))
+                           (when (and (listp refs) (refs-available-p refs li))
                              (push (list op b) out)))))))))
           (try (third c) (fourth c) (second c))
           (try (fourth c) (third c)
@@ -464,7 +494,7 @@ LI's loop: list of (column-index rhs x-ast)."
             (when (and depth (= depth 0) (= si li)
                        (case (car rhs)
                          (:list (every (lambda (e) (let ((r (expr-refs e scope)))
-                                                     (and (listp r) (every (lambda (k) (< k li)) r))))
+                                                     (and (listp r) (refs-available-p r li))))
                                        (second rhs)))
                          (:select t)))
               (push (list ci rhs x) out))))))))
@@ -582,7 +612,7 @@ known before the loop (a subquery correlated with anything)."
                                      (throw :index-done nil))
                                    (let ((row (cond (pk-index (table-record-to-row table nil vals))
                                                     ((table-without-rowid table)
-                                                     (fetch-wr-row table (last vals (length (table-pk table)))))
+                                                     (fetch-wr-row table (wr-entry-pk table idx vals)))
                                                     ((covering-p) (row-from-index table idx vals))
                                                     (t (fetch-row table (car (last vals)) (src-wanted src))))))
                                      (when row (funcall fn row))))
@@ -731,7 +761,7 @@ known before the loop (a subquery correlated with anything)."
                         (lambda (vals)
                           (let ((row (cond (pk-index (table-record-to-row table nil vals))
                                            ((table-without-rowid table)
-                                            (fetch-wr-row table (last vals (length (table-pk table)))))
+                                            (fetch-wr-row table (wr-entry-pk table idx vals)))
                                            ((covering-p) (row-from-index table idx vals))
                                            (t (fetch-row table (car (last vals)) (src-wanted src))))))
                             (when row (funcall fn row))))))))))
@@ -1117,71 +1147,14 @@ Return the per-source ON expressions."
                   on)))
 
 (defun build-levels (fsrcs scope where &optional (ons nil ons-p))
-  "Plan the nested loops.  Return (values levels final-filters)."
-  (let* ((n (length fsrcs))
-         (ons (if ons-p ons (apply-joins fsrcs scope)))
-         (where-conjs (split-conjuncts where))
-         (levels '())
-         (finals '()))
+  "Plan the nested loops (where.lisp).  Return (values levels final-filters)."
+  (let ((ons (if ons-p ons (apply-joins fsrcs scope))))
     ;; table-valued function arguments may name earlier FROM items
     (dolist (fs fsrcs)
       (when (fsrc-tvf fs)
         (destructuring-bind (builder . args) (fsrc-tvf fs)
           (setf (fsrc-rows-fn fs) (funcall builder (mapcar (lambda (a) (compile-expr a scope)) args))))))
-    ;; INNER/CROSS ON conditions behave as WHERE conjuncts, except that a
-    ;; RIGHT/FULL JOIN does not delay them (they belong to its left side)
-    (let ((inner-ons (loop for fs in fsrcs
-                           for on in ons
-                           unless (member (fsrc-join fs) '(:left :right :full))
-                             append (split-conjuncts on))))
-      (setf where-conjs (append (mapcar (lambda (c) (cons :where c)) where-conjs)
-                                (mapcar (lambda (c) (cons :on c)) inner-ons))))
-    (let ((placed (make-array (max n 1) :initial-element '()))
-          ;; WHERE applies to the joined row: never before a RIGHT/FULL JOIN
-          ;; has decided which of its rows matched
-          (floor-level (or (position-if (lambda (fs) (member (fsrc-join fs) '(:right :full)))
-                                        fsrcs :from-end t)
-                           0)))
-      (dolist (tagged where-conjs)
-        (destructuring-bind (kind . c) tagged
-          (if (zerop n)
-              (push c finals)
-              (push c (aref placed (max (if (eq kind :where) floor-level 0)
-                                        (max-ref (expr-refs c scope) n)))))))
-      (loop for fs in fsrcs
-            for on in ons
-            for i from 0
-            do (let* ((outer (member (fsrc-join fs) '(:left :right :full)))
-                      (left (member (fsrc-join fs) '(:left :full)))
-                      (right (member (fsrc-join fs) '(:right :full)))
-                      (match-asts (when outer (split-conjuncts on)))
-                      (filter-asts (reverse (aref placed i)))
-                      ;; conjuncts usable for choosing the access path: never
-                      ;; WHERE terms for the inner table of a LEFT JOIN
-                      (access-asts (cond (right nil) (left match-asts) (t filter-asts)))
-                      (iterate (if (fsrc-table fs)
-                                   (let ((*eqp-left* (and left t)))
-                                     (plan-table-access fs i access-asts scope))
-                                   (let ((rf (fsrc-rows-fn fs)))
-                                     (let ((*eqp-left* (and left t)))
-                                       (eqp-table-note (format nil "SCAN ~a" (or (fsrc-label fs)
-                                                                                 (src-name (fsrc-src fs))
-                                                                                 "(subquery)"))))
-                                     (lambda (env fn)
-                                       (let ((rows (funcall rf env)))
-                                         ;; a streaming source hands over a mapper
-                                         (if (functionp rows)
-                                             (funcall rows fn)
-                                             (dolist (row rows) (funcall fn row)))))))))
-                 (push (make-level :index i :fsrc fs :iterate iterate :left-p (and left t)
-                                   :right-p (and right t)
-                                   :match (mapcar (lambda (c) (compile-expr c scope)) match-asts)
-                                   :filters (mapcar (lambda (c) (compile-expr c scope)) filter-asts)
-                                   :nullrow (make-array (1+ (src-ncols (fsrc-src fs)))
-                                                        :initial-element :null))
-                       levels))))
-    (values (nreverse levels)
-            (mapcar (lambda (c) (compile-expr c scope)) finals))))
+    (plan-levels fsrcs scope where ons)))
 
 (defun all-true (fns env)
   (dolist (f fns t)
@@ -1266,13 +1239,252 @@ Return the per-source ON expressions."
           (unless (integerp n) (sql-error "datatype mismatch"))
           n))))
 
-(defun compile-core (core scope &key order limit offset limit-one)
+(defvar *select-row-est* 320 "nSelectRow of the SELECT core compiled last (LogEst).")
+
+(defun constant-limit (limit)
+  "The value of a LIMIT that is an integer literal, else NIL."
+  (and limit (integer-literal-value limit)))
+
+(defun obterm-for (e desc coll nulls scope n)
+  (multiple-value-bind (src col) (column-ref e scope)
+    (make-obterm :expr e :src src :col col
+                 :coll (if coll (collation-keyword coll) (or (expr-collation e scope) :binary))
+                 :desc (and desc t)
+                 :bignull (and nulls (if desc (eq nulls :first) (eq nulls :last)))
+                 :mask (expr-usage e scope n)
+                 :const (constant-expr-p e))))
+
+(defun constant-expr-p (e)
+  (labels ((walk (x)
+             (cond ((atom x) t)
+                   ((member (car x) '(:col :srccol :subquery :exists :fn :winfn :param :raise)) nil)
+                   ((and (eq (car x) :in) (eq (car (third x)) :select)) nil)
+                   (t (every #'walk (cdr x))))))
+    (walk e)))
+
+(defun plan-request (core rcols order group agg-p windowed limit scope n)
+  "What the planner is asked to deliver in order (sqlite3Select's calls to
+sqlite3WhereBegin).  Returns a plist: :plan (for *PLAN-REQUEST*),
+:order-kind, :order-by-group."
+  (let* ((distinct (select-core-distinct core))
+         (resolved-order (loop for (e desc coll nulls) in order for k from 1
+                               collect (let ((idx (order-term-column e rcols k)))
+                                         (list (if idx (first (nth idx rcols)) e) desc coll nulls))))
+         (lim (constant-limit limit))
+         (use-limit (and lim (>= lim 0) (< (log-est (max 1 lim)) 320)))
+         (limit-flags (if use-limit +wf-use-limit+ 0))
+         (limit-est (and use-limit (log-est (max 1 lim)))))
+    (flet ((obs (items) (mapcar (lambda (o) (destructuring-bind (e desc coll nulls) o
+                                              (obterm-for e desc coll nulls scope n)))
+                                items))
+           (same-list (a b) (and (= (length a) (length b))
+                                 (every (lambda (x y) (equal (first x) (first y))) a b))))
+      (cond
+        (windowed (list :plan nil))
+        ;; SELECT DISTINCT ... ORDER BY the same list: planned as a GROUP BY
+        ((and distinct (not agg-p) order
+              (same-list resolved-order (mapcar (lambda (rc) (list (first rc))) rcols))
+              ;; sqlite3ExprListCompare sees the sort flags too: all plain ASC
+              (every (lambda (o) (and (not (second o)) (not (eq (fourth o) :last)))) resolved-order))
+         (list :plan (list :order-by (obs resolved-order)
+                           :flags (logior +wf-distinctby+ +wf-sortbygroup+))
+               :order-kind :distinct-group :order-by-group t))
+        ((and agg-p group)
+         (let* ((gitems (loop for g in group
+                              for i from 0
+                              collect (let ((ge (resolve-group-term g rcols)))
+                                        ;; ASC/DESC follow the ORDER BY when the lists match in length
+                                        (list ge (and (= (length group) (length order))
+                                                      (second (nth i resolved-order)))
+                                              nil nil))))
+                (by-group (and order (same-list gitems resolved-order)
+                               (every (lambda (a b) (eq (and (second a) t) (and (second b) t))) gitems resolved-order))))
+           (list :plan (list :order-by (obs gitems)
+                             :flags (logior +wf-groupby+ (if by-group +wf-sortbygroup+ 0)))
+                 :order-kind :group :order-by-group by-group)))
+        (agg-p
+         ;; minMaxQuery: one aggregate, min(x) or max(x), no bare columns
+         (let ((mm (sqlite-minmax-arg core rcols order scope)))
+           (if mm
+               (destructuring-bind (arg kind) mm
+                 (list :plan (list :order-by (list (obterm-for arg (eq kind :max) nil
+                                                               (and (eq kind :min)
+                                                                    (expr-can-be-null-p arg scope)
+                                                                    :first)
+                                                               scope n))
+                                   :flags (if (eq kind :min) +wf-orderby-min+ +wf-orderby-max+))))
+               (list :plan nil))))
+        (t
+         (list :plan (list :order-by (and order (obs resolved-order))
+                           :flags (logior (if distinct +wf-want-distinct+ 0) limit-flags)
+                           :limit limit-est
+                           :distinct-list (and distinct (obs (mapcar (lambda (rc) (list (first rc) nil nil nil)) rcols)))
+                           ;; the sources the result set and ORDER BY read, for
+                           ;; whereOmitNoopJoin (only this WhereBegin has a result set)
+                           :noop-used (let ((*fixed-cols* nil))
+                                        (reduce #'logior
+                                                (mapcar (lambda (e) (expr-usage e scope n))
+                                                        (append (mapcar #'first rcols)
+                                                                (mapcar #'first resolved-order)))
+                                                :initial-value 0)))
+               :order-kind (and order :order)))))))
+
+(defun implies-non-null-row-p (e si scope)
+  "sqlite3ExprImpliesNonNullRow: can E be true only if some column of
+source SI is not NULL?"
+  (labels ((skip (x)
+             (loop (cond ((and (consp x) (eq (car x) :collate)) (setf x (second x)))
+                         ((and (consp x) (likelihood-wrapper x)) (setf x (likelihood-wrapper x)))
+                         (t (return x)))))
+           (vtab-col-p (x)
+             (let ((x (skip-collate x)))
+               (and (member (car x) '(:col :srccol))
+                    (multiple-value-bind (s) (column-ref x scope)
+                      (and s (let ((tb (src-table (nth s (scope-srcs scope)))))
+                               (and tb (table-vtab tb))))))))
+           (walk (x)
+             (when (consp x)
+               (case (car x)
+                 ((:col :srccol) (multiple-value-bind (s) (column-ref x scope) (eql s si)))
+                 ((:isnull :in :case :fn :winfn :rowvalue :like :subquery :exists :lit :param :raise) nil)
+                 (:between (walk (second x)))
+                 (:binary
+                  (case (second x)
+                    ((:is :isnot :or) nil)
+                    (:and (and (walk (third x)) (walk (fourth x))))
+                    ((:eq :ne :lt :le :gt :ge)
+                     (unless (or (vtab-col-p (third x)) (vtab-col-p (fourth x)))
+                       (or (walk (third x)) (walk (fourth x)))))
+                    (t (or (walk (third x)) (walk (fourth x))))))
+                 (:unary (walk (third x)))
+                 ((:cast :collate) (walk (second x)))
+                 (t (some #'walk (cdr x))))))
+           (top (x)
+             (let ((x (skip x)))
+               (cond ((null x) nil)
+                     ((and (eq (car x) :isnull) (third x)) (walk (second x)))
+                     ((and (eq (car x) :binary) (eq (second x) :isnot) (null-literal-p (fourth x)))
+                      (walk (third x)))
+                     (t (loop while (and (eq (car x) :binary) (eq (second x) :and))
+                              do (when (top (third x)) (return-from top t))
+                                 (setf x (skip (fourth x))))
+                        (walk x))))))
+    (top e)))
+
+(defun simplify-outer-joins (fsrcs where ons scope)
+  "sqlite3Select's LEFT JOIN simplification: when the WHERE clause (with
+the inner joins' ON clauses) cannot be true for the NULL row of a LEFT
+JOIN's right table, the join is an inner join; a FULL JOIN becomes a
+RIGHT JOIN."
+  (let ((cond where))
+    (loop for fs in fsrcs for on in ons
+          do (when (and on (not (member (fsrc-join fs) '(:left :right :full))))
+               (setf cond (if cond (list :binary :and cond on) on))))
+    (loop for fs in fsrcs for i from 0
+          do (when (and (member (fsrc-join fs) '(:left :full))
+                        (implies-non-null-row-p cond i scope))
+               (setf (fsrc-join fs) (if (eq (fsrc-join fs) :full) :right :inner))))))
+
+(defun expr-can-be-null-p (e scope)
+  "sqlite3ExprCanBeNull, for a column: NULL unless declared NOT NULL (or the rowid)."
+  (multiple-value-bind (si ci) (column-ref e scope)
+    (if si
+        (column-can-be-null-p si ci scope)
+        (not (and (eq (car e) :lit) (not (eq (second e) :null)))))))
+
+(defun fold-null-tests (e fsrcs scope)
+  "The resolver's rewrite: x IS NULL / x IS NOT NULL on an operand that
+cannot be NULL (sqlite3ExprCanBeNull, with EP_CanBeNull for the columns
+of a table an outer join can make NULL, as the joins stand before they are
+simplified) is the constant FALSE / TRUE, reading no column."
+  (labels ((nullable-src-p (si)
+             (let ((fs (nth si fsrcs)))
+               (or (member (fsrc-join fs) '(:left :full))
+                   (some (lambda (g) (member (fsrc-join g) '(:right :full)))
+                         (nthcdr (1+ si) fsrcs)))))
+           (can-be-null-p (x)
+             (loop while (and (eq (car x) :unary) (member (second x) '(:pos :neg)))
+                   do (setf x (third x)))
+             (case (car x)
+               (:lit (eq (second x) :null))
+               ((:col :srccol)
+                (multiple-value-bind (si ci) (column-ref x scope)
+                  (or (null si) (nullable-src-p si) (column-can-be-null-p si ci scope))))
+               (t t)))
+           (walk (x)
+             (cond ((atom x) x)
+                   ((member (car x) '(:subquery :exists :select)) x)
+                   ((and (eq (car x) :isnull) (consp (second x))
+                         (member (car (skip-unary (second x))) '(:lit :col :srccol))
+                         (not (can-be-null-p (second x))))
+                    (list :lit (if (third x) 1 0)))
+                   ;; x IS [NOT] NULL (binaryToUnaryIfNull)
+                   ((and (eq (car x) :binary) (member (second x) '(:is :isnot))
+                         (null-literal-p (fourth x)) (consp (third x))
+                         (member (car (skip-unary (third x))) '(:lit :col :srccol))
+                         (not (can-be-null-p (third x))))
+                    (list :lit (if (eq (second x) :isnot) 1 0)))
+                   (t (let ((new (mapcar #'walk x)))
+                        (if (every #'eq new x) x new))))))
+    (walk e)))
+
+(defun skip-unary (x)
+  (loop while (and (consp x) (eq (car x) :unary) (member (second x) '(:pos :neg)))
+        do (setf x (third x)))
+  x)
+
+(defun sqlite-minmax-arg (core rcols order scope)
+  "(arg :min|:max) when minMaxQuery applies: no GROUP BY or HAVING, and the
+query's only aggregate (identical calls counting once) is min() or max() of
+one argument."
+  (declare (ignore scope))
+  (unless (or (select-core-group core) (select-core-having core))
+    (let ((calls '()))
+      (labels ((walk (x)
+                 (when (consp x)
+                   (case (car x)
+                     ((:subquery :exists) nil)
+                     (:fn (if (aggregate-call-p x) (pushnew x calls :test #'equal) (mapc #'walk (cdr x))))
+                     (:winfn (push x calls))
+                     (t (mapc #'walk (cdr x)))))))
+        (mapc (lambda (rc) (walk (first rc))) rcols)
+        (mapc (lambda (o) (walk (first o))) order))
+      (let ((c (and calls (null (cdr calls)) (first calls))))
+        (when (and c (eq (car c) :fn)
+                   (member (string-downcase-ascii (second c)) '("min" "max") :test #'string=)
+                   (= (length (third c)) 1))
+          (list (first (third c)) (if (string-equal (second c) "min") :min :max)))))))
+
+(defun mark-columns-used (core rcols ons group having order scope)
+  "Compile every expression of the core once, discarding the result, so
+each source knows the columns the query reads (SrcItem.colUsed) before
+its loops are planned."
+  (let ((dry (copy-scope scope)) (*eqp* nil))
+    (setf (scope-aggs dry) (make-array 0 :adjustable t :fill-pointer t)
+          (scope-agg-p dry) t
+          (scope-windows dry) (make-array 0 :adjustable t :fill-pointer t)
+          (scope-window-defs dry) (select-core-windows core))
+    (dolist (e (append (mapcar #'first rcols)
+                       (list (select-core-where core) having)
+                       ons
+                       (mapcar (lambda (g) (ignore-errors (resolve-group-term g rcols))) group)
+                       (loop for (e) in order unless (int32-literal-p e) collect e)))
+      (when e (ignore-errors (compile-expr e dry))))))
+
+(defun compile-core (core scope &rest keys &key order limit offset limit-one)
+  "Compile one SELECT core (see COMPILE-CORE-1); the loops it plans raise
+the estimated repetition count (nQueryLoop) only for what they contain."
+  (declare (ignore order limit offset limit-one))
+  (let ((*query-loop* *query-loop*))
+    (apply #'compile-core-1 core scope keys)))
+
+(defun compile-core-1 (core scope &key order limit offset limit-one)
   "Compile one SELECT core.  Return (values fn columns) where columns is a
 list of (name affinity collation), fn (lambda (parent-env)) -> rows."
   (when (and (consp core) (eq (car core) :values))
-    (return-from compile-core (compile-values-core (second core) scope order limit offset)))
+    (return-from compile-core-1 (compile-values-core (second core) scope order limit offset)))
   (let ((fast (multiple-value-list (count-star-fast-path core order limit offset))))
-    (when (first fast) (return-from compile-core (values-list fast))))
+    (when (first fast) (return-from compile-core-1 (values-list fast))))
   (let* ((fsrcs (let ((items (select-core-from core)))
                   (loop for item in items
                         for i from 0
@@ -1284,7 +1496,18 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                                   (make-fsrc-for item scope)))))
          (_0 (unless fsrcs (eqp-note "SCAN CONSTANT ROW")))
          (cscope (make-scope :srcs (mapcar #'fsrc-src fsrcs) :parent scope))
-         (ons (apply-joins fsrcs cscope))
+         (raw-ons (apply-joins fsrcs cscope))
+         ;; as resolved, before x IS NULL folds: the columns stay in colUsed
+         (raw-where (select-core-where core))
+         (ons (let ((ons (mapcar (lambda (on) (and on (fold-null-tests on fsrcs cscope)))
+                                 raw-ons)))
+                (when (select-core-where core)
+                  (let ((w (fold-null-tests (select-core-where core) fsrcs cscope)))
+                    (unless (eq w (select-core-where core))
+                      (setf core (copy-select-core core)
+                            (select-core-where core) w))))
+                (simplify-outer-joins fsrcs (select-core-where core) ons cscope)
+                ons))
          (rcols (expand-result-columns core cscope))
          (_ (setf (scope-aliases cscope)
                   (loop for c in (select-core-cols core)
@@ -1298,15 +1521,40 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
     (declare (ignore _ _0))
     (when (and having (not group) (not agg-p))
       (sql-error "a GROUP BY clause is required before HAVING"))
-    (multiple-value-bind (levels finals order-done)
-        (let ((*order-hint* (and (not agg-p) (not (select-core-distinct core))
-                                 (not (select-core-windows core))
-                                 (notany (lambda (rc) (contains-window-p (first rc))) rcols)
-                                 (compute-order-hint order rcols cscope fsrcs)))
-              (*minmax-hint* (and agg-p (minmax-candidate core rcols having order cscope fsrcs)))
-              (*order-satisfied* nil))
-          (multiple-value-bind (l f) (build-levels fsrcs cscope (select-core-where core) ons)
-            (values l f *order-satisfied*)))
+    (multiple-value-bind (levels finals order-done plan-info)
+        (let* ((windowed (or (select-core-windows core)
+                             (some (lambda (rc) (contains-window-p (first rc))) rcols)))
+               (*order-hint* (and (not agg-p) (not (select-core-distinct core)) (not windowed)
+                                  (compute-order-hint order rcols cscope fsrcs)))
+               (*minmax-hint* (and agg-p (minmax-candidate core rcols having order cscope fsrcs)))
+               (*order-satisfied* nil)
+               (req (plan-request core rcols order group agg-p windowed limit cscope (length fsrcs))))
+          (mark-columns-used core rcols (cons raw-where raw-ons) group having order cscope)
+          (let ((*plan-request* (getf req :plan)) (*plan-result* nil)
+                (*fixed-cols* (propagate-constants
+                               (cons (select-core-where core)
+                                     ;; ON clauses of inner joins (none at all with a RIGHT JOIN)
+                                     (unless (some (lambda (fs) (member (fsrc-join fs) '(:right :full))) fsrcs)
+                                       (loop for fs in fsrcs for on in ons
+                                             when (and on (not (member (fsrc-join fs) '(:left :right :full))))
+                                               collect on)))
+                               cscope)))
+            (multiple-value-bind (l f) (build-levels fsrcs cscope (select-core-where core) ons)
+              (let* ((plan *plan-result*)
+                     (sat (if plan (plan-n-ob-sat plan) 0)))
+                (when plan (incf *query-loop* (plan-n-row plan)))
+                (values l f
+                        (or *order-satisfied*
+                            (and (getf req :order-kind) (eq (getf req :order-kind) :order)
+                                 order (= sat (length order))))
+                        (list :plan plan :req req :sat sat))))))
+      (setf *select-row-est*
+            (let* ((plan (getf plan-info :plan))
+                   (start (let ((n (constant-limit limit))) (if (and n (>= n 0)) (min 320 (log-est (max 1 n))) 320))))
+              (cond ((and agg-p (null group)) 0)
+                    (group (min start 66))
+                    (plan (min start (plan-n-row plan)))
+                    (t start))))
       (let* ((nsrc (length fsrcs))
              (columns (loop for (e name) in rcols
                             collect (list name (expr-affinity e cscope)
@@ -1332,23 +1580,30 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
              (wins (scope-windows cscope)))
         (declare (ignore _2))
         (when *eqp*
-          (when group
-            (eqp-note (lambda ()
-                        (unless (eqp-scan-order-p fsrcs (mapcar (lambda (g) (resolve-group-term g rcols)) group)
-                                                  cscope)
-                          "USE TEMP B-TREE FOR GROUP BY"))
-                      +eqp-group+))
-          (when distinct
-            (eqp-note (lambda ()
-                        (unless (eqp-scan-order-p fsrcs (mapcar #'first rcols) cscope :any-order t)
-                          "USE TEMP B-TREE FOR DISTINCT"))
-                      +eqp-distinct+))
-          (when (and order-specs (not order-done)
-                     ;; SELECT DISTINCT x ORDER BY x: SQLite turns it into a GROUP BY
-                     (not (and distinct (not agg-p) (= (length order) (length rcols))
-                               (loop for (e) in order for rc in rcols for spec in order-specs for i from 0
-                                     always (or (eql (first spec) i) (equal e (first rc)))))))
-            (eqp-note "USE TEMP B-TREE FOR ORDER BY" +eqp-order+)))
+          (let* ((req (getf plan-info :req))
+                 (plan (getf plan-info :plan))
+                 (sat (getf plan-info :sat))
+                 (kind (getf req :order-kind)))
+            (case kind
+              (:group
+               (unless (= sat (length group))
+                 (eqp-note "USE TEMP B-TREE FOR GROUP BY" +eqp-group+)))
+              (:distinct-group
+               (unless (= sat (length rcols))
+                 (eqp-note "USE TEMP B-TREE FOR DISTINCT" +eqp-distinct+))))
+            (when (and distinct (not (eq kind :distinct-group)) plan
+                       (not (member (plan-distinct plan) '(:unique :ordered))))
+              (eqp-note "USE TEMP B-TREE FOR DISTINCT" +eqp-distinct+))
+            (when (and order-specs (not order-done)
+                       ;; ORDER BY = GROUP BY: satisfied when the grouping
+                       ;; sorted, or the loops deliver the groups sorted
+                       (not (and (getf req :order-by-group)
+                                 (or (< sat (if (eq kind :group) (length group) (length rcols)))
+                                     (and plan (plan-sorted plan))))))
+              (eqp-note (if (and (eq kind :order) (plusp sat))
+                            "USE TEMP B-TREE FOR RIGHT PART OF ORDER BY"
+                            "USE TEMP B-TREE FOR ORDER BY")
+                        +eqp-order+))))
         (values
          (lambda (parent-env)
            (let* ((env (make-env :rows (make-array nsrc) :parent parent-env))
@@ -1406,7 +1661,16 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                      (run-levels levels env
                                  (lambda () (when (all-true finals env) (output env))))
                      (let ((groups (make-hash-table :test #'equal))
-                           (order-of-groups '()))
+                           (order-of-groups '())
+                           ;; minMaxQuery with the rows delivered in min()/max()
+                           ;; order: the first row with a value decides it
+                           ;; (sqlite3WhereMinMaxOptEarlyOut)
+                           (early-out (let ((plan (getf plan-info :plan))
+                                            (flags (or (getf (getf (getf plan-info :req) :plan) :flags) 0)))
+                                        (and plan (null group)
+                                             (logtest flags (logior +wf-orderby-min+ +wf-orderby-max+))
+                                             (plusp (getf plan-info :sat))))))
+                       (catch :minmax-done
                        (run-levels
                         levels env
                         (lambda ()
@@ -1424,7 +1688,8 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                                 ;; bare columns come from the group's first row,
                                 ;; or from the row that set a lone min()/max()
                                 (when (and rep-changed (single-minmax-p aggs))
-                                  (replace (car g) (env-rows env))))))))
+                                  (replace (car g) (env-rows env))
+                                  (when early-out (throw :minmax-done nil)))))))))
                        (when (and (null group) (zerop (hash-table-count groups)))
                          (setf (gethash nil groups)
                                (cons (coerce (loop for fs in fsrcs
@@ -1433,9 +1698,11 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                                              'vector)
                                      (mapcar #'agg-instantiate aggs))
                                order-of-groups (list nil)))
-                       ;; SQLite emits groups in GROUP BY key order
+                       ;; SQLite emits groups in GROUP BY key order: the order
+                       ;; the loops deliver them in when that satisfies the
+                       ;; GROUP BY (a DESC index gives them descending), else sorted
                        (let ((keys (reverse order-of-groups)))
-                         (when group
+                         (when (and group (< (getf plan-info :sat) (length group)))
                            (setf keys (mapcar #'cdr
                                               (sort-rows (mapcar (lambda (k) (cons (group-sort-key (gethash k groups) group-fns env) k)) keys)
                                                          (mapcar (lambda (c) (list nil c nil)) group-colls)))))

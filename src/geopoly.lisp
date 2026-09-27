@@ -484,7 +484,7 @@ Returns the new rowid, T, or :IGNORE."
                 (:srccol (values 0 (second a) (third a))))
             (when (and depth (= depth 0) (= si li) (eql ci 0))
               (let ((refs (expr-refs b scope)))
-                (when (and (listp refs) (every (lambda (r) (< r li)) refs))
+                (when (and (listp refs) (refs-available-p refs li))
                   (setf found (if (string-equal (second c) "geopoly_overlap") 2 3) arg b))))))))
     (values found arg)))
 

@@ -46,6 +46,16 @@
                                 collect (svref row ci))))
           (t (append vals (list rowid))))))
 
+(defun wr-entry-pk (table index vals)
+  "The primary key of the WITHOUT ROWID row an entry VALS of the secondary
+INDEX belongs to: a key column the index already holds is not repeated
+after its own columns (see INDEX-KEY)."
+  (let* ((key-cols (mapcar #'first (index-columns index)))
+         (k (length key-cols)))
+    (loop for ci in (table-pk table)
+          collect (let ((i (position ci key-cols)))
+                    (if i (nth i vals) (prog1 (nth k vals) (incf k)))))))
+
 (defun index-full-cmp (table index)
   "Comparator for whole entries of INDEX."
   (let* ((colls (index-collations index))
@@ -108,14 +118,20 @@ column may use one declared after it)."
 ;;; ------------------------------------------------------------------
 ;;; Low-level row writes (no constraint checks)
 
+(defun autoindex-number (idx)
+  (let ((p (position #\_ (index-name idx) :from-end t)))
+    (or (and p (parse-integer (index-name idx) :start (1+ p) :junk-allowed t)) 0)))
+
 (defun sqlite-index-list (table)
   "TABLE's indexes in the order SQLite keeps them (Table.pIndex): each new
 index goes to the front, and those with ON CONFLICT REPLACE are moved to
 the back.  Index maintenance and constraint checks run in this order."
-  (let* ((pk (find-if #'index-pk-index (table-indexes table)))
-         ;; creation order: a WITHOUT ROWID table's key index is made while
-         ;; its CREATE TABLE is parsed, before any CREATE INDEX
-         (created (append (and pk (list pk)) (remove pk (table-indexes table))))
+  (let* (;; creation order: the constraint indexes (a WITHOUT ROWID table's
+         ;; key among them) in their sqlite_autoindex_<table>_<N> order, while
+         ;; its CREATE TABLE is parsed, then each CREATE INDEX
+         (autos (stable-sort (remove-if-not #'index-auto (table-indexes table)) #'<
+                             :key #'autoindex-number))
+         (created (append autos (remove-if #'index-auto (table-indexes table))))
          (l (reverse created)))
     (flet ((conflict (i) (if (index-pk-index i) (table-pk-conflict table) (index-conflict i))))
       (append (remove :replace l :key #'conflict)
@@ -205,7 +221,7 @@ iIdxNoSeek), whose entry goes after the row."
                      (unless (zerop (funcall cmp vals key)) (throw :probe-done nil))
                      (let ((other (cond ((index-pk-index index) (table-record-to-row table nil vals))
                                         ((table-without-rowid table)
-                                         (fetch-wr-row table (last vals (length (table-pk table)))))
+                                         (fetch-wr-row table (wr-entry-pk table index vals)))
                                         (t (fetch-row table (car (last vals)))))))
                        (when (and other (not (same-row-p table other row)))
                          (push other hits))))

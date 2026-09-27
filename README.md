@@ -221,14 +221,19 @@ json_array json_object json_extract -> ->> json_type json_array_length
 json_set json_insert json_replace json_remove json_patch json_group_array
 json_group_object json_each json_tree`.
 
-**Query planning.** Each join level uses a rowid lookup, a rowid range, an
-index prefix seek (covering when the index holds every column read), an
-`IN (...)` probe of the rowid or an index, or a scan, chosen from the
-`WHERE`/`ON` terms with SQLite's rules for when an index may be used under
-affinity and collation; a lone `min()`/`max()` reads one end of an index or
-of the rowid order; `count(*)` counts the smallest index; `INDEXED BY` and
-`NOT INDEXED` are honoured. Joins run in `FROM` order (SQLite may reorder
-them).
+**Query planning.** A port of SQLite 3.40's query planner (`where.c`): the
+WHERE/ON terms are analyzed as SQLite analyzes them (commuted copies,
+`BETWEEN` and `IS NOT NULL` children, transitive `col = col` equivalences,
+constant propagation, `LEFT JOIN` simplification, no-op `LEFT JOIN`
+removal), every candidate loop — full scans, covering-index scans, rowid
+and index lookups with `=`, `IN`, range and `IS NULL` constraints, automatic
+(and partial automatic) indexes — is costed with SQLite's formulas, and the
+path solver picks the join order and one loop per table, counting the cost
+of any sort an `ORDER BY`, `GROUP BY` or `DISTINCT` would need. A lone
+`min()`/`max()` reads one end of an index; `count(*)` counts the smallest
+index; `INDEXED BY` and `NOT INDEXED` are honoured. A differential fuzzer
+(`test/planfuzz.py`) compares plans and rows with sqlite3 over random
+schemas, data and joins.
 `ORDER BY` is satisfied from rowid or index order where possible (in either
 direction, stopping early for `LIMIT`); otherwise `ORDER BY … LIMIT` keeps
 only the best rows. Only referenced columns are decoded; `count(*)` comes
@@ -338,18 +343,18 @@ SQLite numbers them), compound parts, `SCAN n CONSTANT ROWS`, R-tree and
 table-valued `VIRTUAL TABLE INDEX` lines, and the `USE TEMP B-TREE FOR
 GROUP BY / DISTINCT / ORDER BY` steps. Where the two planners choose alike
 (most single-table and `FROM`-ordered queries) the output is identical;
-where they differ (join order, automatic indexes, subquery flattening) it
-describes what this library does. Plain `EXPLAIN` (VDBE bytecode) has no
+where they differ (subquery flattening, the `OR` multi-index optimization,
+`LIKE` prefixes, `sqlite_stat1` statistics) it describes what this library
+does. Plain `EXPLAIN` (VDBE bytecode) has no
 equivalent here.
 
 ## Not implemented
 
 R-tree `MATCH` geometry callbacks, the ICU tokenizer, FTS5's
 `*`-prefixed diagnostic queries, plain `EXPLAIN` (bytecode listings),
-`ANALYZE` (accepted, writes no `sqlite_stat1`), join reordering and
-automatic indexes — joins run in FROM order, so a many-way join SQLite
-reorders into index lookups can be very slow here (sqllogictest's
-`select5.test`).  `fsync` and file locks need SBCL (elsewhere
+`ANALYZE` (accepted, writes no `sqlite_stat1`), and in the planner:
+subquery flattening, the `OR` (multi-index) and `LIKE` optimizations,
+skip-scans and Bloom filters.  `fsync` and file locks need SBCL (elsewhere
 `finish-output` is the barrier and locks are no-ops, with cache
 validation still applied).
 
@@ -367,6 +372,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 |---|---|
 | `test/run-tests.sh` (also `(asdf:test-system "sqlite-pure")`) | the Lisp API tests (`test/api.lisp`), and the **differential suite**: `test/cases/*.test` are SQL scripts; `test/gen-expected.py` records SQLite's rows or error for every statement; each is replayed here and compared, error messages included |
 | `test/run-qfuzz.sh FIRST N Q` | **query fuzzer**: random expressions, joins, subqueries, compounds, windows and CTEs over random mixed-type data, compared statement by statement |
+| `python3 test/planfuzz.py SQLITE3 bin/sqlp FIRST N [Q]` | **planner fuzzer**: random schemas (indexes, WITHOUT ROWID, INTEGER PRIMARY KEY), data and joins; `EXPLAIN QUERY PLAN` output and rows (in order) must match sqlite3. `PLANFUZZ_NO_SUBQ=1` / `PLANFUZZ_NO_OR=1` leave out FROM-subqueries and `OR` terms |
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
@@ -388,9 +394,8 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-shell.sh [CASE…]` | `bin/sqlp` against SQLite's `sqlite3` shell (built by `test/build-oracle.sh`): every script in `test/shell/*.case` must give identical stdout, stderr and exit status. The scripts cover every output mode, the dot-commands, `.dump`, `.import`, error reports, statement completion, interactive prompts and the command-line options |
 
 Current results (SQLite 3.40.1 as reference): **sqllogictest** — every
-record of 621 of the 622 files passes (5.94 M records; two records listed as
-3.40-versus-corpus differences); `select5.test`, 18-way joins, does not
-finish (see Not implemented).  **SQLite's TCL suite** — of the 628 files
+record of all 622 files passes (two records listed as 3.40-versus-corpus
+differences), `select5.test`'s 18-way joins included.  **SQLite's TCL suite** — of the 628 files
 that use no testfixture-only C hooks, 144 880 of 156 948 tests pass (92.3%);
 over all 1042 files that run to the end, 188 220 of 215 098.
 
@@ -409,7 +414,8 @@ src/
   lexer, parser        SQL -> AST
   schema     sqlite_schema -> tables, columns, indexes, foreign keys, triggers
   expr       expression compiler (closures)
-  select     query engine: sources, joins, planning, aggregates, sorting, compounds, CTEs
+  select     query engine: sources, joins, aggregates, sorting, compounds, CTEs
+  where      the query planner (a port of SQLite's where.c) and the loops it runs
   window     window functions
   functions, printf, math, datetime, json    built-in functions
   triggers   trigger execution

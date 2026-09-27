@@ -188,10 +188,15 @@
       (let ((seen '()))
         (dolist (u (nreverse uniques))
           (destructuring-bind (kind cols conflict) u
-            (unless (or (and (eq kind :pk) (or (table-rowid-alias tb) without-rowid))
-                        (member cols seen :test #'equal))
-              (push cols seen)
-              (push (list cols conflict (eq kind :pk)) (table-unique-constraints tb)))))
+            ;; a WITHOUT ROWID key has no b-tree of its own but takes its
+            ;; place in the sqlite_autoindex_<table>_<N> numbering; a UNIQUE
+            ;; on the same columns declared earlier becomes the key
+            (cond ((and (eq kind :pk) (table-rowid-alias tb)))
+                  ((member cols seen :test #'equal)
+                   (when (and (eq kind :pk) without-rowid)
+                     (setf (third (find cols (table-unique-constraints tb) :key #'first :test #'equal)) t)))
+                  (t (push cols seen)
+                     (push (list cols conflict (eq kind :pk)) (table-unique-constraints tb))))))
         (setf (table-unique-constraints tb) (nreverse (table-unique-constraints tb))))
       (when without-rowid
         ;; NOT NULL is implied for WITHOUT ROWID primary keys
@@ -274,7 +279,8 @@
     (maphash (lambda (k tb) (declare (ignore k))
                (when (table-without-rowid tb)
                  (setf (table-indexes tb)
-                       (cons (make-index :name (format nil "sqlite_autoindex_~a_pk" (table-name tb))
+                       (cons (make-index :name (format nil "sqlite_autoindex_~a_~d" (table-name tb)
+                                                       (1+ (position-if #'third (table-unique-constraints tb))))
                                          :table (table-name tb) :root (table-root tb)
                                          :unique t :auto t :pk-index t
                                          :conflict (table-pk-conflict tb)
@@ -289,7 +295,7 @@
          (n (and (> (length name) (length prefix))
                  (parse-integer name :start (length prefix) :junk-allowed t)))
          (u (and n (nth (1- n) (table-unique-constraints table)))))
-    (when u
+    (when (and u (not (and (third u) (table-without-rowid table))))
       (destructuring-bind (cols conflict pk) u
         (declare (ignore pk))
         (make-index :name name :table (table-name table) :root root :unique t :auto t

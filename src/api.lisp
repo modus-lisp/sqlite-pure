@@ -631,10 +631,11 @@ non-local exit.  Nested uses become savepoints."
     (if (null tb)
         (values nil nil)
         (values
-         (loop for idx in (reverse (remove-if #'index-pk-index (table-indexes tb)))
+         (loop for idx in (sqlite-index-list tb)
                for seq from 0
                collect (list seq (index-name idx) (if (index-unique idx) 1 0)
-                             (cond ((not (index-auto idx)) "c")
+                             (cond ((index-pk-index idx) "pk")
+                                   ((not (index-auto idx)) "c")
                                    ((let ((u (find (mapcar (lambda (c) (list (first c) (second c) (third c)))
                                                            (index-columns idx))
                                                    (table-unique-constraints tb) :key #'first :test #'equal)))

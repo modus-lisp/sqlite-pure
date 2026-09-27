@@ -872,7 +872,7 @@ Returns T, or :IGNORE if a constraint skipped the row."
                        (:srccol (values 0 (second a) (third a))))
                    (when (and depth (= depth 0) (= si li))
                      (let ((refs (expr-refs b scope)))
-                       (when (and (listp refs) (every (lambda (r) (< r li)) refs))
+                       (when (and (listp refs) (refs-available-p refs li))
                          (push (list (if (eq ci :rowid) 0 ci) op b) out)))))))
           (try (third c) (fourth c) (second c))
           (try (fourth c) (third c)
