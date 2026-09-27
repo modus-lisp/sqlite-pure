@@ -108,10 +108,10 @@ SQLite's last connection does.
 cross, `USING`, `NATURAL`), `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY` (`NULLS
 FIRST/LAST`, `COLLATE`)/`LIMIT`/`OFFSET`, `DISTINCT`, aggregates (with
 `DISTINCT` and `FILTER`), **window functions** (`OVER`, `PARTITION BY`,
-`ROWS`/`RANGE`/`GROUPS` frames, named windows), subqueries (scalar, `IN`,
+`ROWS`/`RANGE`/`GROUPS` frames, `EXCLUDE`, named windows), subqueries (scalar, `IN`,
 `EXISTS`, correlated, in `FROM`), `UNION [ALL]`/`INTERSECT`/`EXCEPT`,
 `VALUES`, CTEs including `WITH RECURSIVE`, views, row values, table-valued
-`json_each`/`json_tree` (with lateral references).
+`json_each`/`json_tree` and `pragma_table_info(…)` & co. (with lateral references).
 `INSERT` (`VALUES`, `SELECT`, `DEFAULT VALUES`, `OR REPLACE/IGNORE/ABORT/
 FAIL/ROLLBACK`, upsert `ON CONFLICT … DO UPDATE/NOTHING`, `RETURNING`),
 `UPDATE` (including `UPDATE … FROM`), `DELETE`.
@@ -120,7 +120,7 @@ FAIL/ROLLBACK`, upsert `ON CONFLICT … DO UPDATE/NOTHING`, `RETURNING`),
 **foreign keys** with `ON DELETE/UPDATE` actions and deferred checking),
 `CREATE TABLE … AS`, indexes (unique, multi-column, `DESC`, collations,
 partial, on expressions), views, **triggers** (`BEFORE`/`AFTER`/`INSTEAD
-OF`, `WHEN`, `RAISE`), `ALTER TABLE` (rename table, rename/add/drop column),
+OF`, `WHEN`, `RAISE`, `PRAGMA recursive_triggers`), `ALTER TABLE` (rename table, rename/add/drop column),
 `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`, **`TEMP`
 tables and `ATTACH`/`DETACH`**, `VACUUM` and `VACUUM INTO`, and the common
 `PRAGMA`s (`table_info`, `table_xinfo`, `index_list`, `index_info`,
@@ -154,9 +154,8 @@ plan can only narrow the candidate rows, never change the answer.
 
 ## Not implemented
 
-Virtual tables (FTS, R-tree, `pragma_*` table-valued functions), writing to
-a WAL database while SQLite connections are attached to it, window `EXCLUDE`
-clauses, `ORDER BY` inside aggregate calls, recursive triggers, `EXPLAIN`. Durability depends on the Lisp's
+Virtual tables (FTS, R-tree), writing to
+a WAL database while SQLite connections are attached to it, `EXPLAIN`. Durability depends on the Lisp's
 `finish-output`; there is no portable `fsync`. File locks need SBCL
 (elsewhere they are no-ops, and cache validation still applies).
 

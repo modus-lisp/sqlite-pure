@@ -3,13 +3,25 @@
 ;;;;
 ;;;; A trigger body runs with NEW and OLD as an enclosing scope, so every
 ;;;; statement compiled inside it can say NEW.x; the columns are hidden from
-;;;; unqualified lookup, as in SQLite.  Triggers fire newest first, and (as
-;;;; with recursive_triggers off) a trigger never re-fires itself.
+;;;; unqualified lookup, as in SQLite.  Triggers fire newest first.  With
+;;;; recursive_triggers off a trigger never re-fires itself; with it on,
+;;;; recursion is bounded at SQLite's default depth of 1000.
 
 (in-package #:sqlite-pure)
 
 (defvar *outer-scope* nil "Scope enclosing top-level statement compilation (NEW/OLD in triggers).")
 (defvar *outer-env* nil "Environment matching *OUTER-SCOPE*.")
+
+(defconstant +max-trigger-depth+ 1000)
+
+(defun replace-delete (table row)
+  "Delete ROW to make way for a REPLACE; with recursive_triggers on, as a
+DELETE that fires the table's delete triggers."
+  (let ((rec (and (db-recursive-triggers (conn *db*)) (table-has-triggers-p table))))
+    (unless (and rec (eq :ignore (fire-triggers table :delete :before row nil)))
+      (fk-parent-delete table row)
+      (delete-row table row)
+      (when rec (fire-triggers table :delete :after row nil)))))
 
 (defun root-scope () (or *outer-scope* (make-scope)))
 
@@ -70,7 +82,10 @@ the current row."
         (dolist (tr triggers)
           (let ((name (getf (cdr tr) :name))
                 (cols (getf (cdr tr) :columns)))
-            (when (and (not (member name *active-triggers* :test #'name=))
+            (when (and (or (not (member name *active-triggers* :test #'name=))
+                           (and (db-recursive-triggers (conn *db*))
+                                (or (< (length *active-triggers*) +max-trigger-depth+)
+                                    (sql-error "too many levels of trigger recursion"))))
                        (or (null cols) (not (eq event :update))
                            (some (lambda (c) (member c changed-columns :test #'name=)) cols)))
               (let ((*active-triggers* (cons name *active-triggers*))

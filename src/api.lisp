@@ -335,6 +335,10 @@ non-local exit.  Nested uses become savepoints."
 
 (defun pragma-rows (names rows) (values rows names))
 
+(defun pragma-boolean (value)
+  (let ((v (if (stringp value) (string-downcase-ascii value) value)))
+    (not (member v '(0 "0" "off" "false" "no") :test #'equal))))
+
 (defun exec-pragma (db st)
   (destructuring-bind (&key name value) (cdr st)
     (let ((n (string-downcase-ascii name)))
@@ -408,14 +412,18 @@ non-local exit.  Nested uses become savepoints."
                                   (list 0 -1 -1)))))
           ((string= n "foreign_keys")
            (if value
-               (progn (setf (db-foreign-keys (conn db))
-                            (let ((v (if (stringp value) (string-downcase-ascii value) value)))
-                              (not (member v '(0 "0" "off" "false" "no") :test #'equal))))
+               (progn (setf (db-foreign-keys (conn db)) (pragma-boolean value))
                       (values nil nil))
                (pragma-rows '("foreign_keys") (list (list (if (db-foreign-keys (conn db)) 1 0))))))
+          ((string= n "recursive_triggers")
+           (if value
+               (progn (setf (db-recursive-triggers (conn db)) (pragma-boolean value))
+                      (values nil nil))
+               (pragma-rows '("recursive_triggers")
+                            (list (list (if (db-recursive-triggers (conn db)) 1 0))))))
           ((string= n "foreign_key_list") (pragma-foreign-key-list db value))
           ((member n '("synchronous" "cache_size" "temp_store" "locking_mode"
-                       "busy_timeout" "recursive_triggers" "case_sensitive_like"
+                       "busy_timeout" "case_sensitive_like"
                        "secure_delete" "count_changes" "legacy_file_format" "writable_schema"
                        "ignore_check_constraints" "defer_foreign_keys" "mmap_size" "optimize"
                        "shrink_memory" "automatic_index")

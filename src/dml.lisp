@@ -306,7 +306,7 @@ column may use one declared after it)."
           (let ((action (resolve-action ctx (table-pk-conflict table))))
             (case action
               (:ignore (return-from resolve-uniqueness :ignore))
-              (:replace (fk-parent-delete table existing) (delete-row table existing))
+              (:replace (replace-delete table existing))
               (t (conflict-fail action "UNIQUE constraint failed: ~a"
                                 (if (table-rowid-alias table)
                                     (format nil "~a.~a" (table-name table)
@@ -323,7 +323,7 @@ column may use one declared after it)."
             (let ((action (resolve-action ctx (index-conflict idx))))
               (case action
                 (:ignore (return-from resolve-uniqueness :ignore))
-                (:replace (dolist (o others) (fk-parent-delete table o) (delete-row table o)))
+                (:replace (dolist (o others) (replace-delete table o)))
                 (t (conflict-fail action "UNIQUE constraint failed: ~a"
                                   (if (index-pk-index idx)
                                       (constraint-columns-text table idx)
