@@ -650,28 +650,27 @@ kind :match (the table or a column) or :rank."
 
 (defun fts5-instances-by-tokenizing (info)
   "Without positions in the index (detail=column/none), SQLite finds the
-instances by tokenizing the row (sqlite3Fts5ExprPopulatePoslists)."
+instances by tokenizing the row (sqlite3Fts5ExprPopulatePoslists): every
+phrase live at this row, in every column its column filter allows."
   (let* ((fts (frow-fts info)) (r (frow-result info))
          (v (gethash (frow-rowid info) (fres-instances r)))
          (out '()))
     (when v
       (loop for p across (fres-phrases r)
             for i from 0
-            do (let* ((cols (let ((cs (fts5-phrase-colset (fres-tree r) p)))
-                              (if (eq (fts-detail fts) :column)
-                                  (remove-if-not (lambda (c) (or (null cs) (member c cs))) (aref v i))
-                                  (and (aref v i)
-                                       (loop for c below (length (fts-columns fts))
-                                             when (or (null cs) (member c cs)) collect c)))))
-                      (term (first (fph-terms p))))
-                 (dolist (col (remove-duplicates cols))
-                   (loop for tk across (fts5-tokenize-value fts (nth col (frow-values info)))
-                         for pos from 0
-                         do (when (if (second term)
-                                      (let ((tt (first tk)) (pre (first term)))
-                                        (and (>= (length tt) (length pre)) (string= pre tt :end2 (length pre))))
-                                      (string= (first tk) (first term)))
-                              (push (list i col pos) out)))))))
+            do (when (aref v i)
+                 (let* ((cs (fts5-phrase-colset (fres-tree r) p))
+                        (term (first (fph-terms p)))
+                        (tb (utf8-encode (first term))))
+                   (loop for col below (length (fts-columns fts))
+                         do (when (or (null cs) (and (listp cs) (member col cs)))
+                              (loop for tk across (fts5-tokenize-value fts (nth col (frow-values info)))
+                                    for pos from 0
+                                    do (let ((kb (utf8-encode (first tk))))
+                                         (when (and (or (= (length tb) (length kb))
+                                                        (and (< (length tb) (length kb)) (second term)))
+                                                    (not (mismatch tb kb :end2 (length tb))))
+                                           (push (list i col pos) out))))))))))
     (stable-sort (nreverse out)
                  (lambda (a b) (or (< (second a) (second b))
                                    (and (= (second a) (second b))
@@ -767,16 +766,17 @@ tokens, or all when RANGE-END is negative.  Returns (values bytes-out)."
             do (destructuring-bind (tok s e) tk
                  (declare (ignore tok))
                  (block this
-                   (when (>= range-end 0)
+                   ;; a range end of 0 or less means no range, as in SQLite
+                   (when (> range-end 0)
                      (when (or (< ipos range-start) (> ipos range-end)) (return-from this))
                      (when (and (plusp range-start) (= ipos range-start)) (setf ioff s)))
                    (when (= ipos cur-start)
                      (app bytes ioff s) (app-str open) (setf ioff s))
                    (when (= ipos cur-end)
-                     (when (and (>= range-end 0) (< cur-start range-start)) (app-str open))
+                     (when (and (> range-end 0) (< cur-start range-start)) (app-str open))
                      (app bytes ioff e) (app-str close) (setf ioff e)
                      (next-inst))
-                   (when (and (>= range-end 0) (= ipos range-end))
+                   (when (and (> range-end 0) (= ipos range-end))
                      (app bytes ioff e) (setf ioff e)
                      (when (and (>= ipos cur-start) (< ipos cur-end)) (app-str close))))))
       (values out ioff bytes))))
@@ -785,7 +785,7 @@ tokens, or all when RANGE-END is negative.  Returns (values bytes-out)."
   (let ((text (fts5-column-text info col)))
     (if (null text)
         :null
-        (multiple-value-bind (out ioff bytes) (fts5-highlight-range info col text open close 0 -1)
+        (multiple-value-bind (out ioff bytes) (fts5-highlight-range info col text open close 0 0)
           (buf-bytes out bytes ioff (length bytes))
           (utf8-decode (coerce out '(simple-array (unsigned-byte 8) (*))))))))
 
