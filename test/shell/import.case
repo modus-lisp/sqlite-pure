@@ -1,0 +1,9 @@
+args: 
+.import --csv people.csv p
+.mode box
+SELECT * FROM p;
+.schema p
+CREATE TABLE q(a,b,c);
+.import --csv --skip 1 people.csv q
+SELECT count(*), typeof(a) FROM q;
+.import nosuch.csv z

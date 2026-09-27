@@ -1,0 +1,14 @@
+#!/bin/sh
+# sqlp — an sqlite3-compatible shell for sqlite-pure, run on SBCL.
+# Uses a saved core (bin/sqlp.core, from bin/build-sqlp.sh) when present,
+# otherwise loads the system through ASDF on every start.
+here=$(cd "$(dirname "$0")/.." && pwd)
+SQLP_ARGV0=${SQLP_ARGV0:-$0}; export SQLP_ARGV0
+if [ -f "$here/bin/sqlp.core" ]; then
+  exec sbcl --core "$here/bin/sqlp.core" --noinform --no-userinit --disable-debugger --end-toplevel-options "$@"
+fi
+exec sbcl --noinform --no-userinit --disable-debugger \
+  --eval '(require :asdf)' \
+  --eval "(push #p\"$here/\" asdf:*central-registry*)" \
+  --eval '(let ((*error-output* (make-broadcast-stream)) (*standard-output* (make-broadcast-stream))) (asdf:load-system "sqlite-pure/shell"))' \
+  --eval '(sqlite-pure.shell:toplevel)' --end-toplevel-options "$@"

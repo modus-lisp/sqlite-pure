@@ -1,0 +1,37 @@
+args: 
+CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c REAL, d BLOB);
+INSERT INTO t VALUES(1,'hello',1.5,x'00ff'),(2,'wörld with a longer text',NULL,NULL),(3,'multi
+line',-2.0,x''),(4,'quote''s "dq"',1e300,x'41'),(5,'',0.1,NULL);
+CREATE INDEX tb ON t(b);
+CREATE VIEW v AS SELECT a, b FROM t WHERE a>1;
+CREATE TABLE "odd name"(x);
+CREATE TABLE s2(p, q, PRIMARY KEY(p,q)) WITHOUT ROWID;
+INSERT INTO s2 VALUES(1,'x');
+.tables
+.tables t%
+.indexes
+.schema
+.schema t
+.schema --indent
+.dump
+.dump t
+.nullvalue NULL
+SELECT * FROM t WHERE c IS NULL;
+.separator ; ~
+SELECT a, b FROM t LIMIT 2;
+.show
+.print hello "world\tx"
+.width 3 -8
+.mode column
+SELECT a, b FROM t;
+.mode
+.mode box --wrap 5
+SELECT b FROM t;
+.echo on
+SELECT 1;
+.echo off
+.changes on
+INSERT INTO t(b) VALUES('z');
+.changes off
+.bogus
+.headers maybe

@@ -1,0 +1,4 @@
+args: 
+.read nosuch.sql
+.read script.sql
+SELECT * FROM fromscript;

@@ -1,0 +1,2 @@
+args: -init script.sql
+SELECT 'after init';

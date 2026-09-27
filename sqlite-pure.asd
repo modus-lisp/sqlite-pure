@@ -64,3 +64,8 @@
   :depends-on ("sqlite-pure")
   :components ((:module "test" :components ((:file "differential"))))
   :perform (test-op (o c) (uiop:symbol-call :sqlite-pure.test :run)))
+
+(defsystem "sqlite-pure/shell"
+  :description "sqlp: an sqlite3-compatible command-line shell for sqlite-pure"
+  :depends-on ("sqlite-pure" "sb-posix")
+  :components ((:module "shell" :components ((:file "shell")))))

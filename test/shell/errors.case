@@ -1,0 +1,12 @@
+args: 
+SELECT * FROM nosuch;
+SELECT nocol FROM (SELECT 1 AS x);
+SELEC 1;
+SELECT 1 +;
+CREATE TABLE u(x UNIQUE);
+INSERT INTO u VALUES(1);
+INSERT INTO u VALUES(1);
+SELECT abs(1,2);
+SELECT nofunc(1);
+SELECT 1; SELECT 'still';
+SELECT 'a very long prefix to push the error offset past the midpoint', x FROM u;

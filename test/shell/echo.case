@@ -1,0 +1,6 @@
+args: -echo
+SELECT 1;
+.mode csv
+-- comment
+SELECT 2,
+  3;

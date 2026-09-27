@@ -1,0 +1,8 @@
+args: 
+CREATE VIRTUAL TABLE ft USING fts5(body);
+INSERT INTO ft VALUES('hello world');
+CREATE VIRTUAL TABLE rt USING rtree(id, x0, x1);
+INSERT INTO rt VALUES(1, 0, 5);
+.tables
+.schema
+.dump

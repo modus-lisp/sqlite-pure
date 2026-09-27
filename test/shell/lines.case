@@ -1,0 +1,12 @@
+args: 
+.mode line
+SELECT 'a
+b' AS multi, NULL AS n, 3 AS "a longer column name";
+SELECT 1 AS x;
+.mode html
+.headers on
+SELECT '<b>&"''</b>' AS "h<1>";
+.mode tcl
+SELECT 'tab	and "q" \' AS t;
+.mode json
+SELECT 'ünï' AS "k""ey", char(1) AS ctl;

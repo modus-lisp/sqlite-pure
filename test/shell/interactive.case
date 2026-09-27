@@ -1,0 +1,8 @@
+args: -interactive
+SELECT 1;
+SELECT
+2;
+SELECT * FROM nosuch;
+.prompt "A> " "B> "
+SELECT
+3;

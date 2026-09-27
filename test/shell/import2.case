@@ -1,0 +1,14 @@
+args: 
+.import --csv edge.csv e
+.mode quote
+SELECT * FROM e;
+.import --csv -v edge.csv e
+SELECT count(*) FROM e;
+.import --ascii data.ascii asc
+SELECT * FROM asc;
+.mode csv
+.import edge.csv e2
+.mode list
+SELECT * FROM e2;
+.import
+.import --bogus x y

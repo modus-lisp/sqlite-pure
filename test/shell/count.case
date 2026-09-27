@@ -1,0 +1,7 @@
+args: 
+.mode count
+SELECT 1 UNION SELECT 2;
+.mode off
+SELECT 1;
+.mode list
+SELECT 3;

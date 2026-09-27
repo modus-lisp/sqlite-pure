@@ -1,0 +1,7 @@
+args: 
+CREATE TABLE a(x, y);
+CREATE INDEX ax ON a(x);
+CREATE VIEW va AS SELECT x FROM a;
+CREATE TEMP TABLE tt(z);
+.fullschema
+.fullschema --indent

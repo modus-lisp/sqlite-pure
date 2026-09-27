@@ -1,0 +1,16 @@
+args: 
+.open test.db
+CREATE TABLE t(x);
+INSERT INTO t VALUES(1),(2);
+.databases
+.save copy.db
+.open copy.db
+SELECT * FROM t;
+.open --new test.db
+.tables
+.open --readonly copy.db
+INSERT INTO t VALUES(3);
+SELECT count(*) FROM t;
+ATTACH 'test.db' AS other;
+.databases
+.backup other bk.db

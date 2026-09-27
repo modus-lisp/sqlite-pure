@@ -1,0 +1,9 @@
+args: 
+.output out.txt
+SELECT 'to file';
+.output
+.once out2.txt
+SELECT 'once';
+SELECT 'back';
+.read out.txt
+.shell cat out.txt out2.txt

@@ -1,0 +1,25 @@
+args: 
+CREATE TABLE f(x REAL, y, z TEXT);
+INSERT INTO f VALUES(1.0, 0.1, 'a''b'), (1e300, -0.0, 'line1
+line2'), (3.14159265358979, x'00010203', 'cr' || char(13) || 'x'), (NULL, 9223372036854775807, '');
+CREATE TABLE auto(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+INSERT INTO auto(v) VALUES('a'),('b');
+DELETE FROM auto WHERE id=1;
+CREATE TABLE wr(k TEXT PRIMARY KEY, v) WITHOUT ROWID;
+INSERT INTO wr VALUES('k1', 1);
+CREATE TRIGGER trg AFTER INSERT ON f BEGIN SELECT 1; END;
+CREATE INDEX fi ON f(x) WHERE x > 0; -- a comment
+CREATE VIEW fv AS SELECT * FROM f -- trailing comment
+;
+CREATE TABLE "weird ""name"""(a);
+INSERT INTO "weird ""name""" VALUES(1);
+.dump
+.dump --data-only
+.dump --preserve-rowids f
+.dump --newlines f
+.dump w%
+.mode insert newtab
+SELECT * FROM f;
+.mode insert
+.headers on
+SELECT * FROM f;

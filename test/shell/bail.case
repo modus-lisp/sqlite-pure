@@ -1,0 +1,4 @@
+args: -bail
+SELECT 1;
+SELECT * FROM nosuch;
+SELECT 2;

@@ -97,6 +97,39 @@ integer, **REAL** ↔ `double-float`, **TEXT** ↔ string, **BLOB** ↔
 constraint, parse and corruption errors) carrying SQLite's own message.
 `sqlp::*busy-timeout*` (seconds, default 5) bounds waiting for a lock.
 
+## The shell: `bin/sqlp`
+
+`bin/sqlp` is a command-line shell that behaves like SQLite's own `sqlite3`
+(3.40), running on SBCL.  It takes the same options, uses the same prompts
+and statement completion, and supports the same output modes: list, csv,
+column, table, box, markdown, line, json, html, insert, quote, tabs, tcl,
+ascii, count and off, with `--wrap`, `--wordwrap` and `--quote`.  Error
+reports match too (`Parse error near line N: …` followed by the `^--- error
+here` excerpt).  It supports the dot-commands people script against: `.backup`/`.save`, `.bail`, `.cd`,
+`.changes`, `.databases`, `.dump` (with its options), `.echo`, `.eqp`,
+`.exit`/`.quit`, `.fullschema`, `.headers`, `.help`, `.import` (CSV and ASCII,
+with `--skip`, `--schema`, `-v`), `.indexes`, `.mode`, `.nullvalue`, `.once`,
+`.open` (`--new`, `--readonly`), `.output`, `.parameter`, `.print`, `.prompt`,
+`.read`, `.schema` (`--indent`, `--nosys`), `.separator`, `.shell`/`.system`,
+`.show`, `.tables`, `.timeout`, `.timer` and `.width`.  `~/.sqliterc` and
+`-init` are read as sqlite3 reads them.
+
+```sh
+bin/build-sqlp.sh                 # once: saves bin/sqlp.core (starts in milliseconds)
+bin/sqlp demo.db                  # interactive
+bin/sqlp -box demo.db "SELECT * FROM person"
+bin/sqlp demo.db .dump > demo.sql
+bin/build-sqlp.sh --executable    # a standalone bin/sqlp-bin
+```
+
+Without the saved core, `bin/sqlp` loads the system through ASDF on each
+start.  Output is checked byte for byte against the real shell
+(`test/run-shell.sh`).  What it does not have: `.load` (there are no C
+extensions), `.sha3sum`, `.recover`, `.archive`, `.expert`, `.trace`,
+`.stats`, `.lint` and the rest of the rarely-used commands; line editing
+and history (run it under `rlwrap` for those); and `sqlite_stat1`, because
+`ANALYZE` is accepted but does nothing.
+
 ## What is implemented
 
 **File format.** Table and index b-trees (all four page types), overflow
@@ -346,6 +379,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-rtree.sh` | r-trees modified alternately by SQLite and by us, checked against a plain mirror table and by SQLite's `rtreecheck()`; auto-vacuum root moves on DROP; VACUUM |
 | `test/run-wal.sh` | WAL databases shared with live SQLite connections: each side reading the other's commits, snapshots surviving the other's writes and checkpoints, the write lock both ways, stale snapshots, log restart, two processes writing at once, last-one-out cleanup, crash recovery, rebuilding SQLite's index, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
 | `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |
+| `test/run-shell.sh [CASE…]` | `bin/sqlp` against SQLite's `sqlite3` shell (built by `test/build-oracle.sh`): every script in `test/shell/*.case` must give identical stdout, stderr and exit status. The scripts cover every output mode, the dot-commands, `.dump`, `.import`, error reports, statement completion, interactive prompts and the command-line options |
 
 ## Layout
 
@@ -382,6 +416,8 @@ src/
   integrity  PRAGMA integrity_check
   api        public API, statements, transactions, ATTACH, PRAGMAs
   vacuum     VACUUM
+shell/       bin/sqlp, the sqlite3-compatible shell (system sqlite-pure/shell)
+bin/         sqlp launcher and build-sqlp.sh
 test/        see above
 ```
 

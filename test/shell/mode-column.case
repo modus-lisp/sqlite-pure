@@ -1,0 +1,11 @@
+args: 
+CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c REAL, d BLOB);
+INSERT INTO t VALUES(1,'hello',1.5,x'00ff'),(2,'wörld with a longer text',NULL,NULL),(3,'multi
+line',-2.0,x''),(4,'quote''s "dq"',1e300,x'41'),(5,'',0.1,NULL);
+CREATE INDEX tb ON t(b);
+CREATE VIEW v AS SELECT a, b FROM t WHERE a>1;
+.mode column
+SELECT * FROM t;
+.headers on
+SELECT * FROM t;
+SELECT 1 WHERE 0;

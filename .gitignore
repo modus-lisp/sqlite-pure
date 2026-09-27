@@ -1,2 +1,4 @@
 *.fasl
 /tmp/
+bin/sqlp.core
+bin/sqlp-bin

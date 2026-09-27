@@ -1,0 +1,16 @@
+args: 
+CREATE TABLE x(a);
+CREATE TRIGGER tr AFTER INSERT ON x BEGIN
+  SELECT 1;
+  SELECT 2;
+END;
+INSERT INTO x VALUES(1)
+;
+SELECT 'semi;colon', "q;" FROM x -- comment ;
+;
+SELECT 1
+go
+/* comment */ SELECT 3;
+-- only a comment
+.print done
+SELECT 'unterminated

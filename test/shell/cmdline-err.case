@@ -1,0 +1,1 @@
+args: :memory: "select * from nosuch"

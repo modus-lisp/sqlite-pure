@@ -1,0 +1,9 @@
+args: 
+.parameter init
+.parameter set :x 42
+.parameter set $y 'text'
+.parameter list
+SELECT :x, $y, :x + 1;
+.parameter unset :x
+SELECT :x;
+.parameter clear

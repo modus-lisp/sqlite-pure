@@ -1,0 +1,1 @@
+args: :memory: ".mode csv" "select 1,'a b'" ".bogus"

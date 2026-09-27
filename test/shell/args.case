@@ -1,0 +1,1 @@
+args: -csv -header :memory: "select 1 as a, 'x,y' as b" ".mode json" "select 2 as z"

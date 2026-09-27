@@ -1,0 +1,2 @@
+args: -cmd ".mode line" -nullvalue NIL
+SELECT NULL AS x, 2 AS longer_name;

@@ -1,0 +1,11 @@
+args: 
+CREATE TABLE long_table_name_one(first_column INTEGER PRIMARY KEY, second_column TEXT NOT NULL DEFAULT 'x', third_column REAL CHECK(third_column > 0), fourth BLOB, UNIQUE(second_column, third_column));
+CREATE TABLE short(a);
+CREATE TABLE cm(a, -- first
+   b /* second */, c);
+CREATE VIEW long_view_name AS SELECT first_column, second_column, third_column FROM long_table_name_one WHERE first_column > 10;
+.schema --indent
+.schema --nosys
+.schema long%
+.schema sqlite_master
+.schema nomatch

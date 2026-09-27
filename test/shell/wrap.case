@@ -1,0 +1,20 @@
+args: 
+CREATE TABLE w(a, b);
+INSERT INTO w VALUES('Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam', 1);
+INSERT INTO w VALUES('short', 'two
+lines here');
+.mode box
+SELECT * FROM w;
+.mode table --wrap 20 --ww
+SELECT * FROM w;
+.mode column --wrap 15
+SELECT * FROM w;
+.mode markdown --wrap 0
+SELECT * FROM w;
+.mode qbox
+SELECT * FROM w;
+.width 5 -3
+.mode table
+SELECT * FROM w;
+.mode line
+SELECT * FROM w;
