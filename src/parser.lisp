@@ -1013,10 +1013,24 @@
                      (parse-name p t))))
        (list :vacuum schema (when (accept-kw p "INTO") (parse-expr p)))))
     ((accept-kw p "ANALYZE") (unless (op-p p ";") (when (name-token-p (peek-tok p) t) (parse-qualified-name p))) (list :noop))
-    ((accept-kw p "REINDEX") (when (name-token-p (peek-tok p) t) (parse-qualified-name p)) (list :noop))
+    ((accept-kw p "REINDEX")
+     (if (name-token-p (peek-tok p) t)
+         (multiple-value-bind (name schema) (parse-qualified-name p)
+           (list :reindex :name name :schema schema))
+         (list :reindex)))
     ((accept-kw p "EXPLAIN" "QUERY" "PLAN") (list :explain-qp (parse-statement p)))
     ((accept-kw p "EXPLAIN") (perr p "EXPLAIN is not supported (EXPLAIN QUERY PLAN is)"))
     (t (perr p "syntax error"))))
+
+(defvar *statement-texts* (make-hash-table :test #'eq :weakness :key)
+  "Parsed statement -> (raw . tight): its source text through whatever
+precedes the terminating ; (or the end of input), and through its last token.
+SQLite stores some CREATE statements one way and some the other.")
+
+(defun statement-text (st kind default)
+  "ST's :RAW or :TIGHT source text (see *STATEMENT-TEXTS*), or DEFAULT."
+  (let ((e (gethash st *statement-texts*)))
+    (if e (ecase kind (:raw (car e)) (:tight (cdr e))) default)))
 
 (defun parse-sql (sql)
   "Parse SQL into a list of (statement . source-text), plus the number of
@@ -1031,6 +1045,11 @@ positional parameters."
              (end (tok-pos (peek-tok p))))
         (unless (or (op-p p ";") (eq (tok-kind (peek-tok p)) :eof))
           (perr p "syntax error"))
+        ;; the statement's text up to its terminator (whitespace and comments
+        ;; included), and up to the end of its last token
+        (setf (gethash st *statement-texts*)
+              (cons (subseq sql start end)
+                    (subseq sql start (tok-end (aref (ps-toks p) (1- (ps-pos p)))))))
         (push (cons st (string-right-trim '(#\Space #\Tab #\Newline #\Return)
                                           (subseq sql start end)))
               stmts)))

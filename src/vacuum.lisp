@@ -21,6 +21,9 @@ virtual tables' schema rows."
                                ((eq p :none) nil)
                                ((autovacuum-p db) (if (incremental-p db) :incremental :full))))))
         (rows (schema-rows (db-schema* db))))
+    ;; sqlite3RunVacuum sets SQLITE_WriteSchema: sqlite_stat1 and the like
+    ;; are recreated like any other table
+    (setf (db-writable-schema new) t)
     (flet ((run (sql) (let ((*db* new)) (run-sql new sql '()))))
       (run "BEGIN")
       ;; tables (sqlite_sequence is created by AUTOINCREMENT tables)

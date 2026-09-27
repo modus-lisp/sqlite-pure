@@ -598,6 +598,8 @@ sqlite3_prepare would take them one after another."
     "malformed blob literal" "bad parameter name" "unknown database" "no such module"
     "duplicate column name" "more than one primary key" "no such window"
     "may only be used within a trigger-program" "there is already"
+    "recursive references" "references to recursive table"
+    "unable to identify the object to be reindexed"
     "table" "index" "view" "trigger"))
 
 (defun prepare-error-p (msg)

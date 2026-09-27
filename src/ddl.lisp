@@ -173,7 +173,15 @@ EndTable write it: a placeholder first, then the real record."
                   (apply-row-affinity tb row)
                   (finalize-rowid tb row)
                   (write-row tb row))))))
-        (create-table-from-ast st (stored-create-sql text "TABLE")))
+        ;; sqlite3EndTable: the text ends at the column list's ")" — or, with
+        ;; table options, at the last token before the ";" (so trailing
+        ;; whitespace and comments are kept)
+        (create-table-from-ast st (stored-create-sql
+                                   (statement-text st (if (or (getf (cdr st) :without-rowid)
+                                                              (getf (cdr st) :strict))
+                                                          :raw :tight)
+                                                   text)
+                                   "TABLE")))
     nil)))
 
 (defun dedupe-names (names)
@@ -210,6 +218,115 @@ EndTable write it: a placeholder first, then the real record."
     (dolist (key keys)
       (index-insert *db* (index-root idx) key :bulk t))))
 
+(defun refill-index (table idx)
+  "sqlite3RefillIndex for REINDEX: read every key, clear the index b-tree
+(keeping its root page), and bulk-load the keys in order.  A WITHOUT
+ROWID table's key index is the table itself: its rows are read before the
+b-tree is cleared, as SQLite fills its sorter before OP_Clear."
+  (let ((*index-cmp* (index-full-cmp table idx))
+        (seen (make-hash-table :test #'equal))
+        (keys '()))
+    (map-table-rows table
+                    (lambda (row)
+                      (when (index-applies-p table idx row)
+                        (let ((key (index-key table idx row)))
+                          (when (index-unique idx)
+                            (let ((prefix (subseq key 0 (length (index-columns idx)))))
+                              (unless (member :null prefix)
+                                (let ((k (group-key prefix (index-collations idx))))
+                                  (when (gethash k seen)
+                                    (constraint-error "UNIQUE constraint failed: ~a"
+                                                      (constraint-columns-text table idx)))
+                                  (setf (gethash k seen) t)))))
+                          (push key keys)))))
+    (setf keys (stable-sort (nreverse keys) (lambda (a b) (minusp (funcall *index-cmp* a b)))))
+    (clear-btree (table-owner table) (index-root idx) :keep-root t)
+    (dolist (key keys)
+      (index-insert (table-owner table) (index-root idx) key :bulk t))))
+
+(defun sqlite-hash-order (names)
+  "The order SQLite's Hash (hash.c) iterates NAMES in, after inserting them
+in the given order: strHash, the bucket array doubling once 10 elements
+outnumber twice its size, and insertElement's placement."
+  (let ((elems '()) (buckets nil) (htsize 0) (count 0))
+    (labels ((str-hash (s)
+               (let ((h 0))
+                 (loop for c across (utf8-encode s)
+                       do (setf h (ldb (byte 32 0) (* (ldb (byte 32 0) (+ h (if (<= 65 c 90) (+ c 32) c)))
+                                                      #x9e3779b1))))
+                 h))
+             (insert (name bucket)
+               ;; before the bucket's first element, else at the very front
+               (let ((head (and bucket (plusp (car (aref buckets bucket))) (cdr (aref buckets bucket)))))
+                 (when bucket
+                   (incf (car (aref buckets bucket)))
+                   (setf (cdr (aref buckets bucket)) name))
+                 (if head
+                     (let ((pos (position head elems :test #'eq)))
+                       (setf elems (append (subseq elems 0 pos) (list name) (nthcdr pos elems))))
+                     (push name elems)))))
+      (dolist (name names elems)
+        (incf count)
+        (when (and (>= count 10) (> count (* 2 htsize)))
+          (setf htsize (* 2 count)
+                buckets (make-array htsize :initial-element nil))
+          (dotimes (i htsize) (setf (aref buckets i) (cons 0 nil)))
+          (let ((old elems))
+            (setf elems '())
+            (dolist (e old) (insert e (mod (str-hash e) htsize)))))
+        (insert name (and buckets (mod (str-hash name) htsize)))))))
+
+(defun tables-in-hash-order (db)
+  "DB's tables and views in the order SQLite's schema hash (tblHash)
+visits them, as built by loading the schema: the schema table itself,
+then each table or view in sqlite_schema rowid order."
+  (let* ((rows (schema-rows (db-schema* db)))
+         (names (cons (if (name= (db-name db) "temp") "sqlite_temp_master" "sqlite_master")
+                      (loop for (nil type name nil nil sql) in rows
+                            when (and (member type '("table" "view") :test #'equal) (stringp sql)
+                                      (stringp name))
+                              collect name))))
+    (loop for n in (sqlite-hash-order (mapcar #'copy-seq names))
+          for tb = (find-table-in db n)
+          when tb collect tb)))
+
+(defun reindex-table (table collation)
+  "reindexTable: every index of TABLE, or those with a column in COLLATION."
+  (unless (table-virtual-p table)
+    (dolist (idx (sqlite-index-list table))
+      (when (or (null collation)
+                (some (lambda (c) (and (integerp (first c))
+                                       (string-equal (collation-name (second c)) collation)))
+                      (index-columns idx)))
+        (let ((*db* (table-owner table)))
+          (refill-index table idx))))))
+
+(defun collation-known-p (name)
+  (or (member name '("BINARY" "NOCASE" "RTRIM") :test #'string-equal)
+      (gethash (string-upcase-ascii name) (db-user-collations (conn *db*)))))
+
+(defun exec-reindex (st)
+  "sqlite3Reindex: REINDEX, REINDEX collation, REINDEX [schema.]table-or-index."
+  (destructuring-bind (&key name schema) (cdr st)
+    (flet ((all (collation)
+             (dolist (d (temp-first-list *db*))
+               (dolist (tb (tables-in-hash-order d))
+                 (reindex-table tb collation)))))
+      (cond
+        ((null name) (all nil))
+        ((and (null schema) (collation-known-p name)) (all name))
+        (t
+         (when schema (schema-db *db* schema))
+         (let ((tb (lookup-table *db* name nil schema)))
+           (if tb
+               (reindex-table tb nil)
+               (let ((idx (lookup-index *db* name schema)))
+                 (unless idx (sql-error "unable to identify the object to be reindexed"))
+                 (let ((table (lookup-table *db* (index-table idx) t schema)))
+                   (let ((*db* (table-owner table)))
+                     (refill-index table idx)))))))))
+    (values nil nil)))
+
 (defun exec-create-index (st text)
   (destructuring-bind (&key name schema table if-not-exists &allow-other-keys) (cdr st)
    (let* ((tb (lookup-table *db* table t schema))
@@ -223,7 +340,8 @@ EndTable write it: a placeholder first, then the real record."
       (when (table-view-select tb) (sql-error "views may not be indexed"))
       (when (table-vtab tb) (sql-error "virtual tables may not be indexed"))
       (when (= (table-root tb) 1) (sql-error "table ~a may not be indexed" table))
-      (let* ((sql (stored-create-sql text "INDEX"))
+      ;; sqlite3CreateIndex: the text runs to the ";" (or the end of input)
+      (let* ((sql (stored-create-sql (statement-text st :raw text) "INDEX"))
              (idx (index-from-ast st 0 sql tb)))
         (dolist (c (index-columns idx))
           (let ((e (first c)))
@@ -259,7 +377,9 @@ EndTable write it: a placeholder first, then the real record."
           (return-from exec-create-trigger nil)
           (sql-error "trigger ~a already exists" name)))
     (progn
-      (add-schema-row "trigger" name (table-name tb) 0 (stored-create-sql text "TRIGGER"))
+      ;; sqlite3FinishTrigger: the text ends at END
+      (add-schema-row "trigger" name (table-name tb) 0
+                      (stored-create-sql (statement-text st :tight text) "TRIGGER"))
       (bump-schema-cookie))
     nil)))
 

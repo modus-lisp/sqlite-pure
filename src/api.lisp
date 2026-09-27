@@ -12,7 +12,7 @@
 (defun write-statement-p (st)
   (case (car st)
     ((:insert :update :delete :create-table :create-index :create-view
-      :create-trigger :create-virtual :drop :alter)
+      :create-trigger :create-virtual :drop :alter :reindex)
      t)
     (:pragma (and (getf (cdr st) :value)
                   (member (getf (cdr st) :name)
@@ -132,6 +132,7 @@
               (:create-virtual (exec-create-virtual st))
               (:drop (exec-drop st))
               (:alter (exec-alter st))
+              (:reindex (exec-reindex st))
               (:pragma (exec-pragma db st)))
                   ;; FTS5 writes are buffered per statement; FTS3 per transaction
                   (fts5-flush-touched)
@@ -526,6 +527,8 @@ non-local exit.  Nested uses become savepoints."
              (pragma-rows (list n) (if problems (mapcar #'list problems) (list (list "ok"))))))
           ((string= n "collation_list")
            (pragma-rows '("seq" "name") '((0 "RTRIM") (1 "NOCASE") (2 "BINARY"))))
+          ((string= n "compile_options")
+           (pragma-rows '("compile_options") (mapcar #'list *compile-options*)))
           ((string= n "function_list")
            (let ((names '()))
              (maphash (lambda (k v) (declare (ignore v)) (push k names)) *functions*)

@@ -18,7 +18,10 @@ that way would produce the rows in ORDER BY order.")
   "Set by the planner when it adopted *ORDER-HINT*.")
 
 
-(defstruct cte name columns sel (rows nil) (done nil) recursive-rows affinities env)
+(defstruct cte name columns sel (rows nil) (done nil) recursive-rows affinities env
+  error                      ; the error a reference to it raises, if its definition is bad
+  declared                   ; the column names given in WITH name(...), if any
+  checked)                   ; its shape has been checked (on first use)
 
 ;;; ------------------------------------------------------------------
 ;;; Rows of stored tables
@@ -173,7 +176,39 @@ columns are decoded; the others read as NULL."
                 (compile-select (make-sel :cores (last (sel-cores sel))) (make-scope))))
             (compile-select (cte-sel cte) (make-scope)))))))
 
+(defun check-cte-shape (cte)
+  "What expanding a CTE checks, in SQLite's order: the leftmost SELECT's
+width against the declared columns, then a recursive CTE's terms against
+each other."
+  (unless (cte-checked cte)
+    (setf (cte-checked cte) t)
+    (let* ((sel (cte-sel cte))
+           (*ctes* (cons (cons (cte-name cte) cte) (cte-env cte)))
+           (*eqp* nil)                  ; checking is not part of the plan
+           (width (lambda (core)
+                    (length (nth-value 1 (compile-select (make-sel :cores (list core)) (make-scope)))))))
+      (when (cte-declared cte)
+        (let ((n (funcall width (first (sel-cores sel)))))
+          (unless (= n (length (cte-declared cte)))
+            (setf (cte-checked cte) nil)
+            (sql-error "table ~a has ~d values for ~d columns" (cte-name cte) n (length (cte-declared cte))))))
+      (when (eq (cte-recursive-rows cte) :recursive)
+        (let ((anchor (length (nth-value 1 (compile-select (make-sel :cores (butlast (sel-cores sel))
+                                                                     :ops (butlast (sel-ops sel)))
+                                                           (make-scope)))))
+              (recur (let ((saved (cte-done cte)))
+                       ;; compile the recursive term as the recursion would see it
+                       (setf (cte-done cte) :working)
+                       (unwind-protect (funcall width (car (last (sel-cores sel))))
+                         (setf (cte-done cte) saved)))))
+          (unless (= anchor recur)
+            (setf (cte-checked cte) nil)
+            (sql-error "SELECTs to the left and right of ~a do not have the same number of result columns"
+                       (if (eq (car (last (sel-ops sel))) :union) "UNION" "UNION ALL"))))))))
+
 (defun cte-source (cte alias)
+  (when (cte-error cte) (sql-error (cte-error cte) (cte-name cte)))
+  (check-cte-shape cte)
   (when *eqp* (eqp-describe-cte cte))
   (let* ((src (derived-src (or alias (cte-name cte)) (cte-columns cte)
                            (or (cte-affinities cte) (make-list (length (cte-columns cte))))
@@ -182,10 +217,23 @@ columns are decoded; the others read as NULL."
                :label (or alias (cte-name cte))
                :rows-fn (lambda (env)
                           (declare (ignore env))
-                          (if (eq (cte-done cte) :working)
-                              (cte-recursive-rows cte)
-                              (progn (unless (cte-done cte) (materialize-cte cte))
-                                     (cte-rows cte)))))))
+                          (case (cte-done cte)
+                            ;; inside this CTE's own recursive step: the current row
+                            (:working (cte-recursive-rows cte))
+                            ;; another reference while a scan streams it: a copy of
+                            ;; its own, computed in full
+                            (:streaming (let ((copy (copy-cte cte)))
+                                          (setf (cte-done copy) nil (cte-rows copy) nil
+                                                (cte-recursive-rows copy) :recursive)
+                                          (materialize-cte copy)
+                                          (cte-rows copy)))
+                            ((t) (cte-rows cte))
+                            (t (if (eq (cte-recursive-rows cte) :recursive)
+                                   ;; SQLite runs a recursive query as a co-routine:
+                                   ;; rows reach the outer scan as they are made, so an
+                                   ;; outer LIMIT ends an unbounded recursion
+                                   (lambda (fn) (materialize-cte cte fn))
+                                   (progn (materialize-cte cte) (cte-rows cte)))))))))
 
 (defun eqp-labelled (fs label)
   (setf (fsrc-label fs) label)
@@ -818,11 +866,71 @@ led by COL (SQLite's min/max optimisation).  NIL if neither exists."
                           (eql i (table-rowid-alias table))
                           (member i cols))))))
 
+(defun column-size-estimate (type)
+  "SQLite's Column.szEst: a column's size, an integer being 1, from its
+declared type (sqlite3AddColumn and sqlite3AffinityType)."
+  (let ((type (or type "")))
+    (cond
+      ((zerop (length type)) 1)
+      ;; the standard names: TEXT and BLOB are 5, the rest (ANY, INT,
+      ;; INTEGER, REAL) are 1
+      ((and (>= (length type) 3)
+            (member type '("ANY" "BLOB" "INT" "INTEGER" "REAL" "TEXT") :test #'string-equal))
+       (if (member type '("BLOB" "TEXT") :test #'string-equal) 5 1))
+      (t
+       (let ((h 0) (aff :numeric) (zchar nil) (n (length type)))
+         (loop for i below n
+               do (setf h (logand #xffffffff (+ (ash h 8) (char-code (char-downcase (char type i))))))
+                  (let ((next (1+ i)))
+                    (flet ((is (s) (= h (reduce (lambda (a c) (+ (ash a 8) (char-code c))) s :initial-value 0))))
+                      (cond ((is "char") (setf aff :text zchar next))
+                            ((or (is "clob") (is "text")) (setf aff :text))
+                            ((and (is "blob") (member aff '(:numeric :real)))
+                             (setf aff :blob)
+                             (when (and (< next n) (char= (char type next) #\()) (setf zchar next)))
+                            ((and (member aff '(:numeric))
+                                  (or (is "real") (is "floa") (is "doub")))
+                             (setf aff :real))
+                            ((= (logand h #xffffff) (reduce (lambda (a c) (+ (ash a 8) (char-code c))) "int" :initial-value 0))
+                             (setf aff :integer)
+                             (return))))))
+         (let ((v 0))
+           (when (member aff '(:text :blob))
+             (if zchar
+                 (let ((d (position-if #'digit-char-p type :start zchar)))
+                   (when d (setf v (min (parse-integer type :start d :junk-allowed t) #x7fffffff))))
+                 (setf v 16)))
+           (min 255 (1+ (floor v 4)))))))))
+
+(defun log-est (x)
+  "sqlite3LogEst: 10*log2(X), roughly, as SQLite computes it."
+  (let ((a #(0 2 3 5 6 7 8 9)) (y 40))
+    (if (< x 8)
+        (progn (when (< x 2) (return-from log-est 0))
+               (loop while (< x 8) do (decf y 10) (setf x (ash x 1))))
+        (let ((i (- (integer-length x) 4)))
+          (incf y (* i 10))
+          (setf x (ash x (- i)))))
+    (+ (aref a (logand x 7)) y -10)))
+
+(defun table-row-width (table)
+  "estimateTableWidth: szTabRow."
+  (log-est (* 4 (+ (loop for c across (table-columns table) sum (column-size-estimate (column-type c)))
+                   (if (table-rowid-alias table) 0 1)))))
+
+(defun index-row-width (table idx)
+  "estimateIndexWidth: szIdxRow (the key columns and the rowid)."
+  (let ((cols (table-columns table)))
+    (log-est (* 4 (+ 1 (loop for (c) in (index-columns idx)
+                             sum (if (integerp c) (column-size-estimate (column-type (aref cols c))) 1)))))))
+
 (defun covering-index (table wanted &optional fs)
-  "A plain index of a rowid table that contains every WANTED column (the
-narrowest, newest on ties), or NIL."
+  "The index of a rowid table SQLite would scan instead of the table: one
+holding every WANTED column whose estimated row is narrower than the
+table's, the cheapest by SQLite's cost (rows + 1 + 15*szIdxRow/szTabRow),
+the newest on ties; or NIL."
   (when (and wanted (not (table-without-rowid table)) (not (table-virtual-p table)))
-    (let ((best nil))
+    (let ((best nil) (best-cost nil) (tab-w (table-row-width table)))
       (dolist (idx (table-indexes table) best)
         (let ((cols (mapcar #'first (index-columns idx))))
           (when (and (null (index-where idx))
@@ -831,9 +939,13 @@ narrowest, newest on ties), or NIL."
                      (loop for i below (length wanted)
                            always (or (zerop (sbit wanted i))
                                       (eql i (table-rowid-alias table))
-                                      (member i cols)))
-                     (or (null best) (<= (length cols) (length (index-columns best)))))
-            (setf best idx)))))))
+                                      (member i cols))))
+            (let ((w (index-row-width table idx)))
+              ;; INDEXED BY forces the index, however wide
+              (when (or (< w tab-w) (and fs (eq (fsrc-index-hint fs) idx)))
+                (let ((cost (floor (* 15 w) tab-w)))
+                  (when (or (null best) (<= cost best-cost))
+                    (setf best idx best-cost cost)))))))))))
 
 (defun order-term-source-column (e rcols scope)
   "The (depth-0) column of source 0 an ORDER BY term sorts by, or NIL."
@@ -917,8 +1029,8 @@ narrowest, newest on ties), or NIL."
              (when (consp x)
                (case (car x)
                  ((:subquery :exists) nil)
-                 (:in (walk (second x))
-                  (when (eq (car (third x)) :list) (some #'walk (second (third x)))))
+                 (:in (or (walk (second x))
+                          (and (eq (car (third x)) :list) (some #'walk (second (third x))))))
                  (:fn (or (aggregate-call-p x) (some #'walk (third x))))
                  (:winfn (or (some #'walk (third x))
                              (let ((spec (seventh x)))
@@ -1056,7 +1168,11 @@ Return the per-source ON expressions."
                                                                                  (src-name (fsrc-src fs))
                                                                                  "(subquery)"))))
                                      (lambda (env fn)
-                                       (dolist (row (funcall rf env)) (funcall fn row)))))))
+                                       (let ((rows (funcall rf env)))
+                                         ;; a streaming source hands over a mapper
+                                         (if (functionp rows)
+                                             (funcall rows fn)
+                                             (dolist (row rows) (funcall fn row)))))))))
                  (push (make-level :index i :fsrc fs :iterate iterate :left-p (and left t)
                                    :right-p (and right t)
                                    :match (mapcar (lambda (c) (compile-expr c scope)) match-asts)
@@ -1349,13 +1465,16 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
          cscope)))))
 
 (defun count-index (table)
-  "The narrowest full index of a rowid table (newest on ties), or NIL."
+  "The index SQLite counts instead of a rowid table: the narrowest full
+index by estimated row width, if narrower than the table (newest on ties),
+or NIL."
   (unless (table-without-rowid table)
-    (let ((best nil))
+    (let ((best nil) (best-w nil) (tab-w (table-row-width table)))
       (dolist (idx (table-indexes table) best)
-        (when (and (null (index-where idx))
-                   (or (null best) (<= (length (index-columns idx)) (length (index-columns best)))))
-          (setf best idx))))))
+        (let ((w (index-row-width table idx)))
+          (when (and (null (index-where idx)) (< w tab-w)
+                     (or (null best) (<= w best-w)))
+            (setf best idx best-w w)))))))
 
 (defun count-star-fast-path (core order limit offset)
   "SELECT count(*) FROM <table>: count cells without decoding any record."
@@ -1487,7 +1606,8 @@ EXPRS, so that SQLite would need no temp b-tree?"
 ;;; ------------------------------------------------------------------
 ;;; Whole SELECT statements: CTEs and compound operators
 
-(defun materialize-cte (cte)
+(defun materialize-cte (cte &optional emit)
+  "Compute CTE's rows.  A recursive CTE may EMIT each row as it is made."
   (let ((sel (cte-sel cte))
         (*ctes* (cons (cons (cte-name cte) cte) (cte-env cte))))
     (if (not (and (cte-recursive-rows cte) (eq (cte-recursive-rows cte) :recursive)))
@@ -1495,9 +1615,9 @@ EXPRS, so that SQLite would need no temp b-tree?"
           (unless (cte-columns cte) (setf (cte-columns cte) (mapcar #'first cols)))
           (setf (cte-rows cte) (rows-to-vectors (funcall fn nil))
                 (cte-done cte) t))
-        (run-recursive-cte cte))))
+        (run-recursive-cte cte emit))))
 
-(defun run-recursive-cte (cte)
+(defun run-recursive-cte (cte &optional emit)
   (let* ((sel (cte-sel cte))
          (cores (sel-cores sel))
          (ops (sel-ops sel))
@@ -1522,16 +1642,30 @@ EXPRS, so that SQLite would need no temp b-tree?"
                                   (unless (gethash k seen) (setf (gethash k seen) t))))
                          collect r)))
           (setf queue (admit queue))
-          (catch :cte-done
-            (loop while queue
-                  do (let ((row (pop queue)))
-                       (push row all)
-                       (incf count)
-                       (when (and limit (>= limit 0) (>= count limit)) (throw :cte-done nil))
-                       (setf (cte-recursive-rows cte) (rows-to-vectors (list row)))
-                       (setf queue (append queue (admit (funcall recur-fn nil))))))))
-        (setf (cte-rows cte) (rows-to-vectors (nreverse all))
-              (cte-done cte) t)))))
+          (let ((finished nil))
+            (unwind-protect
+                 (progn
+                   (catch :cte-done
+                     (loop while queue
+                           do (let ((row (pop queue)))
+                                (push row all)
+                                (incf count)
+                                (when emit
+                                  ;; the outer scan runs while this row is current;
+                                  ;; a reference it makes to the CTE is not the
+                                  ;; recursive step's
+                                  (setf (cte-done cte) :streaming)
+                                  (funcall emit (first (rows-to-vectors (list row))))
+                                  (setf (cte-done cte) :working))
+                                (when (and limit (>= limit 0) (>= count limit)) (throw :cte-done nil))
+                                (setf (cte-recursive-rows cte) (rows-to-vectors (list row)))
+                                (setf queue (append queue (admit (funcall recur-fn nil)))))))
+                   (setf finished t))
+              (if finished
+                  (setf (cte-rows cte) (rows-to-vectors (nreverse all))
+                        (cte-done cte) t)
+                  ;; the outer scan stopped early: nothing is cached
+                  (setf (cte-done cte) nil (cte-rows cte) nil)))))))))
 
 (defun register-ctes (sel)
   "Push this SELECT's WITH clause onto *CTES*."
@@ -1541,8 +1675,30 @@ EXPRS, so that SQLite would need no temp b-tree?"
 (defun register-ctes-1 (sel)
   (dolist (w (sel-with sel))
     (destructuring-bind (name cols csel) w
-      (let ((cte (make-cte :name name :columns cols :sel csel :env *ctes*)))
-        (when (and (sel-recursive sel) (cte-references-self-p csel name))
+      (let ((cte (make-cte :name name :columns cols :declared cols :sel csel :env *ctes*)))
+        ;; resolveFromTermToCte: RECURSIVE is optional; a CTE recurses when it
+        ;; is a UNION [ALL] whose last term names it directly in its FROM, and
+        ;; any other reference to itself is an error (raised only if used)
+        (let* ((cores (sel-cores csel))
+               (last-core (car (last cores)))
+               (direct (and (sel-ops csel)
+                            (member (car (last (sel-ops csel))) '(:union :union-all))
+                            (select-core-p last-core)
+                            (count-if (lambda (item)
+                                        (let ((s (getf item :source)))
+                                          (and (eq (car s) :table) (stringp (second s))
+                                               (null (fourth s)) (name= (second s) name))))
+                                      (select-core-from last-core)))))
+          (cond ((and direct (> direct 1))
+                 (setf (cte-error cte) "multiple references to recursive table: ~a"))
+                ((and direct (= direct 1))
+                 (cond ((some (lambda (c) (plusp (cte-self-references c name))) (butlast cores))
+                        (setf (cte-error cte) "circular reference: ~a"))
+                       ((> (cte-self-references last-core name) 1)
+                        (setf (cte-error cte) "multiple recursive references: ~a"))))
+                ((plusp (cte-self-references csel name))
+                 (setf (cte-error cte) "circular reference: ~a"))))
+        (when (and (null (cte-error cte)) (cte-references-self-p csel name))
           (setf (cte-recursive-rows cte) :recursive)
           ;; recursive CTEs need their column names up front
           (unless cols
@@ -1551,13 +1707,30 @@ EXPRS, so that SQLite would need no temp b-tree?"
                   (compile-select (make-sel :cores (list (first (sel-cores csel)))) (make-scope))
                 (declare (ignore fn))
                 (setf (cte-columns cte) (mapcar #'first c))))))
-        (unless (cte-columns cte)
+        (unless (or (cte-columns cte) (cte-error cte))
           (let ((*ctes* *ctes*))
             (multiple-value-bind (fn c) (compile-select csel (make-scope))
               (declare (ignore fn))
               (setf (cte-columns cte) (mapcar #'first c)
                     (cte-affinities cte) (mapcar #'second c)))))
         (push (cons name cte) *ctes*)))))
+
+(defun cte-self-references (x name)
+  "How many times X (a SELECT, a core, or an AST) names table NAME,
+unqualified, at any depth."
+  (cond ((sel-p x) (reduce #'+ (sel-cores x) :key (lambda (c) (cte-self-references c name))))
+        ((select-core-p x)
+         (+ (reduce #'+ (select-core-from x) :key (lambda (c) (cte-self-references c name)))
+            (cte-self-references (select-core-where x) name)
+            (cte-self-references (select-core-group x) name)
+            (cte-self-references (select-core-having x) name)
+            (reduce #'+ (select-core-cols x) :key (lambda (c) (cte-self-references c name)))))
+        ((consp x)
+         (if (and (eq (car x) :table) (stringp (second x)) (name= (second x) name)
+                  (consp (cdr x)) (consp (cddr x)) (null (fourth x)))
+             1
+             (+ (cte-self-references (car x) name) (cte-self-references (cdr x) name))))
+        (t 0)))
 
 (defun cte-references-self-p (sel name)
   (labels ((walk (x)

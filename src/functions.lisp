@@ -342,6 +342,44 @@ connection shadows the built-in of that name."
 (defsqlfun "sqlite_version" (0 0) (args) (declare (ignore args)) "3.40.1")
 (defsqlfun "sqlite_source_id" (0 0) (args) (declare (ignore args)) "sqlite-pure")
 
+(defparameter *compile-options*
+  '("DEFAULT_CACHE_SIZE=-2000" "DEFAULT_FILE_FORMAT=4" "DEFAULT_JOURNAL_SIZE_LIMIT=-1"
+    "DEFAULT_MMAP_SIZE=0" "DEFAULT_PAGE_SIZE=4096" "DEFAULT_PCACHE_INITSZ=20"
+    "DEFAULT_SECTOR_SIZE=4096" "DEFAULT_SYNCHRONOUS=2" "DEFAULT_WAL_AUTOCHECKPOINT=1000"
+    "DEFAULT_WAL_SYNCHRONOUS=2" "DEFAULT_WORKER_THREADS=0" "ENABLE_DBSTAT_VTAB" "ENABLE_FTS3"
+    "ENABLE_FTS3_PARENTHESIS" "ENABLE_FTS4" "ENABLE_FTS5" "ENABLE_GEOPOLY"
+    "ENABLE_MATH_FUNCTIONS" "ENABLE_RTREE" "MAX_ATTACHED=10" "MAX_COLUMN=2000"
+    "MAX_COMPOUND_SELECT=500" "MAX_DEFAULT_PAGE_SIZE=8192" "MAX_EXPR_DEPTH=1000"
+    "MAX_FUNCTION_ARG=127" "MAX_LENGTH=1000000000" "MAX_LIKE_PATTERN_LENGTH=50000"
+    "MAX_MMAP_SIZE=0" "MAX_PAGE_COUNT=1073741823" "MAX_PAGE_SIZE=65536"
+    "MAX_SQL_LENGTH=1000000000" "MAX_TRIGGER_DEPTH=1000" "MAX_VARIABLE_NUMBER=32766"
+    "MAX_VDBE_OP=250000000" "MAX_WORKER_THREADS=8" "SECURE_DELETE" "TEMP_STORE=1"
+    "THREADSAFE=0")
+  "What PRAGMA compile_options reports: SQLite 3.40.1's defaults, the
+extensions this library implements, and its own defaults (secure_delete on;
+connections are not shared between threads).")
+
+(defun compile-option-used-p (name)
+  "sqlite3_compileoption_used: NAME, with or without SQLITE_, is a prefix of
+an option that ends there (case-insensitively)."
+  (let* ((z (if (and (>= (length name) 7) (string-equal name "SQLITE_" :end1 7)) (subseq name 7) name))
+         (n (length z)))
+    (some (lambda (opt)
+            (and (>= (length opt) n) (string-equal z opt :end2 n)
+                 (or (= n (length opt))
+                     (let ((c (char opt n))) (not (or (alphanumericp c) (char= c #\_) (char= c #\$)))))))
+          *compile-options*)))
+
+(defsqlfun "sqlite_compileoption_used" (1 1) (args)
+  (let ((v (first args)))
+    (if (eq v :null) :null (if (compile-option-used-p (value-to-text v)) 1 0))))
+
+(defsqlfun "sqlite_compileoption_get" (1 1) (args)
+  (let ((n (value-to-integer (first args))))
+    (if (and (integerp n) (<= 0 n) (< n (length *compile-options*)))
+        (nth n *compile-options*)
+        :null)))
+
 (defsqlfun "glob" (2 2) (args)
   (destructuring-bind (pat s) args
     (when (and (not *like-matches-blobs*) (or (blobp pat) (blobp s)))

@@ -64,6 +64,55 @@ conflict found ROW (its entry is removed last, as SQLite does)."
                (schema-triggers (db-schema* d))))
     hit))
 
+(defun check-trigger-programs (table event &optional changed-columns)
+  "What sqlite3_prepare does when it codes the triggers a statement may
+fire: compile each WHEN clause and look up every function a trigger body
+calls, so a missing function (or column in WHEN) fails the statement even
+when no row reaches the trigger."
+  (dolist (timing '(:before :after :instead-of))
+    (dolist (tr (triggers-for table event timing))
+      (let ((cols (getf (cdr tr) :columns)))
+        (when (or (null cols) (not (eq event :update))
+                  (some (lambda (c) (member c changed-columns :test #'name=)) cols))
+          (let ((scope (trigger-scope table)) (when-expr (getf (cdr tr) :when)))
+            (when when-expr
+              (let ((*outer-scope* scope) (*ctes* '()))
+                (compile-expr when-expr scope)))
+            (check-functions-called (getf (cdr tr) :body))))))))
+
+(defun check-functions-called (ast)
+  "Signal \"no such function\" for the first call in AST (statements,
+expressions, and the structures a SELECT parses into) to an unknown
+function, or a known scalar function with the wrong number of arguments."
+  (let ((seen (make-hash-table :test #'eq)))
+    (labels ((walk (x)
+               (cond ((consp x)
+                      (unless (gethash x seen)
+                        (setf (gethash x seen) t)
+                        (when (and (eq (car x) :fn) (stringp (second x)) (listp (third x)))
+                          (check-call (second x) (third x)))
+                        (loop for tail = x then (cdr tail)
+                              while (consp tail) do (walk (car tail))
+                              finally (walk tail))))
+                     ((typep x 'structure-object)
+                      (unless (gethash x seen)
+                        (setf (gethash x seen) t)
+                        #+sbcl
+                        (dolist (s (sb-mop:class-slots (class-of x)))
+                          (walk (slot-value x (sb-mop:slot-definition-name s))))))
+                     ((and (vectorp x) (not (stringp x)) (not (typep x '(vector (unsigned-byte 8)))))
+                      (map nil #'walk x))))
+             (check-call (name args)
+               (let ((lname (string-downcase-ascii name)))
+                 (unless (string= lname "match")
+                   (multiple-value-bind (scalar agg) (find-sql-function lname)
+                     (cond ((and (null scalar) (null agg))
+                            (sql-error "no such function: ~a" name))
+                           ((and scalar (null agg)
+                                 (not (<= (first scalar) (length args) (or (second scalar) (length args)))))
+                            (sql-error "wrong number of arguments to function ~a()" name))))))))
+      (walk ast))))
+
 (defun run-trigger-statement (st)
   (case (car st)
     (:insert (exec-insert st))
