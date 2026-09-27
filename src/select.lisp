@@ -165,6 +165,8 @@ columns are decoded; the others read as NULL."
                  (let ((cte (and (null (fourth source)) (cdr (assoc name *ctes* :test #'name=)))))
                    (cond
                      (cte (cte-source cte alias))
+                     ((and (pragma-vtab-spec name) (null (lookup-table *db* name nil schema)))
+                      (pragma-table-source name '() alias))
                      (t (let ((table (lookup-table *db* name t schema)))
                           (if (table-view-select table)
                               (let ((*ctes* '()))
@@ -181,12 +183,22 @@ columns are decoded; the others read as NULL."
                 (third source) scope))
               (:tvf
                (destructuring-bind (name args alias) (cdr source)
-                 (unless (or (name= name "json_each") (name= name "json_tree"))
-                   (sql-error "no such table-valued function: ~a" name))
-                 (let ((fs (json-table-source name nil alias)))
-                   (setf (fsrc-tvf fs)
-                         (cons (lambda (fns) (fsrc-rows-fn (json-table-source name fns alias))) args))
-                   fs))))))
+                 (cond
+                   ((or (name= name "json_each") (name= name "json_tree"))
+                    (let ((fs (json-table-source name nil alias)))
+                      (setf (fsrc-tvf fs)
+                            (cons (lambda (fns) (fsrc-rows-fn (json-table-source name fns alias))) args))
+                      fs))
+                   ((pragma-vtab-spec name)
+                    (let ((fs (pragma-table-source name nil alias)))
+                      (when (> (length args) (length (third (pragma-vtab-spec name))))
+                        (sql-error "too many arguments on ~a() - max ~d"
+                                   (string-downcase-ascii name) (length (third (pragma-vtab-spec name)))))
+                      (setf (fsrc-tvf fs)
+                            (cons (lambda (fns) (fsrc-rows-fn (pragma-table-source name fns alias))) args))
+                      fs))
+                   ((lookup-table *db* name nil) (sql-error "'~a' is not a function" name))
+                   (t (sql-error "no such table: ~a" name))))))))
       (setf (fsrc-join fs) join (fsrc-on fs) on (fsrc-using fs) using (fsrc-natural fs) natural)
       fs)))
 
@@ -591,7 +603,8 @@ narrowest, newest on ties), or NIL."
                       (setf any t)
                       (loop for name across (src-columns s)
                             for ci from 0
-                            do (unless (and (null tname) (member ci (src-hidden s)))
+                            do (unless (and (null tname) (or (member ci (src-hidden s))
+                                                             (member ci (src-star-hidden s))))
                                  (push (list (list :srccol si ci) name) out)))))
            (unless any
              (if tname (sql-error "no such table: ~a" tname) (sql-error "no tables specified")))))

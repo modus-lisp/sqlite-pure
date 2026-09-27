@@ -24,6 +24,7 @@
   affinities             ; simple-vector
   collations             ; simple-vector
   hidden                 ; list of column indexes hidden from unqualified * and lookup
+  star-hidden            ; ... hidden from unqualified * only (table-valued functions' hidden columns)
   table                  ; TABLE or NIL
   (rowid-p t)
   (used nil))            ; bit vector of referenced columns, or :ALL

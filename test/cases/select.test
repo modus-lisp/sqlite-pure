@@ -231,3 +231,64 @@ SELECT changes();
 UPDATE t AS tt SET v = v || s.nv FROM (SELECT id, count(*) AS nv FROM s GROUP BY id) AS s WHERE tt.id = s.id;
 SELECT * FROM t ORDER BY id;
 SELECT a.k, b.k, c.k FROM a JOIN b ON a.k = b.k AND b.k > 2 RIGHT JOIN c ON c.k = a.k ORDER BY c.k;
+
+== pragma-table-functions
+CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'x', ref INT REFERENCES q(k) ON DELETE CASCADE);
+CREATE TABLE q(k UNIQUE, v);
+CREATE INDEX pn ON p(name, ref DESC);
+CREATE VIEW pv AS SELECT name, ref FROM p;
+SELECT * FROM pragma_table_info('p');
+SELECT name, type, pk FROM pragma_table_info('p') WHERE notnull ORDER BY cid;
+SELECT cid, name, hidden FROM pragma_table_xinfo('pv');
+SELECT m.name, c.name FROM sqlite_schema AS m JOIN pragma_table_info(m.name) AS c WHERE m.type = 'table' ORDER BY m.name, c.cid;
+SELECT m.name, count(*) FROM sqlite_schema m, pragma_table_info(m.name) GROUP BY m.name ORDER BY 1;
+SELECT * FROM pragma_index_list('p');
+SELECT * FROM pragma_index_list('q');
+SELECT * FROM pragma_index_info('pn');
+SELECT * FROM pragma_index_xinfo('pn');
+SELECT * FROM pragma_foreign_key_list('p');
+SELECT "table", "from", "to", on_delete FROM pragma_foreign_key_list('p');
+SELECT * FROM pragma_table_info('nonesuch');
+SELECT * FROM pragma_table_info;
+SELECT * FROM pragma_table_info(NULL);
+SELECT name, arg, schema FROM pragma_table_info('q');
+SELECT * FROM pragma_table_info('q', 'main');
+SELECT name FROM pragma_database_list;
+SELECT * FROM pragma_integrity_check;
+SELECT * FROM pragma_quick_check();
+SELECT * FROM pragma_collation_list ORDER BY seq;
+SELECT user_version FROM pragma_user_version;
+SELECT * FROM pragma_encoding, pragma_foreign_keys, pragma_schema_version;
+SELECT * FROM pragma_page_size;
+SELECT count(*) FROM pragma_table_list WHERE name IN ('p', 'q', 'pv');
+SELECT name, type, ncol FROM pragma_table_list('p');
+SELECT * FROM pragma_table_info('p', 'q', 'r');
+SELECT * FROM pragma_nosuch('p');
+SELECT * FROM pragma_nosuch;
+SELECT p.name FROM pragma_table_info('p') AS p WHERE p.name LIKE 'n%';
+
+== index-xinfo
+CREATE TABLE w(a, b, c COLLATE NOCASE, d, PRIMARY KEY(c DESC, a)) WITHOUT ROWID;
+CREATE INDEX wb ON w(b, a);
+CREATE UNIQUE INDEX wd ON w(d DESC);
+CREATE TABLE r(x, y);
+CREATE INDEX rx ON r(x COLLATE NOCASE, y DESC);
+PRAGMA index_xinfo(wb);
+PRAGMA index_xinfo(wd);
+PRAGMA index_xinfo(rx);
+SELECT * FROM pragma_index_xinfo('wd');
+PRAGMA index_info(wb);
+
+== pragma-table-list
+CREATE TABLE a(x, y, z);
+CREATE TABLE s(k INTEGER PRIMARY KEY, v TEXT) STRICT;
+CREATE TABLE w(k PRIMARY KEY, v) WITHOUT ROWID;
+CREATE VIEW av AS SELECT x, y FROM a;
+CREATE TEMP TABLE t1(q);
+PRAGMA table_list;
+PRAGMA table_list(av);
+PRAGMA table_list('nosuch');
+SELECT schema, name, ncol, wr, strict FROM pragma_table_list ORDER BY schema, name;
+SELECT name FROM pragma_table_list('s');
+SELECT * FROM nosuch(1);
+SELECT * FROM a(1);

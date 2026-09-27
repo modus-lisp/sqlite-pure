@@ -15,6 +15,7 @@
   rowid-alias            ; index of the INTEGER PRIMARY KEY column, or NIL
   without-rowid
   pk                     ; list of column indexes making the PRIMARY KEY
+  pk-spec                ; list of (column-index collation desc) for the PRIMARY KEY
   autoincrement
   checks                 ; list of (name . expr)
   indexes                ; list of INDEX
@@ -169,7 +170,8 @@
                      (table-fkeys tb)))))))
       (setf (table-fkeys tb) (nreverse (table-fkeys tb)))
       (setf (table-checks tb) (nreverse (table-checks tb)))
-      (setf (table-pk tb) (mapcar #'first pk-set))
+      (setf (table-pk tb) (mapcar #'first pk-set)
+            (table-pk-spec tb) pk-set)
       ;; INTEGER PRIMARY KEY (not DESC, exactly one column) aliases the rowid
       (when (and pk-set (null (cdr pk-set)) (not without-rowid))
         (let* ((ci (first (first pk-set)))
@@ -262,9 +264,7 @@
                                          :table (table-name tb) :root (table-root tb)
                                          :unique t :auto t :pk-index t
                                          :conflict (table-pk-conflict tb)
-                                         :columns (loop for ci in (table-pk tb)
-                                                        collect (list ci (collate-of (aref (table-columns tb) ci))
-                                                                      nil)))
+                                         :columns (mapcar #'copy-list (table-pk-spec tb)))
                              (table-indexes tb)))))
              (schema-tables schema))
     schema))

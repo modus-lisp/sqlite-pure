@@ -551,7 +551,7 @@
          (src (derived-src (or alias name) +json-each-columns+
                            (make-list 10 :initial-element nil)
                            (make-list 10 :initial-element :binary))))
-    (setf (src-hidden src) '(8 9))
+    (setf (src-star-hidden src) '(8 9))
     (make-fsrc :src src
                :rows-fn (lambda (env)
                           (let* ((vals (mapcar (lambda (f) (funcall f env)) arg-fns))

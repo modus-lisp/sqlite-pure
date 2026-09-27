@@ -38,3 +38,8 @@ SELECT doc.id, j.value FROM doc, json_each(doc.body, '$.tags') AS j ORDER BY doc
 SELECT id FROM doc WHERE EXISTS (SELECT 1 FROM json_each(doc.body, '$.tags') WHERE value = 'c');
 SELECT body ->> '$.n' AS n, json_array_length(body, '$.tags') FROM doc ORDER BY n;
 SELECT count(*) FROM doc, json_tree(doc.body);
+
+== json-each-hidden-columns
+SELECT json, root, key FROM json_each('[1,2]');
+SELECT * FROM json_each('[1]') AS a NATURAL JOIN json_each('[1]') AS b;
+SELECT j.json FROM json_tree('{"a":1}') AS j WHERE j.key = 'a';

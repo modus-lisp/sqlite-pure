@@ -274,6 +274,65 @@ non-local exit.  Nested uses become savepoints."
 ;;; ------------------------------------------------------------------
 ;;; PRAGMA
 
+;;; pragma_NAME(arg, schema): the eponymous table-valued functions over the
+;;; pragmas that return rows.  (name columns hidden-columns), as in 3.40.
+(defparameter +pragma-vtabs+
+  (let ((as '("arg" "schema")) (s '("schema")))
+    `(("table_info" ("cid" "name" "type" "notnull" "dflt_value" "pk") ,as)
+      ("table_xinfo" ("cid" "name" "type" "notnull" "dflt_value" "pk" "hidden") ,as)
+      ("index_list" ("seq" "name" "unique" "origin" "partial") ,as)
+      ("index_info" ("seqno" "cid" "name") ,as)
+      ("index_xinfo" ("seqno" "cid" "name" "desc" "coll" "key") ,as)
+      ("foreign_key_list" ("id" "seq" "table" "from" "to" "on_update" "on_delete" "match") ,as)
+      ("table_list" ("schema" "name" "type" "ncol" "wr" "strict") ,as)
+      ("integrity_check" ("integrity_check") ,as)
+      ("quick_check" ("quick_check") ,as)
+      ("database_list" ("seq" "name" "file") ())
+      ("collation_list" ("seq" "name") ())
+      ("user_version" ("user_version") ())
+      ("application_id" ("application_id") ())
+      ("schema_version" ("schema_version") ())
+      ("freelist_count" ("freelist_count") ())
+      ("encoding" ("encoding") ())
+      ("foreign_keys" ("foreign_keys") ())
+      ("page_size" ("page_size") ,s)
+      ("page_count" ("page_count") ,s)
+      ("journal_mode" ("journal_mode") ,s)
+      ("auto_vacuum" ("auto_vacuum") ,s))))
+
+(defun pragma-vtab-spec (name)
+  (and (> (length name) 7) (name= (subseq name 0 7) "pragma_")
+       (assoc (subseq name 7) +pragma-vtabs+ :test #'name=)))
+
+(defun pragma-table-source (name arg-fns alias)
+  "An FSRC for pragma_NAME with argument closures ARG-FNS (arg, then schema)."
+  (destructuring-bind (pname cols hidden) (pragma-vtab-spec name)
+    (let* ((all (append cols hidden))
+           (src (derived-src (or alias (string-downcase-ascii name)) all
+                             (make-list (length all) :initial-element nil)
+                             (make-list (length all) :initial-element :binary))))
+      (setf (src-star-hidden src) (loop for i from (length cols) below (length all) collect i))
+      (make-fsrc
+       :src src
+       :rows-fn (lambda (env)
+                  (let* ((vals (mapcar (lambda (f) (funcall f env)) arg-fns))
+                         (arg (if (member "arg" hidden :test #'string=) (pop vals) nil))
+                         (schema (pop vals))
+                         (db (if (and schema (not (eq schema :null)))
+                                 (schema-db *db* (value-to-text schema) nil)
+                                 *db*)))
+                    (if (or (null db) (eq arg :null))
+                        '()
+                        (let ((rows (exec-pragma db (list :pragma :name pname :value arg))))
+                          (rows-to-vectors
+                           (mapcar (lambda (r)
+                                     (append (subseq (append r (make-list (length cols) :initial-element :null))
+                                                     0 (length cols))
+                                             (if (member "arg" hidden :test #'string=)
+                                                 (list (if arg arg :null) (or schema :null))
+                                                 (and hidden (list (or schema :null))))))
+                                   rows))))))))))
+
 (defun pragma-rows (names rows) (values rows names))
 
 (defun exec-pragma (db st)
@@ -376,7 +435,7 @@ non-local exit.  Nested uses become savepoints."
                                                     ((name= (db-name d) "temp") 1)
                                                     (t (prog1 next (incf next))))
                                               (db-name d) (or (db-path d) ""))))))
-          ((string= n "table_list") (pragma-table-list db))
+          ((string= n "table_list") (pragma-table-list db value))
           ((member n '("integrity_check" "quick_check") :test #'string=)
            (let ((problems (integrity-check db)))
              (pragma-rows (list n) (if problems (mapcar #'list problems) (list (list "ok"))))))
@@ -500,22 +559,59 @@ non-local exit.  Nested uses become savepoints."
         (values nil nil)
         (let ((tb (lookup-table db (index-table idx))))
           (values
-           (loop for (c coll desc) in (index-columns idx)
-                 for i from 0
-                 collect (append (list i (if (integerp c) c -2)
-                                       (if (integerp c) (column-name (aref (table-columns tb) c)) :null))
-                                 (when xinfo (list (if desc 1 0) (collation-name coll) 1))))
+           (append
+            (loop for (c coll desc) in (index-columns idx)
+                  for i from 0
+                  collect (append (list i (if (integerp c) c -2)
+                                        (if (integerp c) (column-name (aref (table-columns tb) c)) :null))
+                                  (when xinfo (list (if desc 1 0) (collation-name coll) 1))))
+            ;; xinfo also lists the key suffix every index entry carries
+            (when xinfo
+              (let ((n (length (index-columns idx)))
+                    (used (mapcar #'first (index-columns idx))))
+                (cond
+                  ((not (table-without-rowid tb)) (list (list n -1 :null 0 "BINARY" 0)))
+                  ((index-pk-index idx)
+                   (loop for col across (table-columns tb) for ci from 0
+                         unless (member ci used)
+                           collect (list n ci (column-name col) 0 "BINARY" 0) and do (incf n)))
+                  (t (let ((pk (find-if #'index-pk-index (table-indexes tb))))
+                       (loop for (c coll desc) in (index-columns pk)
+                             unless (member c used)
+                               collect (list n c (column-name (aref (table-columns tb) c))
+                                             (if desc 1 0) (collation-name coll) 0)
+                               and do (incf n))))))))
            (append '("seqno" "cid" "name") (when xinfo '("desc" "coll" "key"))))))))
 
-(defun pragma-table-list (db)
-  (let ((*db* db) (rows '()))
-    (maphash (lambda (k tb)
-               (unless (string= k "sqlite_master")
-                 (push (list "main" (table-name tb)
-                             (if (table-view-select tb) "view" "table")
-                             (length (table-columns tb))
-                             (if (table-without-rowid tb) 1 0) 0)
-                       rows)))
-             (schema-tables (db-schema* db)))
-    (values (sort rows #'string< :key #'second)
+(defun pragma-table-list (db &optional only)
+  "Every table and view of every database (or just those named ONLY)."
+  (let ((*db* db) (rows '())
+        (only (and only (value-to-text only)))
+        (dbs (temp-first-list db)))
+    (flet ((add (schema name type ncol wr strict)
+             (when (or (null only) (name= only name))
+               (push (list schema name type ncol wr strict) rows))))
+      (dolist (d (if (find "temp" dbs :key #'db-name :test #'name=)
+                     dbs
+                     (list* (first dbs) :temp (rest dbs))))
+        (if (eq d :temp)
+            (add "temp" "sqlite_temp_schema" "table" 5 0 0)
+            (let ((schema (if (eq d (conn db)) "main" (db-name d)))
+                  (tabs '()))
+              (maphash (lambda (k tb)
+                         (declare (ignore k))
+                         (unless (member (table-name tb) '("sqlite_master" "sqlite_schema"
+                                                           "sqlite_temp_master" "sqlite_temp_schema")
+                                         :test #'name=)
+                           (pushnew tb tabs)))
+                       (schema-tables (db-schema* d)))
+              (dolist (tb (sort tabs #'string< :key #'table-name))
+                (add schema (table-name tb)
+                     (if (table-view-select tb) "view" "table")
+                     (length (if (table-view-select tb) (view-column-info tb) (table-columns tb)))
+                     (if (table-without-rowid tb) 1 0)
+                     (if (table-strict tb) 1 0)))
+              (add schema (if (name= schema "temp") "sqlite_temp_schema" "sqlite_schema")
+                   "table" 5 0 0)))))
+    (values (nreverse rows)
             '("schema" "name" "type" "ncol" "wr" "strict"))))
