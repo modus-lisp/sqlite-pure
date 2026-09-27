@@ -10,10 +10,11 @@ dropped root's slot is filled by the largest root, whose sqlite_schema row
 is repointed; roots are dropped largest first, as SQLite does."
   (if (autovacuum-p *db*)
       (dolist (root (sort (copy-list roots) #'>))
-        (clear-btree *db* root)
+        (clear-btree *db* root :keep-root t)
         (let ((moved (release-root *db* root)))
           (when moved (retarget-schema-root moved root))))
-      (dolist (root roots) (clear-btree *db* root))))
+      ;; largest root first, as destroyTable() orders them
+      (dolist (root (sort (copy-list roots) #'>)) (clear-btree *db* root))))
 
 (defun retarget-schema-root (old new)
   (let ((rows '()))
@@ -22,7 +23,8 @@ is repointed; roots are dropped largest first, as SQLite does."
       (destructuring-bind (rowid type name tbl root sql &rest more) r
         (declare (ignore more))
         (when (eql root old)
-          (table-insert *db* 1 rowid (encode-record (list type name tbl new sql))))))))
+          ;; an UPDATE of sqlite_schema: rewritten in place when the same size
+          (table-insert *db* 1 rowid (encode-record (list type name tbl new sql)) :overwrite t))))))
 
 (defun ddl-target (schema temp)
   "The database a CREATE statement writes to."
@@ -35,10 +37,34 @@ is repointed; roots are dropped largest first, as SQLite does."
   (setf (db-schema *db*) nil))
 
 (defun add-schema-row (type name tbl root sql)
-  (let* ((st (schema-table))
-         (rowid (1+ (or (table-max-rowid *db* 1) 0))))
+  (let ((rowid (1+ (or (table-max-rowid *db* 1) 0))))
     (table-insert *db* 1 rowid (encode-record (list type name tbl root (or sql :null))))
     rowid))
+
+(defparameter +null-schema-record+ (coerce '(6 0 0 0 0 0) 'octets)
+  "The empty record sqlite3StartTable writes as a placeholder schema row.")
+
+(defun add-placeholder-schema-row ()
+  "sqlite3StartTable's placeholder row in sqlite_schema; returns its rowid.
+sqlite3EndTable later rewrites it (REWRITE-PLACEHOLDER).  A file format not
+yet set (a database created by PRAGMA auto_vacuum) is set now, with the
+text encoding."
+  (when (zerop (header-u32 *db* +hdr-schema-format+))
+    (set-header-u32 *db* +hdr-schema-format+ 4)
+    (set-header-u32 *db* +hdr-text-encoding+ (ecase (db-encoding *db*) (:utf-8 1) (:utf-16le 2) (:utf-16be 3))))
+  (let ((rowid (1+ (or (table-max-rowid *db* 1) 0))))
+    (table-insert *db* 1 rowid +null-schema-record+)
+    rowid))
+
+(defun rewrite-placeholder (rowid type name tbl root sql)
+  (table-insert *db* 1 rowid (encode-record (list type name tbl root (or sql :null)))))
+
+(defun add-table-schema-row (type name tbl root sql)
+  "A table, view or virtual table's schema row, written as StartTable and
+EndTable write it: a placeholder first, then the real record."
+  (let ((row (add-placeholder-schema-row)))
+    (rewrite-placeholder row type name tbl root sql)
+    row))
 
 (defun schema-rows-where (pred)
   (remove-if-not pred (schema-rows (db-schema* *db*))))
@@ -94,14 +120,17 @@ is repointed; roots are dropped largest first, as SQLite does."
 ;;; CREATE TABLE
 
 (defun create-table-from-ast (ast sql)
+  ;; as SQLite codes it: the table's b-tree and a placeholder schema row,
+  ;; the constraint indexes (b-tree and row each), then the real row
   (let* ((name (getf (cdr ast) :name))
          (tb (table-from-ast name ast 0 sql))
-         (root (create-btree *db* (if (table-without-rowid tb) +leaf-index+ +leaf-table+))))
-    (add-schema-row "table" name name root sql)
+         (root (create-btree *db* (if (table-without-rowid tb) +leaf-index+ +leaf-table+)))
+         (row (add-placeholder-schema-row)))
     (loop for u in (table-unique-constraints tb)
           for k from 1
-          do (add-schema-row "index" (format nil "sqlite_autoindex_~a_~d" name k) name
-                             (create-btree *db* +leaf-index+) nil))
+          do (let ((iroot (create-btree *db* +leaf-index+)))
+               (add-schema-row "index" (format nil "sqlite_autoindex_~a_~d" name k) name iroot nil)))
+    (rewrite-placeholder row "table" name name root sql)
     (when (and (table-autoincrement tb) (null (find-table-in *db* "sqlite_sequence")))
       (let ((seq-sql "CREATE TABLE sqlite_sequence(name,seq)"))
         (add-schema-row "table" "sqlite_sequence" "sqlite_sequence"
@@ -157,10 +186,10 @@ is repointed; roots are dropped largest first, as SQLite does."
 ;;; CREATE INDEX
 
 (defun populate-index (table idx)
+  "sqlite3RefillIndex: every key, sorted, appended through a bulk-load cursor."
   (let ((*index-cmp* (index-full-cmp table idx))
-        (unique-cmp (index-key-cmp (index-collations idx) (index-descs idx)))
-        (seen (make-hash-table :test #'equal)))
-    (declare (ignore unique-cmp))
+        (seen (make-hash-table :test #'equal))
+        (keys '()))
     (map-table-rows table
                     (lambda (row)
                       (when (index-applies-p table idx row)
@@ -173,7 +202,10 @@ is repointed; roots are dropped largest first, as SQLite does."
                                     (constraint-error "UNIQUE constraint failed: ~a"
                                                       (constraint-columns-text table idx)))
                                   (setf (gethash k seen) t)))))
-                          (index-insert *db* (index-root idx) key)))))))
+                          (push key keys)))))
+    (setf keys (stable-sort (nreverse keys) (lambda (a b) (minusp (funcall *index-cmp* a b)))))
+    (dolist (key keys)
+      (index-insert *db* (index-root idx) key :bulk t))))
 
 (defun exec-create-index (st text)
   (destructuring-bind (&key name schema table if-not-exists &allow-other-keys) (cdr st)
@@ -195,8 +227,8 @@ is repointed; roots are dropped largest first, as SQLite does."
             (when (and (consp e) (eq (car e) :col))
               (sql-error "no such column: ~a" (third e)))))
         (setf (index-root idx) (create-btree *db* +leaf-index+))
-        (populate-index tb idx)
         (add-schema-row "index" name (table-name tb) (index-root idx) sql)
+        (populate-index tb idx)
         (bump-schema-cookie)))
     nil)))
 
@@ -210,7 +242,7 @@ is repointed; roots are dropped largest first, as SQLite does."
     (check-new-name name :view)
     ;; validate the body now, as SQLite does
     (compile-select select (make-scope))
-    (add-schema-row "view" name name 0 (stored-create-sql text "VIEW"))
+    (add-table-schema-row "view" name name 0 (stored-create-sql text "VIEW"))
     (bump-schema-cookie)
     nil)))
 
@@ -261,17 +293,23 @@ is repointed; roots are dropped largest first, as SQLite does."
          (when (= (table-root tb) 1) (sql-error "table ~a may not be dropped" name))
          (when (and (eq kind :table) (name= name "sqlite_sequence"))
            (sql-error "table sqlite_sequence may not be dropped"))
-         (when (table-vtab tb) (vtab-drop tb))
+         ;; sqlite3CodeDropTable: the triggers' rows, the sqlite_sequence row,
+         ;; the other schema rows, then the b-trees (largest root first)
+         (dolist (r (reverse (schema-rows-where (lambda (r) (and (equal (second r) "trigger") (stringp (fourth r))
+                                                                  (name= (fourth r) name))))))
+           (table-delete *db* 1 (first r)))
+         (when (and (table-autoincrement tb) (sequence-table))
+           (let ((seq (sequence-table)))
+             (dolist (row (scan-table-rows seq nil nil))
+               (when (and (stringp (svref row 0)) (name= (svref row 0) name))
+                 (delete-row seq row)))))
+         (delete-schema-rows (lambda (r) (and (stringp (fourth r)) (name= (fourth r) name)
+                                              (not (equal (second r) "trigger")))))
          (unless (or (table-view-select tb) (table-vtab tb))
            (drop-btrees (cons (table-root tb)
                               (loop for idx in (table-indexes tb)
-                                    unless (index-pk-index idx) collect (index-root idx))))
-           (when (and (table-autoincrement tb) (sequence-table))
-             (let ((seq (sequence-table)))
-               (dolist (row (scan-table-rows seq nil nil))
-                 (when (and (stringp (svref row 0)) (name= (svref row 0) name))
-                   (delete-row seq row))))))
-         (delete-schema-rows (lambda (r) (and (stringp (fourth r)) (name= (fourth r) name))))
+                                    unless (index-pk-index idx) collect (index-root idx)))))
+         (when (table-vtab tb) (vtab-drop tb))
          (bump-schema-cookie)))
       (:index
        (let ((idx (gethash (schema-key name) (schema-indexes (db-schema* *db*)))))
@@ -279,8 +317,8 @@ is repointed; roots are dropped largest first, as SQLite does."
            (if if-exists (return-from exec-drop nil) (sql-error "no such index: ~a" name)))
          (when (index-auto idx)
            (sql-error "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"))
-         (drop-btrees (list (index-root idx)))
          (delete-schema-rows (lambda (r) (and (equal (second r) "index") (name= (third r) name))))
+         (drop-btrees (list (index-root idx)))
          (bump-schema-cookie)))
       (:trigger
        (unless (gethash (schema-key name) (schema-triggers (db-schema* *db*)))

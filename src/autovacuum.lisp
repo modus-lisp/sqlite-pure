@@ -99,140 +99,81 @@
         while b do (ptrmap-put db b +ptrmap-overflow2+ a)))
 
 ;;; ------------------------------------------------------------------
-;;; The freelist, page by page
+;;; Moving a page (relocatePage)
 
-(defun remove-free-page (db pgno)
-  "Take the specific free page PGNO off the freelist.  True if it was there."
-  (let ((prev nil) (trunk (header-u32 db +hdr-freelist-trunk+)))
-    (loop while (plusp trunk)
-          do (let* ((tb (read-page db trunk))
-                    (next (get-u32 tb 0))
-                    (n (get-u32 tb 4)))
-               (cond
-                 ((= trunk pgno)
-                  (if (zerop n)
-                      (if prev
-                          (put-u32 (page-for-write db prev) 0 next)
-                          (set-header-u32 db +hdr-freelist-trunk+ next))
-                      ;; promote its last leaf to be the trunk
-                      (let* ((leaf (get-u32 tb (+ 8 (* 4 (1- n)))))
-                             (lb (page-for-write db leaf)))
-                        (replace lb tb)
-                        (put-u32 lb 4 (1- n))
-                        (if prev
-                            (put-u32 (page-for-write db prev) 0 leaf)
-                            (set-header-u32 db +hdr-freelist-trunk+ leaf))
-                        (ptrmap-put db leaf +ptrmap-free+ 0)))
-                  (set-header-u32 db +hdr-freelist-count+ (1- (header-u32 db +hdr-freelist-count+)))
-                  (return-from remove-free-page t))
-                 (t
-                  (let ((k (loop for i below n when (= (get-u32 tb (+ 8 (* 4 i))) pgno) return i)))
-                    (when k
-                      (let ((w (page-for-write db trunk)))
-                        (put-u32 w (+ 8 (* 4 k)) (get-u32 w (+ 8 (* 4 (1- n)))))
-                        (put-u32 w 4 (1- n)))
-                      (set-header-u32 db +hdr-freelist-count+ (1- (header-u32 db +hdr-freelist-count+)))
-                      (return-from remove-free-page t)))))
-               (setf prev trunk trunk next)))
-    nil))
-
-(defun free-page-at-most (db limit)
-  "Take a free page numbered LIMIT or less off the freelist, or NIL."
-  (let ((trunk (header-u32 db +hdr-freelist-trunk+)))
-    (loop while (plusp trunk)
-          do (let* ((tb (read-page db trunk)) (n (get-u32 tb 4)))
-               (loop for i below n
-                     for p = (get-u32 tb (+ 8 (* 4 i)))
-                     do (when (<= p limit) (remove-free-page db p) (return-from free-page-at-most p)))
-               (setf trunk (get-u32 tb 0))))
-    (setf trunk (header-u32 db +hdr-freelist-trunk+))
-    (loop while (plusp trunk)
-          do (when (<= trunk limit)
-               (remove-free-page db trunk)
-               (return-from free-page-at-most trunk))
-             (setf trunk (get-u32 (read-page db trunk) 0)))
-    nil))
-
-(defun extend-to (db pgno)
-  "Grow the file so PGNO exists (map pages included)."
-  (loop while (< (db-page-count db) pgno)
-        do (let ((p (1+ (db-page-count db))))
-             (setf (db-page-count db) p)
-             (fill (page-for-write db p) 0))))
-
-;;; ------------------------------------------------------------------
-;;; Moving a page
-
-(defun relocate-page (db src dst)
-  "Move page SRC's content to DST (already taken off the freelist) and fix
-its referrer and the entries of the pages it refers to."
-  (multiple-value-bind (type parent) (ptrmap-get db src)
-    (let ((content (copy-seq (read-page db src))))
-      (replace (page-for-write db dst) content))
-    ;; children and chains now name DST as parent
-    (cond ((member type (list +ptrmap-root+ +ptrmap-btree+))
-           (ptrmap-note-page db dst))
-          ((member type (list +ptrmap-overflow1+ +ptrmap-overflow2+))
-           (let ((next (get-u32 (read-page db dst) 0)))
+(defun relocate-page (db src dst &optional type parent)
+  "Move page SRC's content to DST (already allocated) and fix its referrer
+and the entries of the pages it refers to."
+  (unless type (multiple-value-setq (type parent) (ptrmap-get db src)))
+  (let ((content (copy-seq (read-page db src))))
+    (replace (page-for-write db dst) content))
+  (cond ((member type (list +ptrmap-root+ +ptrmap-btree+))
+         (ptrmap-note-page db dst))
+        (t (let ((next (get-u32 (read-page db dst) 0)))
              (when (plusp next) (ptrmap-put db next +ptrmap-overflow2+ dst)))))
-    ;; the referrer
+  (unless (= type +ptrmap-root+)
+    ;; modifyPagePointer: the first pointer to SRC in the referrer
     (cond ((= type +ptrmap-btree+)
            (let* ((b (page-for-write db parent)) (off (hdr-off parent))
                   (ptype (aref b off)) (n (page-ncells b off)))
-             (dotimes (i n)
-               (let ((p (cell-ptr b off ptype i)))
-                 (when (= (get-u32 b p) src) (put-u32 b p dst))))
-             (when (= (get-u32 b (+ off 8)) src) (put-u32 b (+ off 8) dst))))
+             (unless (loop for i below n
+                           for p = (cell-ptr b off ptype i)
+                           thereis (when (= (get-u32 b p) src) (put-u32 b p dst) t))
+               (if (= (get-u32 b (+ off 8)) src)
+                   (put-u32 b (+ off 8) dst)
+                   (corrupt "page ~d not referred to by ~d" src parent)))))
           ((= type +ptrmap-overflow1+)
            (let* ((b (read-page db parent)) (off (hdr-off parent))
                   (ptype (aref b off)) (n (page-ncells b off)))
-             (dotimes (i n)
+             (dotimes (i n (corrupt "overflow page ~d not referred to by ~d" src parent))
                (multiple-value-bind (ov at) (cell-overflow-at db b off ptype i)
-                 (when (eql ov src) (put-u32 (page-for-write db parent) at dst))))))
+                 (when (eql ov src)
+                   (put-u32 (page-for-write db parent) at dst)
+                   (return))))))
           ((= type +ptrmap-overflow2+)
            (put-u32 (page-for-write db parent) 0 dst)))
-    (ptrmap-put db dst type parent)
-    type))
+    (ptrmap-put db dst type parent))
+  type)
 
 ;;; ------------------------------------------------------------------
-;;; Roots
+;;; Roots (btreeCreateTable / btreeDropTable)
 
 (defun next-root-slot (db n)
   (loop do (incf n) while (skipped-page-p db n))
   n)
 
 (defun allocate-root (db)
-  "A page for a new b-tree root at largest-root + 1."
-  (let* ((largest (header-u32 db +hdr-largest-root+))
-         (slot (next-root-slot db largest)))
-    (cond ((> slot (db-page-count db)) (extend-to db slot))
-          ((remove-free-page db slot))
-          (t ;; in use: move its content out of the way
-           (let ((dst (allocate-page db)))
-             (when (= dst slot) (corrupt "root slot allocated twice"))
-             (relocate-page db slot dst))))
-    (fill (page-for-write db slot) 0)
-    (ptrmap-put db slot +ptrmap-root+ 0)
-    (set-header-u32 db +hdr-largest-root+ slot)
-    slot))
+  "The page for a new b-tree root: the slot after the largest root, its
+occupant (if any) moved out of the way."
+  (let* ((root (next-root-slot db (header-u32 db +hdr-largest-root+)))
+         (move (allocate-page db root :exact)))
+    (when (/= move root)
+      (multiple-value-bind (type parent) (ptrmap-get db root)
+        (when (member type (list +ptrmap-root+ +ptrmap-free+))
+          (corrupt "root slot ~d already a root" root))
+        (relocate-page db root move type parent)))
+    (ptrmap-put db root +ptrmap-root+ 0)
+    (set-header-u32 db +hdr-largest-root+ root)
+    root))
 
 (defun release-root (db root)
-  "After ROOT's tree was freed: keep the roots packed.  Returns the root
-page that was moved into ROOT's slot (whose schema entry must change), or NIL."
-  (let ((largest (header-u32 db +hdr-largest-root+)))
-    (prog1
-        (when (/= root largest)
-          ;; ROOT is free now; move the largest root into it
-          (remove-free-page db root)
-          (relocate-page db largest root)
+  "After ROOT's tree was cleared (ROOT itself left an empty leaf): keep the
+roots packed.  Returns the root page moved into ROOT's slot (whose schema
+entry must change), or NIL."
+  (let ((largest (header-u32 db +hdr-largest-root+)) (moved nil))
+    (if (= root largest)
+        (free-page db root)
+        (progn
+          (relocate-page db largest root +ptrmap-root+ 0)
           (free-page db largest)
-          largest)
-      (let ((n (1- largest)))
-        (loop while (and (> n 1) (skipped-page-p db n)) do (decf n))
-        (set-header-u32 db +hdr-largest-root+ (max 1 n))))))
+          (setf moved largest)))
+    (let ((n (1- largest)))
+      (loop while (skipped-page-p db n) do (decf n))
+      (set-header-u32 db +hdr-largest-root+ n))
+    moved))
 
 ;;; ------------------------------------------------------------------
-;;; Vacuuming
+;;; Vacuuming (incrVacuumStep, autoVacuumCommit)
 
 (defun final-db-size (db norig nfree)
   (let* ((nentry (floor (db-usable-size db) 5))
@@ -243,15 +184,24 @@ page that was moved into ROOT's slot (whose schema entry must change), or NIL."
     (loop while (skipped-page-p db nfin) do (decf nfin))
     nfin))
 
-(defun vacuum-step (db nfin last)
-  "Empty page LAST (> NFIN) by moving it into a free page at or below NFIN."
+(defun incr-vacuum-step (db nfin last commit)
+  "Empty page LAST into a free page at or below NFIN.  :DONE if the
+freelist is empty."
   (unless (skipped-page-p db last)
-    (multiple-value-bind (type) (ptrmap-get db last)
+    (when (zerop (header-u32 db +hdr-freelist-count+))
+      (return-from incr-vacuum-step :done))
+    (multiple-value-bind (type parent) (ptrmap-get db last)
       (cond ((= type +ptrmap-root+) (corrupt "root page ~d above the vacuum limit" last))
-            ((= type +ptrmap-free+) (remove-free-page db last))
-            (t (let ((dst (or (free-page-at-most db nfin)
-                              (corrupt "no free page to vacuum into"))))
-                 (relocate-page db last dst)))))))
+            ((= type +ptrmap-free+)
+             (unless commit (allocate-page db last :exact)))
+            (t (let ((dst nil))
+                 (loop do (setf dst (if commit (allocate-page db 0 :any) (allocate-page db nfin :le)))
+                       while (and commit (> dst nfin)))
+                 (relocate-page db last dst type parent))))))
+  (unless commit
+    (loop do (decf last) while (skipped-page-p db last))
+    (shrink-to db last))
+  :ok)
 
 (defun autovacuum-commit (db)
   "FULL auto-vacuum: before committing, move pages down and shrink."
@@ -259,18 +209,23 @@ page that was moved into ROOT's slot (whose schema entry must change), or NIL."
         (norig (db-page-count db)))
     (when (plusp nfree)
       (let ((nfin (final-db-size db norig nfree)))
-        (loop for last from norig above nfin do (vacuum-step db nfin last))
+        (loop for last from norig above nfin
+              until (eq (incr-vacuum-step db nfin last t) :done))
+        (set-header-u32 db +hdr-freelist-trunk+ 0)
+        (set-header-u32 db +hdr-freelist-count+ 0)
+        (set-header-u32 db +hdr-page-count+ nfin)
         (shrink-to db nfin)))))
 
 (defun incremental-vacuum (db n)
-  "Free up to N pages (all if N <= 0) from the end of the file."
-  (let ((nfree (header-u32 db +hdr-freelist-count+)))
-    (when (plusp nfree)
-      (let* ((k (if (plusp n) (min n nfree) nfree))
-             (norig (db-page-count db))
-             (nfin (final-db-size db norig k)))
-        (loop for last from norig above nfin do (vacuum-step db nfin last))
-        (shrink-to db nfin)))))
+  "PRAGMA incremental_vacuum(N): N steps (all if N <= 0), each moving the
+last page of the file into a free page, as sqlite3BtreeIncrVacuum does."
+  (loop repeat (if (plusp n) n most-positive-fixnum)
+        do (let ((nfree (header-u32 db +hdr-freelist-count+))
+                 (norig (db-page-count db)))
+             (when (zerop nfree) (return))
+             (when (eq (incr-vacuum-step db (final-db-size db norig nfree) norig nil) :done)
+               (return))
+             (set-header-u32 db +hdr-page-count+ (db-page-count db)))))
 
 (defun ptrmap-problems (db)
   "Pointer-map entries that disagree with the b-trees and the freelist."

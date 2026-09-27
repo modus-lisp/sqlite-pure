@@ -132,7 +132,7 @@
       (let* ((fts (fts5-spec name args))
              (q (substitute-string "'" "''" name)))
         (ensure-write-txn *db*)
-        (add-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
+        (add-table-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
         (dolist (suffix (fts5-shadow-suffixes fts))
           (let ((ddl (cond
                        ((string= suffix "data") (format nil "CREATE TABLE '~a_data'(id INTEGER PRIMARY KEY, block BLOB)" q))
@@ -921,7 +921,7 @@ tokens, or all when RANGE-END is negative.  Returns (values bytes-out)."
       (check-new-name name :table)
       (fts5vocab-spec args)
       (ensure-write-txn *db*)
-      (add-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
+      (add-table-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
       (bump-schema-cookie)
       nil)))
 

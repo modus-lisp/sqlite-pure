@@ -224,7 +224,8 @@
       (let ((*encoding* (db-encoding db)))
         (map-table db 1 (lambda (rowid payload)
                           (push (cons rowid (decode-record payload)) rows)))))
-    (setf rows (nreverse rows)
+    ;; (a CREATE's placeholder row, not yet filled in, is not a schema entry)
+    (setf rows (remove-if-not (lambda (r) (stringp (third r))) (nreverse rows))
           (schema-rows schema) rows)
     ;; tables and views first, then indexes and triggers
     (dolist (r rows)

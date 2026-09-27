@@ -157,7 +157,7 @@ HIDDEN, '__langid' HIDDEN); the last three are marked hidden separately)."
       (let* ((f (fts3-spec module name args *db*))
              (q (substitute-string "'" "''" name)))
         (ensure-write-txn *db*)
-        (add-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
+        (add-table-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
         (flet ((ddl (text) (create-table-from-ast (car (first (parse-sql text))) text)))
           (unless (f3-content f)
             (ddl (format nil "CREATE TABLE '~a_content'(docid INTEGER PRIMARY KEY~{, 'c~d~a'~}~@[, langid~])"

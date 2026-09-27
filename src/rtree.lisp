@@ -149,7 +149,7 @@
               ((name= module "dbstat") (dbstat-spec args))
               (t (fts3tok-spec args)))
         (ensure-write-txn *db*)
-        (add-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
+        (add-table-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
         (bump-schema-cookie)
         (return-from exec-create-virtual nil))
       (when (name= module "fts5vocab")
@@ -161,7 +161,7 @@
                      (rtree-spec module args)))
              (q (substitute-string "\"" "\"\"" name)))
         (ensure-write-txn *db*)
-        (add-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
+        (add-table-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
         (dolist (ddl (list (format nil "CREATE TABLE \"~a_rowid\"(rowid INTEGER PRIMARY KEY,nodeno~{,a~d~})"
                                    q (loop for i below (rtree-naux rt) collect i))
                            (format nil "CREATE TABLE \"~a_node\"(nodeno INTEGER PRIMARY KEY,data)" q)
@@ -391,6 +391,13 @@ so one past the largest node number in <t>_node at that moment."
         (shadow-put (rt-rowid-table) id
                     (cons nodeno (if old (rest old) (make-list (rtree-naux (rt-spec)) :initial-element :null)))))
       (shadow-put (rt-parent-table) id (list nodeno))))
+
+(defun rtree-new-rowid ()
+  "rtreeNewRowid: a row (NULL, NULL) inserted into <t>_rowid claims the next
+rowid; the mapping written later replaces it."
+  (let ((id (1+ (or (table-max-rowid (table-owner (rt-rowid-table)) (table-root (rt-rowid-table))) 0))))
+    (shadow-put (rt-rowid-table) id (make-list (1+ (rtree-naux (rt-spec))) :initial-element :null))
+    id))
 
 (defun update-mapping (id node height)
   (when (plusp height)
@@ -747,9 +754,7 @@ Returns T, or :IGNORE if a constraint skipped the row."
       (when old (rtree-delete-id (rt-int64 (svref old 0))))
       (when new
         (unless (car cell)
-          (setf (car cell) (1+ (or (table-max-rowid (table-owner (rt-rowid-table))
-                                                    (table-root (rt-rowid-table)))
-                                   0))))
+          (setf (car cell) (rtree-new-rowid)))
         (insert-at-height cell 0)
         (let ((aux (loop for i from (1+ (rtree-ndim2 rt)) below (length (rtree-names rt))
                          collect (svref new i))))
@@ -920,17 +925,28 @@ walking the tree past subtrees the coordinate constraints rule out."
           ((fts3-p v) (progn (fts3-of table) (fts3-shadow-suffixes v)))
           (t '()))))
 
+(defun vtab-drop-order (table)
+  "The shadow tables in the order the module's xDestroy drops them."
+  (let* ((v (table-vtab table))
+         (present (vtab-shadow-suffixes table))
+         (order (cond ((rtree-p v) '("node" "rowid" "parent"))
+                      ((fts5-p v) '("data" "idx" "config" "docsize" "content"))
+                      ((fts3-p v) '("segments" "segdir" "docsize" "stat" "content"))
+                      (t present))))
+    (remove-if-not (lambda (x) (member x present :test #'string=)) order)))
+
 (defun vtab-drop (table)
-  "Drop a virtual table's shadow tables (all roots at once: in an auto-vacuum
-database dropping one moves another)."
-  (progn
-    (when (rtree-p (table-vtab table)) (rtree-forget-state table))
-    (let ((shadows (loop for suffix in (vtab-shadow-suffixes table)
-                         for sh = (find-table-in *db* (shadow-name table suffix))
-                         when sh collect sh)))
-      (drop-btrees (mapcar #'table-root shadows))
-      (dolist (sh shadows)
-        (delete-schema-rows (lambda (r) (and (stringp (fourth r)) (name= (fourth r) (table-name sh)))))))))
+  "xDestroy: DROP TABLE each shadow table in turn (its schema rows, then its
+b-trees, largest root first)."
+  (when (rtree-p (table-vtab table)) (rtree-forget-state table))
+  (dolist (suffix (vtab-drop-order table))
+    (let ((sh (find-table-in *db* (shadow-name table suffix))))
+      (when sh
+        (delete-schema-rows (lambda (r) (and (stringp (fourth r)) (name= (fourth r) (table-name sh))
+                                             (not (equal (second r) "trigger")))))
+        (drop-btrees (cons (table-root sh)
+                           (loop for idx in (table-indexes sh)
+                                 unless (index-pk-index idx) collect (index-root idx))))))))
 
 (defun vtab-rename (table new)
   "Rename the shadow tables along with the virtual table."

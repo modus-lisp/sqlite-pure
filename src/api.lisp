@@ -416,12 +416,22 @@ non-local exit.  Nested uses become savepoints."
           ((string= n "auto_vacuum")
            (if value
                (let* ((v (string-downcase-ascii (value-to-text value)))
+                      (created nil)
                       (mode (cond ((member v '("1" "full") :test #'string=) :full)
                                   ((member v '("2" "incremental") :test #'string=) :incremental)
                                   (t nil))))
                  ;; takes effect now on a database without tables, else at VACUUM
                  (setf (db-pending-autovacuum db) (or mode :none))
-                 (when (and (plusp (db-page-count db))
+                 ;; on a new database SQLite writes page 1 now (its setMeta6
+                 ;; program), before the file format or encoding is set
+                 (when (and mode (zerop (db-page-count db)) (not (memory-db-p db)))
+                   (setf created t)
+                   (let ((*db* db))
+                     (run-in-write-txn db (lambda ()
+                                            (let ((h (page-for-write db 1)))
+                                              (put-u32 h +hdr-schema-format+ 0)
+                                              (put-u32 h +hdr-text-encoding+ 0))))))
+                 (when (and (not created) (plusp (db-page-count db))
                             (<= (length (schema-rows (db-schema* db))) 0))
                    (let ((*db* db))
                      (run-in-write-txn db (lambda ()
@@ -464,9 +474,24 @@ non-local exit.  Nested uses become savepoints."
                  (setf (db-safety-level db) (if (zerop lv) 1 lv))
                  (values nil nil))
                (pragma-rows '("synchronous") (list (list (1- (db-safety-level db)))))))
+          ((string= n "secure_delete")
+           ;; 0, 1 or FAST (2); a value sets it (for every database when no
+           ;; schema is named) and the result is the setting, either way
+           (when value
+             (let* ((v (value-to-text value))
+                    ;; sqlite3GetBoolean: a number, on/yes/true, else false
+                    (b (cond ((string-equal v "fast") :fast)
+                             ((and (plusp (length v)) (digit-char-p (char v 0)))
+                              (/= 0 (or (parse-integer v :junk-allowed t) 0)))
+                             (t (and (member v '("on" "yes" "true") :test #'string-equal) t)))))
+               (if (eq db (conn db))
+                   (dolist (d (conn-dbs db)) (setf (db-secure-delete d) b))
+                   (setf (db-secure-delete db) b))))
+           (pragma-rows '("secure_delete")
+                        (list (list (case (db-secure-delete db) (:fast 2) ((nil) 0) (t 1))))))
           ((member n '("cache_size" "temp_store" "locking_mode"
                        "busy_timeout" "case_sensitive_like"
-                       "secure_delete" "count_changes" "legacy_file_format" "writable_schema"
+                       "count_changes" "legacy_file_format" "writable_schema"
                        "ignore_check_constraints" "defer_foreign_keys" "mmap_size" "optimize"
                        "shrink_memory" "automatic_index")
                    :test #'string=)

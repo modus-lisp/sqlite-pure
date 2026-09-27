@@ -104,8 +104,25 @@ chains, the freelist, page sizes 512–65536, UTF-8 and UTF-16 databases,
 `WITHOUT ROWID` tables. Writes go through a rollback journal in SQLite's
 format — a crash mid-commit leaves a hot journal that both this library and
 SQLite roll back — or, for **WAL-mode** databases, append checksummed frames
-to `-wal` (see below). `PRAGMA journal_mode = WAL / DELETE` switches modes. Pages split on insert and merge
-through their parent on delete, keeping every leaf at the same depth.
+to `-wal` (see below). `PRAGMA journal_mode = WAL / DELETE` switches modes.
+
+**Byte-identical files.** Writing is a port of SQLite 3.40's `btree.c`:
+cell space within a page (freeblocks, fragments, defragmentation), overflow
+chains, the freelist (`allocateBtreePage` with its nearby / exact rules,
+`freePage2`), `balance_quick`, `balance_deeper` and `balance_nonroot` with
+`editPage`, and insert and delete with SQLite's cursor behaviour
+(in-place overwrites, interior-cell promotion).  The statements drive the
+b-trees in SQLite's order too: index entries in SQLite's index-list order,
+`UPDATE` rewriting only the index entries it must and the row in place,
+`REPLACE`'s deletions, `CREATE TABLE`'s placeholder schema row, `CREATE
+INDEX`'s sorted bulk load, `DROP` order, `VACUUM`'s rebuild, and auto-vacuum's
+relocations; `secure_delete` is on, as in SQLite as commonly built.  So the
+same statements leave the same file, byte for byte — checked after every
+statement of random workloads (`test/run-file-identity.sh`).  Where SQLite's
+query planner would choose a different scan for an `UPDATE` or `DELETE`
+(a covering index on a `WITHOUT ROWID` table, say) the rows are visited in
+a different order and the pages can differ; FTS3/4/5 write their shadow
+tables with the same contents but not yet in SQLite's statement order.
 **Auto-vacuum.** `auto_vacuum = FULL` and `INCREMENTAL` databases are read and
 written: pointer-map pages are kept current, table and index roots stay packed
 at the front of the file (a `DROP` moves the last root into the freed slot and
@@ -296,10 +313,7 @@ equivalent here.
 
 R-tree `MATCH` geometry callbacks, the ICU tokenizer, FTS5's
 `*`-prefixed diagnostic queries, plain `EXPLAIN` (bytecode listings),
-join reordering and automatic indexes.  B-tree pages are filled as this
-library's own balancing leaves them rather than by a port of SQLite's
-`balance_nonroot`, so files are valid and interchangeable but page for
-page not SQLite's.  `fsync` and file locks need SBCL (elsewhere
+join reordering and automatic indexes.  `fsync` and file locks need SBCL (elsewhere
 `finish-output` is the barrier and locks are no-ops, with cache
 validation still applied).
 
@@ -327,6 +341,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fts5fuzz.sh` | random documents and random FTS5 queries (every operator, column filters, NEAR, prefixes, detail modes) against SQLite: rowids, `bm25()`, `highlight()`, `snippet()` |
 | `test/run-fts5-tokens.sh` | every tokenizer configuration against SQLite's, token for token, over random text and a stemming word list |
 | `test/run-geopoly.sh` | geopoly against SQLite 3.40.1 built with GEOPOLY (`test/build-oracle.sh` builds it from the amalgamation): 2000 random rows of every function compared bit for bit, and a table built by each side read and modified by the other; also regenerates `test/cases-ext` (run by `run-tests.sh` from the committed `test/expected-ext.sexp`) |
+| `test/run-file-identity.sh [FIRST N]` | the whole database file, byte for byte, after every statement of random workloads (rowid, rowid-less and `WITHOUT ROWID` tables, every kind of index, overflow values, REPLACE / IGNORE / UPSERT, rowid-changing UPDATEs, DDL, rollbacks, auto-vacuum FULL and INCREMENTAL, VACUUM, three page sizes) run by SQLite and by this library |
 | `test/run-rtree-fuzz.sh [FIRST N]` | random r-tree workloads (1-5 dimensions, `rtree_i32`, auxiliary columns, page sizes, REPLACE, rowid changes, rollbacks): after every statement the shadow tables must be byte for byte SQLite's |
 | `test/run-rtree.sh` | r-trees modified alternately by SQLite and by us, checked against a plain mirror table and by SQLite's `rtreecheck()`; auto-vacuum root moves on DROP; VACUUM |
 | `test/run-wal.sh` | WAL databases shared with live SQLite connections: each side reading the other's commits, snapshots surviving the other's writes and checkpoints, the write lock both ways, stale snapshots, log restart, two processes writing at once, last-one-out cleanup, crash recovery, rebuilding SQLite's index, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
@@ -341,7 +356,8 @@ src/
   locking    SQLite's file locks and cache validation
   wal        write-ahead log and the shared wal-index (-shm)
   record     the record format
-  btree      b-trees: traversal (both directions), insert with splits, delete with merges
+  btree      b-trees: reading (both directions)
+  btree-edit b-trees: writing, a port of SQLite's (cells, freelist, balancing)
   values     storage classes, comparison, collation, affinity, CAST, SQLite's AtoF
   lexer, parser        SQL -> AST
   schema     sqlite_schema -> tables, columns, indexes, foreign keys, triggers

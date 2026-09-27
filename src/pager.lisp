@@ -74,6 +74,8 @@
   (stmt-cache (make-hash-table :test #'equal))
   (vtab-state nil)           ; plist: virtual-table transaction bookkeeping (FTS3)
   (safety-level 3)           ; PRAGMA synchronous + 1: 1 OFF, 2 NORMAL, 3 FULL, 4 EXTRA
+  (secure-delete t)          ; PRAGMA secure_delete: T, NIL or :fast (SQLite as commonly built: on)
+  (freed-in-txn (make-hash-table)) ; pages put on the freelist in this transaction
   (closed nil))
 
 (defmethod print-object ((db db) s)
@@ -155,10 +157,15 @@ there is)."
 
 (defun page-offset (db pgno) (* (1- pgno) (db-page-size db)))
 
+(defvar *bt* nil "The database whose b-trees are being changed (btree-edit).")
+(defvar *mps* nil "pgno -> MPAGE for the b-tree operation in progress (btree-edit).")
+
 (defun trim-cache (db)
-  (let ((cache (db-cache db)) (dirty (db-dirty db)) (victims '()))
+  ;; never a page the b-tree operation in progress holds: it may yet change it
+  (let ((cache (db-cache db)) (dirty (db-dirty db)) (victims '())
+        (held (and (eq *bt* db) *mps*)))
     (maphash (lambda (k v) (declare (ignore v))
-               (unless (or (gethash k dirty) (= k 1)) (push k victims)))
+               (unless (or (gethash k dirty) (= k 1) (and held (gethash k held))) (push k victims)))
              cache)
     (dolist (k victims) (remhash k cache))))
 
@@ -315,6 +322,7 @@ there is)."
   (setf (db-txn db) kind
         (db-orig-page-count db) (db-page-count db))
   (clrhash (db-journal db))
+  (clrhash (db-freed-in-txn db))
   (when (zerop (db-page-count db))
     (init-header db)))
 
@@ -383,6 +391,7 @@ there is)."
       (setf (db-page-count db) orig))
     (clrhash (db-dirty db))
     (clrhash (db-journal db))
+    (clrhash (db-freed-in-txn db))
     (setf (db-txn db) nil (db-stmt-journal db) nil (db-schema db) nil)
     (unlock-to db :shared)))
 
@@ -492,55 +501,3 @@ there is)."
 
 ;;; ------------------------------------------------------------------
 ;;; Freelist
-
-(defun allocate-page (db)
-  "Return the number of a fresh, zeroed, writable page."
-  (ensure-write-txn db)
-  (let ((trunk (header-u32 db +hdr-freelist-trunk+))
-        (pgno nil))
-    (when (plusp trunk)
-      (let* ((tb (page-for-write db trunk))
-             (nleaves (get-u32 tb 4)))
-        (if (plusp nleaves)
-            (progn
-              (setf pgno (get-u32 tb (+ 8 (* 4 (1- nleaves)))))
-              (put-u32 tb 4 (1- nleaves)))
-            (progn
-              (setf pgno trunk)
-              (set-header-u32 db +hdr-freelist-trunk+ (get-u32 tb 0))))
-        (set-header-u32 db +hdr-freelist-count+
-                        (1- (header-u32 db +hdr-freelist-count+)))))
-    (unless pgno
-      (setf pgno (1+ (db-page-count db)))
-      (when (= pgno (pending-byte-page db))
-        (incf pgno))
-      ;; auto-vacuum: pointer-map pages sit at fixed places in the file
-      (when (and (autovacuum-p db) (ptrmap-page-p db pgno))
-        (setf (db-page-count db) pgno)
-        (fill (page-for-write db pgno) 0)
-        (incf pgno)
-        (when (= pgno (pending-byte-page db)) (incf pgno)))
-      (setf (db-page-count db) pgno))
-    (let ((b (page-for-write db pgno)))
-      (fill b 0)
-      pgno)))
-
-(defun free-page (db pgno)
-  (ptrmap-put db pgno +ptrmap-free+ 0)
-  (let* ((trunk (header-u32 db +hdr-freelist-trunk+))
-         (max-leaves (- (floor (db-usable-size db) 4) 2)))
-    (set-header-u32 db +hdr-freelist-count+
-                    (1+ (header-u32 db +hdr-freelist-count+)))
-    (if (and (plusp trunk)
-             (< (get-u32 (read-page db trunk) 4) (- max-leaves 6)))
-        (let* ((tb (page-for-write db trunk))
-               (n (get-u32 tb 4)))
-          (put-u32 tb (+ 8 (* 4 n)) pgno)
-          (put-u32 tb 4 (1+ n))
-          ;; The page's content is now garbage; nothing need rewrite it.
-          )
-        (let ((b (page-for-write db pgno)))
-          (fill b 0)
-          (put-u32 b 0 trunk)
-          (put-u32 b 4 0)
-          (set-header-u32 db +hdr-freelist-trunk+ pgno)))))

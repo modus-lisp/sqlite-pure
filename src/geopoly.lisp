@@ -425,7 +425,7 @@ Returns the new rowid, T, or :IGNORE."
       (rtree-delete-id old-id))
     (when (and new coords)
       (unless new-valid
-        (setf id (1+ (or (table-max-rowid (table-owner (rt-rowid-table)) (table-root (rt-rowid-table))) 0))))
+        (setf id (rtree-new-rowid)))
       (insert-at-height (cons id coords) 0))
     (when new
       (let ((r (shadow-get (rt-rowid-table) id)))

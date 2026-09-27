@@ -108,15 +108,59 @@ column may use one declared after it)."
 ;;; ------------------------------------------------------------------
 ;;; Low-level row writes (no constraint checks)
 
-(defun insert-index-entries (table row)
-  (dolist (idx (table-indexes table))
-    (unless (index-pk-index idx)
+(defun sqlite-index-list (table)
+  "TABLE's indexes in the order SQLite keeps them (Table.pIndex): each new
+index goes to the front, and those with ON CONFLICT REPLACE are moved to
+the back.  Index maintenance and constraint checks run in this order."
+  (let* ((pk (find-if #'index-pk-index (table-indexes table)))
+         ;; creation order: a WITHOUT ROWID table's key index is made while
+         ;; its CREATE TABLE is parsed, before any CREATE INDEX
+         (created (append (and pk (list pk)) (remove pk (table-indexes table))))
+         (l (reverse created)))
+    (flet ((conflict (i) (if (index-pk-index i) (table-pk-conflict table) (index-conflict i))))
+      (append (remove :replace l :key #'conflict)
+              (remove :replace l :key #'conflict :test-not #'eq)))))
+
+(defun expr-column-refs (table e)
+  "Column indexes of TABLE (and :ROWID) the expression E mentions."
+  (let ((out '()))
+    (labels ((walk (x)
+               (when (consp x)
+                 (if (and (eq (car x) :col) (stringp (third x)))
+                     (let ((ci (or (find-column table (third x))
+                                   (and (rowid-name-p (third x)) :rowid))))
+                       (when ci (pushnew ci out)))
+                     (mapc #'walk x)))))
+      (walk e))
+    out))
+
+(defun index-changed-by-update-p (table idx assigned chng-key)
+  "Does an UPDATE assigning ASSIGNED (column indexes and :ROWID) rewrite IDX's
+entries?  (sqlite3Update's aRegIdx.)"
+  (or chng-key
+      (eq assigned :all)
+      (and (index-where idx)
+           (intersection (expr-column-refs table (index-where idx)) assigned))
+      (some (lambda (c)
+              (let ((k (first c)))
+                (cond ((integerp k) (member k assigned))
+                      ((eq k :rowid) (member :rowid assigned))
+                      (t (intersection (expr-column-refs table k) assigned)))))
+            (index-columns idx))))
+
+(defun insert-index-entries (table row &optional (indexes (sqlite-index-list table)))
+  "Index entries for ROW, in SQLite's index order; a WITHOUT ROWID table's
+own entry (its key index) is written at its place in that order."
+  (dolist (idx indexes)
+    (if (index-pk-index idx)
+        (let ((*index-cmp* (index-full-cmp table idx)))
+          (index-insert-payload (table-owner table) (table-root table) (encode-record (wr-record table row))))
       (when (index-applies-p table idx row)
         (let ((*index-cmp* (index-full-cmp table idx)))
           (index-insert (table-owner table) (index-root idx) (index-key table idx row)))))))
 
-(defun delete-index-entries (table row)
-  (dolist (idx (table-indexes table))
+(defun delete-index-entries (table row &optional (indexes (sqlite-index-list table)))
+  (dolist (idx indexes)
     (unless (index-pk-index idx)
       (when (index-applies-p table idx row)
         (let ((*index-cmp* (index-full-cmp table idx)))
@@ -128,20 +172,22 @@ index entries first, as SQLite writes them, so pages are allocated in the
 same order)."
   (let ((n (length (table-columns table))))
     (insert-index-entries table row)
+    (unless (table-without-rowid table)
+      (table-insert (table-owner table) (table-root table) (svref row n)
+                    (encode-record (table-record table row))))))
+
+(defun delete-row (table row &optional last-index)
+  "Remove ROW and its index entries: the entries first, in SQLite's index
+order, then the row -- except LAST-INDEX (the index whose cursor found ROW,
+iIdxNoSeek), whose entry goes after the row."
+  (let ((last (and last-index (not (index-pk-index last-index)) last-index)))
+    (delete-index-entries table row (remove last (sqlite-index-list table)))
     (if (table-without-rowid table)
         (let* ((pkidx (find-if #'index-pk-index (table-indexes table)))
                (*index-cmp* (index-full-cmp table pkidx)))
-          (index-insert (table-owner table) (table-root table) (wr-record table row)))
-        (table-insert (table-owner table) (table-root table) (svref row n)
-                      (encode-record (table-record table row))))))
-
-(defun delete-row (table row)
-  (delete-index-entries table row)
-  (if (table-without-rowid table)
-      (let* ((pkidx (find-if #'index-pk-index (table-indexes table)))
-             (*index-cmp* (index-full-cmp table pkidx)))
-        (index-delete (table-owner table) (table-root table) (wr-record table row)))
-      (table-delete (table-owner table) (table-root table) (svref row (length (table-columns table))))))
+          (index-delete (table-owner table) (table-root table) (wr-record table row)))
+        (table-delete (table-owner table) (table-root table) (svref row (length (table-columns table)))))
+    (when last (delete-index-entries table row (list last)))))
 
 ;;; ------------------------------------------------------------------
 ;;; Conflict detection
@@ -311,7 +357,13 @@ same order)."
           (let ((action (resolve-action ctx (table-pk-conflict table))))
             (case action
               (:ignore (return-from resolve-uniqueness :ignore))
-              (:replace (replace-delete table existing))
+              (:replace
+               ;; with no delete triggers or foreign keys to run, SQLite removes only the
+               ;; old index entries and lets the new row overwrite the old in place
+               (if (or (and (db-recursive-triggers (conn *db*)) (table-has-triggers-p table))
+                       (and (fk-enabled-p) (or (table-fkeys table) (referencing-keys table))))
+                   (replace-delete table existing)
+                   (delete-index-entries table existing)))
               (t (conflict-fail action "UNIQUE constraint failed: ~a"
                                 (if (table-rowid-alias table)
                                     (format nil "~a.~a" (table-name table)
@@ -319,7 +371,9 @@ same order)."
                                                                (table-rowid-alias table))))
                                     (format nil "~a.rowid" (table-name table))))))))))
     ;; unique indexes (the WITHOUT ROWID primary key among them)
-    (dolist (idx (table-indexes table) t)
+    (dolist (idx (append (remove-if-not #'index-pk-index (table-indexes table))
+                         (sqlite-index-list table))
+                 t)
       (when (and (index-unique idx) (index-applies-p table idx row))
         (let ((others (find-index-conflicts table idx row)))
           (when others
@@ -328,7 +382,7 @@ same order)."
             (let ((action (resolve-action ctx (index-conflict idx))))
               (case action
                 (:ignore (return-from resolve-uniqueness :ignore))
-                (:replace (dolist (o others) (replace-delete table o)))
+                (:replace (dolist (o others) (replace-delete table o idx)))
                 (t (conflict-fail action "UNIQUE constraint failed: ~a"
                                   (if (index-pk-index idx)
                                       (constraint-columns-text table idx)
@@ -428,7 +482,9 @@ same order)."
                   (dolist (c cols)
                     (let ((ci (or (find-column table c) (sql-error "no such column: ~a" c))))
                       (setf (svref new ci) v))))))
-            (let ((uctx (copy-write-ctx ctx)))
+            (let ((uctx (copy-write-ctx ctx))
+                  (*update-columns* (loop for (cols) in (getf clause :sets)
+                                          append (mapcar (lambda (c) (find-column table c)) cols))))
               (setf (wc-conflict uctx) nil (wc-upsert uctx) nil (wc-changes uctx) 0
                     (wc-returned uctx) nil)
               (update-one uctx existing new)
@@ -458,8 +514,38 @@ same order)."
       (when (eq (check-checks ctx new) :ignore) (return-from update-one :ignore))
       (let ((u (resolve-uniqueness ctx new)))
         (when (eq u :ignore) (return-from update-one :ignore))))
-    (delete-row table old)
-    (write-row table new)
+    (if (table-without-rowid table)
+        (let* ((assigned *update-columns*)
+               (pk (find-if #'index-pk-index (table-indexes table)))
+               (chng-pk (or (eq assigned :all)
+                            (some (lambda (ci) (member ci assigned)) (table-pk table))))
+               (changed (remove-if-not (lambda (idx) (or (eq idx pk)
+                                                         (index-changed-by-update-p table idx assigned chng-pk)))
+                                       (sqlite-index-list table))))
+          ;; the key index is the table: its entry is deleted only when the
+          ;; key changes, and rewritten (in place if the same size) otherwise
+          (delete-index-entries table old (remove pk changed))
+          (when chng-pk
+            (let ((*index-cmp* (index-full-cmp table pk)))
+              (index-delete (table-owner table) (table-root table) (wr-record table old))))
+          (insert-index-entries table new changed))
+        (let* ((n (length (table-columns table)))
+               (assigned *update-columns*)
+               (chng-key (and (listp assigned)
+                              (or (member :rowid assigned)
+                                  (and (table-rowid-alias table) (member (table-rowid-alias table) assigned)))))
+               (changed (remove-if-not (lambda (idx) (index-changed-by-update-p table idx assigned chng-key))
+                                       (sqlite-index-list table))))
+          ;; sqlite3Update: the changed index entries go, then (if the rowid
+          ;; changes) the row; then the new entries, then the row is written --
+          ;; over the old one in place when the rowid stays
+          (delete-index-entries table old changed)
+          (when chng-key
+            (table-delete (table-owner table) (table-root table) (svref old n)))
+          (insert-index-entries table new changed)
+          (table-insert (table-owner table) (table-root table) (svref new n)
+                        (encode-record (table-record table new))
+                        :overwrite (not chng-key))))
     (fk-check-child table new old)
     (fk-parent-update table old new)
     (incf (wc-changes ctx))
@@ -543,6 +629,16 @@ same order)."
                                     (sql-error "table ~a has ~d columns but ~d values were supplied"
                                                table (length targets) (length cols))))
                               (funcall fn *outer-env*)))))))
+      ;; sqlite3UpsertAnalyzeTarget: every target must name a PRIMARY KEY
+      ;; or UNIQUE constraint, checked before anything is written
+      (unless view
+        (dolist (u upsert)
+          (when (getf u :target)
+            (let ((ctx (make-write-ctx :table tb :upsert (list u))))
+              (unless (or (matching-upsert ctx :rowid)
+                          (some (lambda (idx) (and (index-unique idx) (matching-upsert ctx idx)))
+                                (table-indexes tb)))
+                (sql-error "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"))))))
       (multiple-value-bind (ctx rnames) (make-ctx-for tb conflict returning alias upsert)
         (dolist (vals rows)
           (let ((row (make-array (1+ ncols) :initial-element :unset)))
@@ -744,9 +840,13 @@ row once, from the last joined row that matched it."
                   (clear-btree (table-owner tb) (index-root idx) :keep-root t)))
               (setf (wc-changes ctx) n))
             (dolist (row (let ((rows (scan-table-rows tb alias where)))
-                           (if (and (table-vtab tb) (not view))
-                               ;; SQLite collects a virtual table's rowids in a
-                               ;; RowSet and deletes them in ascending order
+                           (if (and (not view) (not (table-without-rowid tb))
+                                    (or (table-vtab tb) triggers
+                                        (and (fk-enabled-p) (or (table-fkeys tb) (referencing-keys tb)))))
+                               ;; SQLite collects the rowids in a RowSet and
+                               ;; deletes in ascending order (a virtual table's
+                               ;; always; a table's when triggers or foreign
+                               ;; keys make the delete two-pass)
                                (let ((n (length (table-columns tb))))
                                  (remove-duplicates (stable-sort rows #'< :key (lambda (r) (rt-int64 (svref r n))))
                                                     :key (lambda (r) (rt-int64 (svref r n))) :from-end t))

@@ -14,13 +14,14 @@
 
 (defconstant +max-trigger-depth+ 1000)
 
-(defun replace-delete (table row)
+(defun replace-delete (table row &optional found-by)
   "Delete ROW to make way for a REPLACE; with recursive_triggers on, as a
-DELETE that fires the table's delete triggers."
+DELETE that fires the table's delete triggers.  FOUND-BY is the index whose
+conflict found ROW (its entry is removed last, as SQLite does)."
   (let ((rec (and (db-recursive-triggers (conn *db*)) (table-has-triggers-p table))))
     (unless (and rec (eq :ignore (fire-triggers table :delete :before row nil)))
       (fk-parent-delete table row)
-      (delete-row table row)
+      (delete-row table row found-by)
       (when rec (fire-triggers table :delete :after row nil)))))
 
 (defun root-scope () (or *outer-scope* (make-scope)))

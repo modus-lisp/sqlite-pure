@@ -21,6 +21,7 @@
      (:file "record")
      (:file "btree")
      (:file "autovacuum")
+     (:file "btree-edit")
      (:file "values")
      (:file "lexer")
      (:file "parser")
