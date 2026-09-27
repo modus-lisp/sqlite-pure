@@ -25,6 +25,7 @@
      (:file "lexer")
      (:file "parser")
      (:file "schema")
+     (:file "eqp")
      (:file "expr")
      (:file "select")
      (:file "window")

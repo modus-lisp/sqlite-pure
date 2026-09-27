@@ -101,7 +101,10 @@ columns are decoded; the others read as NULL."
   rows-fn         ; for derived sources: (lambda (env)) -> list of row vectors
   tvf             ; table-valued function: (builder . arg-asts), args compiled late
   join            ; :first :inner :left :cross :comma
-  on using natural)
+  on using natural
+  index-hint      ; NOT INDEXED -> :not; INDEXED BY i -> the INDEX
+  label           ; EXPLAIN QUERY PLAN: what a non-table source's loop is called
+  scan-index)     ; EQP: thunk -> the index (or :rowid) a full scan reads in order, if any
 
 (defun make-table-src (table &optional alias)
   (let ((cols (table-columns table)))
@@ -144,11 +147,37 @@ columns are decoded; the others read as NULL."
                                   (unless correlated (setf cache (cons t rows)))
                                   rows)))))))
 
+(defun eqp-derived-kind ()
+  (if *eqp-coroutine-ok* "CO-ROUTINE" "MATERIALIZE"))
+
+(defun eqp-describe-cte (cte)
+  "EXPLAIN QUERY PLAN: how CTE is computed (once per statement)."
+  (unless (member cte *eqp-ctes-done*)
+    (push cte *eqp-ctes-done*)
+    (let ((kind (if (> (- (gethash (string-downcase-ascii (cte-name cte)) *eqp-cte-uses* 0)
+                          (eqp-table-refs (cte-sel cte) (cte-name cte)))   ; its own recursion
+                       1)
+                    "MATERIALIZE"
+                    (eqp-derived-kind)))
+          (*ctes* (cons (cons (cte-name cte) cte) (cte-env cte)))
+          (*eqp-coroutine-ok* nil))
+      (with-eqp-node ((format nil "~a ~a" kind (cte-name cte)) +eqp-materialize+)
+        (if (eq (cte-recursive-rows cte) :recursive)
+            (let ((sel (cte-sel cte)))
+              (with-eqp-node ("SETUP")
+                (compile-select (make-sel :cores (butlast (sel-cores sel)) :ops (butlast (sel-ops sel)))
+                                (make-scope)))
+              (with-eqp-node ("RECURSIVE STEP")
+                (compile-select (make-sel :cores (last (sel-cores sel))) (make-scope))))
+            (compile-select (cte-sel cte) (make-scope)))))))
+
 (defun cte-source (cte alias)
+  (when *eqp* (eqp-describe-cte cte))
   (let* ((src (derived-src (or alias (cte-name cte)) (cte-columns cte)
                            (or (cte-affinities cte) (make-list (length (cte-columns cte))))
                            (make-list (length (cte-columns cte)) :initial-element :binary))))
     (make-fsrc :src src
+               :label (or alias (cte-name cte))
                :rows-fn (lambda (env)
                           (declare (ignore env))
                           (if (eq (cte-done cte) :working)
@@ -156,12 +185,17 @@ columns are decoded; the others read as NULL."
                               (progn (unless (cte-done cte) (materialize-cte cte))
                                      (cte-rows cte)))))))
 
+(defun eqp-labelled (fs label)
+  (setf (fsrc-label fs) label)
+  fs)
+
 (defun make-fsrc-for (item scope)
   (destructuring-bind (&key source join on using natural) item
     (let ((fs
             (ecase (car source)
               (:table
-               (destructuring-bind (name alias &optional schema) (cdr source)
+               (destructuring-bind (name alias &optional schema hint) (cdr source)
+                 (declare (ignore hint))
                  (let ((cte (and (null (fourth source)) (cdr (assoc name *ctes* :test #'name=)))))
                    (cond
                      (cte (cte-source cte alias))
@@ -170,27 +204,46 @@ columns are decoded; the others read as NULL."
                      (t (let ((table (lookup-table *db* name t schema)))
                           (if (table-view-select table)
                               (let ((*ctes* '()))
-                                (select-derived-source (table-view-select table) (or alias name)
-                                                       (make-scope)
-                                                       (table-view-columns table)))
-                              (make-fsrc :src (make-table-src table alias) :table table))))))))
+                                (with-eqp-node ((format nil "~a ~a" (eqp-derived-kind) (or alias name))
+                                                +eqp-materialize+)
+                                  (let ((*eqp-coroutine-ok* nil))
+                                    (eqp-labelled
+                                     (select-derived-source (table-view-select table) (or alias name)
+                                                            (make-scope)
+                                                            (table-view-columns table))
+                                     (or alias name)))))
+                              (let ((hint (fifth source)))
+                                (make-fsrc :src (make-table-src table alias) :table table
+                                           :index-hint
+                                           (cond ((eq hint :not) :not)
+                                                 (hint (or (find (second hint) (table-indexes table)
+                                                                 :key #'index-name :test #'name=)
+                                                           (sql-error "no such index: ~a" (second hint))))))))))))))
               (:subquery
-               (select-derived-source (second source) (third source) scope))
+               (let ((label (or (third source)
+                                (format nil "(subquery-~a)" (eqp-sel-id (second source))))))
+                 (with-eqp-node ((format nil "~a ~a" (eqp-derived-kind) label) +eqp-materialize+)
+                   (let ((*eqp-coroutine-ok* nil))
+                     (eqp-labelled (select-derived-source (second source) (third source) scope) label)))))
               (:join-group
-               (select-derived-source
-                (make-sel :cores (list (make-select-core :cols (list (list :star nil))
-                                                         :from (second source))))
-                (third source) scope))
+               (let ((*eqp-coroutine-ok* nil))
+                 (select-derived-source
+                  (make-sel :cores (list (make-select-core :cols (list (list :star nil))
+                                                           :from (second source))))
+                  (third source) scope)))
               (:tvf
                (destructuring-bind (name args alias) (cdr source)
                  (cond
                    ((or (name= name "json_each") (name= name "json_tree"))
                     (let ((fs (json-table-source name nil alias)))
+                      (setf (fsrc-label fs) (format nil "~a VIRTUAL TABLE INDEX ~d:" (or alias (string-downcase-ascii name))
+                                                    (case (length args) (0 0) (1 1) (t 3))))
                       (setf (fsrc-tvf fs)
                             (cons (lambda (fns) (fsrc-rows-fn (json-table-source name fns alias))) args))
                       fs))
                    ((pragma-vtab-spec name)
                     (let ((fs (pragma-table-source name nil alias)))
+                      (setf (fsrc-label fs) (format nil "~a VIRTUAL TABLE INDEX 0:" (or alias (string-downcase-ascii name))))
                       (when (> (length args) (length (third (pragma-vtab-spec name))))
                         (sql-error "too many arguments on ~a() - max ~d"
                                    (string-downcase-ascii name) (length (third (pragma-vtab-spec name)))))
@@ -294,8 +347,17 @@ source[LI].col = expr where expr references only earlier sources."
                     (:srccol (values 0 (second a*) (third a*))))
                 (when (and depth (= depth 0) (= si li))
                   (let ((refs (expr-refs b scope)))
-                    (when (and (listp refs) (every (lambda (r) (< r li)) refs))
+                    (when (or (and (listp refs) (every (lambda (r) (< r li)) refs))
+                              (uncorrelated-subquery-p b scope))
                       (push (list ci b (binary-collation a b scope) (second c)) out))))))))))))
+
+(defun uncorrelated-subquery-p (e scope)
+  "Is E a scalar subquery that refers to nothing outside itself (so it can
+be evaluated before any loop)?"
+  (and (eq (car e) :subquery)
+       (ignore-errors
+        (not (third (multiple-value-list
+                     (without-eqp (compile-subselect (second e) scope :limit-one t))))))))
 
 (defun range-candidates (conjuncts li scope)
   "rowid <op> expr conjuncts for source LI: list of (op expr)."
@@ -317,6 +379,49 @@ source[LI].col = expr where expr references only earlier sources."
           (try (fourth c) (third c)
                (ecase (second c) (:lt :gt) (:le :ge) (:gt :lt) (:ge :le))))))))
 
+(defvar *minmax-hint* nil
+  "For a lone min()/max() over one table: (column-index :min|:max).")
+
+(defun index-allowed-p (fs idx)
+  "May FS's loop use IDX (NOT INDEXED / INDEXED BY)?"
+  (let ((h (fsrc-index-hint fs)))
+    (cond ((null h) t)
+          ((eq h :not) (index-pk-index idx))     ; a WITHOUT ROWID table is its key
+          (t (or (eq h idx) (index-pk-index idx))))))
+
+(defun in-candidates (conjuncts li scope)
+  "col IN (...) conjuncts on source LI whose right side is known before
+LI's loop: list of (column-index rhs x-ast)."
+  (let ((out '()))
+    (dolist (c conjuncts (nreverse out))
+      (when (and (eq (car c) :in) (not (fourth c)))
+        (let* ((x (second c)) (rhs (third c))
+               (x* (if (eq (car x) :collate) (second x) x)))
+          (multiple-value-bind (depth si ci)
+              (case (car x*)
+                (:col (resolve-column scope (second x*) (third x*)))
+                (:srccol (values 0 (second x*) (third x*))))
+            (when (and depth (= depth 0) (= si li)
+                       (case (car rhs)
+                         (:list (every (lambda (e) (let ((r (expr-refs e scope)))
+                                                     (and (listp r) (every (lambda (k) (< k li)) r))))
+                                       (second rhs)))
+                         (:select t)))
+              (push (list ci rhs x) out))))))))
+
+(defun in-values-fn (rhs scope)
+  "(lambda (env)) -> the IN operand's values, or NIL if they cannot be
+known before the loop (a subquery correlated with anything)."
+  (ecase (car rhs)
+    (:list (let ((fns (mapcar (lambda (e) (compile-expr e scope)) (second rhs))))
+             (lambda (env) (mapcar (lambda (f) (funcall f env)) fns))))
+    (:select (multiple-value-bind (fn cols correlated)
+                 (without-eqp (compile-subselect (second rhs) scope))
+               (when (and (not correlated) (= (length cols) 1))
+                 (let ((cache nil))
+                   (lambda (env)
+                     (or cache (setf cache (list* :done (mapcar #'first (funcall fn env))))))))))))
+
 (defun plan-table-access (fs li conjuncts scope)
   "Return an iterate function for a stored table."
   (when (table-vtab (fsrc-table fs))
@@ -332,16 +437,35 @@ source[LI].col = expr where expr references only earlier sources."
                           eqs)))
         (when hit
           (let ((f (compile-expr (second hit) scope)))
+            (eqp-table-note (format nil "SEARCH ~a USING INTEGER PRIMARY KEY (rowid=?)" (src-name src)))
             (return-from plan-table-access
               (lambda (env fn)
                 (let* ((v (funcall f env))
                        (r (and (not (eq v :null)) (rowid-probe v)))
                        (row (and r (fetch-row table r (src-wanted src)))))
                   (when row (funcall fn row)))))))))
+    ;; 1b. rowid IN (...)
+    (unless (table-without-rowid table)
+      (let* ((hit (find-if (lambda (c) (or (eq (first c) :rowid) (eql (first c) (table-rowid-alias table))))
+                           (in-candidates conjuncts li scope)))
+             (vf (and hit (in-values-fn (second hit) scope))))
+        (when vf
+          (eqp-table-note (format nil "SEARCH ~a USING INTEGER PRIMARY KEY (rowid=?)" (src-name src)))
+          (return-from plan-table-access
+            (lambda (env fn)
+              (let ((vals (funcall vf env)))
+                (when (eq (car vals) :done) (setf vals (cdr vals)))
+                (dolist (r (sort (remove-duplicates
+                                  (loop for v in vals
+                                        for r = (and (not (eq v :null)) (rowid-probe v))
+                                        when r collect r))
+                                 #'<))
+                  (let ((row (fetch-row table r (src-wanted src))))
+                    (when row (funcall fn row))))))))))
     ;; 2. index prefix equality
     (let ((best nil) (best-k 0))
       (dolist (idx (table-indexes table))
-        (unless (index-where idx)
+        (unless (or (index-where idx) (not (index-allowed-p fs idx)))
           (let ((k 0) (probes '()))
             (loop for (ci coll) in (index-columns idx)
                   for hit = (and (integerp ci)
@@ -355,9 +479,11 @@ source[LI].col = expr where expr references only earlier sources."
                                           eqs))
                   while hit
                   do (incf k) (push hit probes))
+            ;; on a tie the newest index wins, as in SQLite (whose list is
+            ;; newest first), unless only the earlier one is unique
             (when (or (> k best-k)
-                      (and (= k best-k) (plusp k) best (index-unique idx)
-                           (not (index-unique (first best)))))
+                      (and (= k best-k) (plusp k) best
+                           (or (index-unique idx) (not (index-unique (first best))))))
               (setf best (list idx (nreverse probes)) best-k k)))))
       (when best
         (destructuring-bind (idx probes) best
@@ -367,7 +493,20 @@ source[LI].col = expr where expr references only earlier sources."
                                        (expr-affinity (second c) scope)))
                                probes))
                  (cmp (index-key-cmp (index-collations idx) (index-descs idx)))
-                 (pk-index (index-pk-index idx)))
+                 (pk-index (index-pk-index idx))
+                 (covers :unknown))
+            (flet ((covering-p ()
+                     (when (eq covers :unknown)
+                       (setf covers (and (not pk-index) (index-covers-p table idx (src-wanted src)))))
+                     covers))
+              (eqp-table-note
+               (lambda ()
+                 (format nil "SEARCH ~a USING ~a (~{~a=?~^ AND ~})"
+                         (src-name src)
+                         (cond (pk-index "PRIMARY KEY")
+                               ((covering-p) (format nil "COVERING INDEX ~a" (index-name idx)))
+                               (t (format nil "INDEX ~a" (index-name idx))))
+                         (mapcar (lambda (c) (column-name (aref (table-columns table) (first c)))) probes))))
             (return-from plan-table-access
               (lambda (env fn)
                 (let ((probe (loop for f in fns
@@ -384,9 +523,61 @@ source[LI].col = expr where expr references only earlier sources."
                                    (let ((row (cond (pk-index (table-record-to-row table nil vals))
                                                     ((table-without-rowid table)
                                                      (fetch-wr-row table (last vals (length (table-pk table)))))
+                                                    ((covering-p) (row-from-index table idx vals))
                                                     (t (fetch-row table (car (last vals)) (src-wanted src))))))
                                      (when row (funcall fn row))))
-                                 :probe probe :cmp cmp))))))))))
+                                 :probe probe :cmp cmp)))))))))))
+    ;; 2b. IN (...) on an index's first column
+    (let ((ins (in-candidates conjuncts li scope)))
+      (dolist (idx (reverse (table-indexes table)))    ; newest first
+        (let* ((ic (first (index-columns idx)))
+               (hit (and (not (index-where idx)) (index-allowed-p fs idx) (not (index-pk-index idx))
+                         (not (table-without-rowid table))
+                         (find-if (lambda (c)
+                                    (and (eql (first c) (first ic))
+                                         (collation= (or (expr-collation (third c) scope) :binary) (second ic))
+                                         (or (eq (car (second c)) :list)
+                                             (probe-usable-p (column-affinity (aref (table-columns table) (first ic)))
+                                                             (select-first-affinity (second (second c)) scope)))))
+                                  ins)))
+               (vf (and hit (in-values-fn (second hit) scope))))
+          (when vf
+            (let* ((col-aff (column-affinity (aref (table-columns table) (first ic))))
+                   (other-aff (if (eq (car (second hit)) :list)
+                                  nil
+                                  (select-first-affinity (second (second hit)) scope)))
+                   (cmp (index-key-cmp (list (second ic)) (list (third ic))))
+                   (covers :unknown))
+              (flet ((covering-p ()
+                       (when (eq covers :unknown)
+                         (setf covers (index-covers-p table idx (src-wanted src))))
+                       covers))
+                (eqp-table-note (lambda ()
+                                  (format nil "SEARCH ~a USING ~:[~;COVERING ~]INDEX ~a (~a=?)"
+                                          (src-name src) (covering-p) (index-name idx)
+                                          (column-name (aref (table-columns table) (first ic))))))
+                (return-from plan-table-access
+                  (lambda (env fn)
+                    (let* ((vals (funcall vf env))
+                           (vals (if (eq (car vals) :done) (cdr vals) vals))
+                           (probes (sort (loop for v in vals
+                                               unless (eq v :null)
+                                                 collect (list (convert-probe v col-aff other-aff)))
+                                         (lambda (a b) (minusp (funcall cmp a b)))))
+                           (last nil))
+                      (dolist (probe probes)
+                        (unless (and last (zerop (funcall cmp last probe)))
+                          (setf last probe)
+                          (catch :index-done
+                            (map-index (table-owner table) (index-root idx)
+                                       (lambda (ivals)
+                                         (unless (zerop (funcall cmp ivals probe))
+                                           (throw :index-done nil))
+                                         (let ((row (if (covering-p)
+                                                        (row-from-index table idx ivals)
+                                                        (fetch-row table (car (last ivals)) (src-wanted src)))))
+                                           (when row (funcall fn row))))
+                                       :probe probe :cmp cmp)))))))))))))
     ;; 3. rowid range
     (unless (table-without-rowid table)
       (let ((ranges (range-candidates conjuncts li scope)))
@@ -395,6 +586,8 @@ source[LI].col = expr where expr references only earlier sources."
                             collect (cons op (compile-expr e scope))))
                 (highs (loop for (op e) in ranges when (member op '(:lt :le))
                              collect (cons op (compile-expr e scope)))))
+            (eqp-table-note (format nil "SEARCH ~a USING INTEGER PRIMARY KEY (~{~a~^ AND ~})" (src-name src)
+                                    (append (when lows (list "rowid>?")) (when highs (list "rowid<?")))))
             (return-from plan-table-access
               (lambda (env fn)
                 (let ((start nil) (stop nil) (stop-op nil) (empty nil))
@@ -424,10 +617,24 @@ source[LI].col = expr where expr references only earlier sources."
                                       :start (and start (clamp-i64 start))
                                       :wanted (src-wanted src)))))))))))
     ;; 4. full scan -- in the order ORDER BY wants, when we can
-    (let ((hint (and (= li 0) *order-hint*)))
+    (let* ((hint (and (= li 0) *order-hint*))
+           (hint (if (and hint (eq (first hint) :index) (not (index-allowed-p fs (second hint))))
+                     nil hint))
+           (forced (and (index-p (fsrc-index-hint fs)) (fsrc-index-hint fs))))
+      (when (and forced (not (and hint (eq (first hint) :index) (eq (second hint) forced))))
+        ;; INDEXED BY with nothing to seek: scan that index
+        (setf hint (list :index forced :asc))
+        (setf *order-hint* nil))
+      (let ((*eqp* *eqp*))
+      (when (and (= li 0) *minmax-hint* (null conjuncts))
+        (let ((mm (minmax-access fs *minmax-hint*)))
+          (when mm (return-from plan-table-access mm))
+          (setf *eqp* nil)))             ; its note is made; scan as usual
       (cond
         ((and hint (eq (first hint) :rowid) (not (table-without-rowid table)))
          (setf *order-satisfied* t)
+         (eqp-table-note (format nil "SCAN ~a" (src-name src)))
+         (setf (fsrc-scan-index fs) (lambda () :rowid))
          (if (eq (second hint) :desc)
              (lambda (env fn)
                (declare (ignore env))
@@ -442,10 +649,21 @@ source[LI].col = expr where expr references only earlier sources."
                (declare (ignore env))
                (map-table-rows table fn :wanted (src-wanted src)))))
         ((and hint (eq (first hint) :index))
-         (setf *order-satisfied* t)
+         (when *order-hint* (setf *order-satisfied* t))
          (destructuring-bind (idx dir) (rest hint)
-           (let ((owner (table-owner table))
-                 (pk-index (index-pk-index idx)))
+           (let* ((owner (table-owner table))
+                  (pk-index (index-pk-index idx))
+                  (covers :unknown))
+             (flet ((covering-p ()
+                      (when (eq covers :unknown)
+                        (setf covers (and (not pk-index) (index-covers-p table idx (src-wanted src)))))
+                      covers))
+             (setf (fsrc-scan-index fs) (lambda () idx))
+             (eqp-table-note (lambda ()
+                               (if pk-index
+                                   (format nil "SCAN ~a" (src-name src))
+                                   (format nil "SCAN ~a USING ~:[~;COVERING ~]INDEX ~a"
+                                           (src-name src) (covering-p) (index-name idx)))))
              (lambda (env fn)
                (declare (ignore env))
                (funcall (if (eq dir :desc) #'map-index-reverse #'map-index)
@@ -454,36 +672,141 @@ source[LI].col = expr where expr references only earlier sources."
                           (let ((row (cond (pk-index (table-record-to-row table nil vals))
                                            ((table-without-rowid table)
                                             (fetch-wr-row table (last vals (length (table-pk table)))))
+                                           ((covering-p) (row-from-index table idx vals))
                                            (t (fetch-row table (car (last vals)) (src-wanted src))))))
-                            (when row (funcall fn row)))))))))
+                            (when row (funcall fn row))))))))))
         (t
+         (setf (fsrc-scan-index fs)
+               (lambda () (or (covering-index table (src-wanted src) fs)
+                              (if (table-without-rowid table)
+                                  (find-if #'index-pk-index (table-indexes table))
+                                  :rowid))))
+         (eqp-table-note (lambda ()
+                           (let ((idx (covering-index table (src-wanted src) fs)))
+                             (format nil "SCAN ~a~@[ USING COVERING INDEX ~a~]"
+                                     (src-name src) (and idx (index-name idx))))))
          (lambda (env fn)
            (declare (ignore env))
            ;; Like SQLite, scan a covering index instead of the table when
            ;; one holds every column the query reads (this decides the row
            ;; order an unordered query, or group_concat, sees).
-           (let ((idx (covering-index table (src-wanted src))))
+           (let ((idx (covering-index table (src-wanted src) fs)))
              (if idx
-                 (let ((cols (table-columns table))
-                       (n (length (table-columns table))))
-                   (map-index (table-owner table) (index-root idx)
-                              (lambda (vals)
-                                (let ((row (make-array (1+ n) :initial-element :null)))
-                                  (loop for (ci) in (index-columns idx)
-                                        for v in vals
-                                        do (setf (svref row ci)
-                                                 (if (and (integerp v)
-                                                          (eq (column-affinity (aref cols ci)) :real))
-                                                     (safe-double v)
-                                                     v)))
-                                  (let ((rowid (car (last vals))))
-                                    (setf (svref row n) rowid)
-                                    (when (table-rowid-alias table)
-                                      (setf (svref row (table-rowid-alias table)) rowid)))
-                                  (funcall fn row)))))
-                 (map-table-rows table fn :wanted (src-wanted src))))))))))
+                 (map-index (table-owner table) (index-root idx)
+                            (lambda (vals) (funcall fn (row-from-index table idx vals))))
+                 (map-table-rows table fn :wanted (src-wanted src)))))))))))
 
-(defun covering-index (table wanted)
+(defun minmax-candidate (core rcols having order scope fsrcs)
+  "(column :min|:max) when the query's only aggregate is min/max of a
+column of its single table, with no WHERE or GROUP BY."
+  (let ((fs (first fsrcs)))
+    (when (and fs (null (cdr fsrcs)) (fsrc-table fs) (not (table-vtab (fsrc-table fs)))
+               (null (select-core-where core)) (null (select-core-group core))
+               (not (select-core-distinct core)))
+      (let ((calls '()))
+        (labels ((walk (x)
+                   (when (consp x)
+                     (case (car x)
+                       ((:subquery :exists) nil)
+                       (:fn (if (aggregate-call-p x) (push x calls) (mapc #'walk (cdr x))))
+                       (:winfn (push x calls))
+                       (t (mapc #'walk (cdr x)))))))
+          (mapc (lambda (rc) (walk (first rc))) rcols)
+          (walk having)
+          (mapc (lambda (o) (walk (first o))) order))
+        (let ((c (and calls (null (cdr calls)) (first calls))))
+          (when (and c (eq (car c) :fn)
+                     (member (string-downcase-ascii (second c)) '("min" "max") :test #'string=)
+                     (= (length (third c)) 1) (not (fourth c)))
+            (let ((a (first (third c))))
+              (when (eq (car a) :col)
+                (multiple-value-bind (depth si ci) (resolve-column scope (second a) (third a))
+                  (when (and depth (= depth 0) (= si 0))
+                    (list ci (if (string-equal (second c) "min") :min :max))))))))))))
+
+(defun minmax-access (fs hint)
+  "A lone min(col)/max(col): read one end of the rowid order or of an index
+led by COL (SQLite's min/max optimisation).  NIL if neither exists."
+  (destructuring-bind (ci kind) hint
+    (let* ((table (fsrc-table fs))
+           (src (fsrc-src fs))
+           (owner (table-owner table))
+           (rowid-p (and (not (table-without-rowid table))
+                         (or (eq ci :rowid) (eql ci (table-rowid-alias table)))))
+           (idx (and (not rowid-p) (integerp ci) (not (table-without-rowid table))
+                     (find-if (lambda (idx)
+                                (let ((ic (first (index-columns idx))))
+                                  (and (null (index-where idx)) (index-allowed-p fs idx)
+                                       (eql (first ic) ci)
+                                       (collation= (second ic) (column-collation (aref (table-columns table) ci))))))
+                              (reverse (table-indexes table))))))
+      (cond
+        (rowid-p
+         (eqp-table-note (format nil "SEARCH ~a" (src-name src)))
+         (lambda (env fn)
+           (declare (ignore env))
+           (catch :minmax
+             (funcall (if (eq kind :max) #'map-table-reverse #'map-table) owner (table-root table)
+                      (lambda (rowid payload)
+                        (funcall fn (table-record-to-row table rowid
+                                                         (decode-record payload 0 (length payload) nil
+                                                                        (src-wanted src))))
+                        (throw :minmax nil))))))
+        (idx
+         (let ((desc (third (first (index-columns idx)))) (covers :unknown))
+           (flet ((covering-p ()
+                    (when (eq covers :unknown) (setf covers (index-covers-p table idx (src-wanted src))))
+                    covers))
+             (eqp-table-note (lambda () (format nil "SEARCH ~a USING ~:[~;COVERING ~]INDEX ~a"
+                                                (src-name src) (covering-p) (index-name idx))))
+             (lambda (env fn)
+               (declare (ignore env))
+               (let ((from-end (if desc (eq kind :min) (eq kind :max))))
+                 (catch :minmax
+                   ;; NULLs sort first: max takes the last entry (NULL only if
+                   ;; all are), min the first non-NULL one
+                   (funcall (if from-end #'map-index-reverse #'map-index) owner (index-root idx)
+                            (lambda (vals)
+                              (unless (and (eq kind :min) (eq (first vals) :null))
+                                (let ((row (if (covering-p)
+                                               (row-from-index table idx vals)
+                                               (fetch-row table (car (last vals)) (src-wanted src)))))
+                                  (when row (funcall fn row)))
+                                (throw :minmax nil))))))))))
+        (t
+         ;; no index: every row is read, but SQLite still calls the loop a SEARCH
+         (eqp-table-note (format nil "SEARCH ~a" (src-name src)))
+         nil)))))
+
+(defun row-from-index (table idx vals)
+  "A table row built from an index entry (the columns it lacks read NULL)."
+  (let* ((cols (table-columns table))
+         (n (length cols))
+         (row (make-array (1+ n) :initial-element :null)))
+    (loop for (ci) in (index-columns idx)
+          for v in vals
+          do (setf (svref row ci)
+                   (if (and (integerp v) (eq (column-affinity (aref cols ci)) :real))
+                       (safe-double v)
+                       v)))
+    (let ((rowid (car (last vals))))
+      (setf (svref row n) rowid)
+      (when (table-rowid-alias table)
+        (setf (svref row (table-rowid-alias table)) rowid)))
+    row))
+
+(defun index-covers-p (table idx wanted)
+  "Does IDX (of a rowid table) hold every WANTED column?"
+  (let ((cols (mapcar #'first (index-columns idx))))
+    (and wanted (not (table-without-rowid table)) (not (table-virtual-p table))
+         (null (index-where idx))
+         (every #'integerp cols)
+         (loop for i below (length wanted)
+               always (or (zerop (sbit wanted i))
+                          (eql i (table-rowid-alias table))
+                          (member i cols))))))
+
+(defun covering-index (table wanted &optional fs)
   "A plain index of a rowid table that contains every WANTED column (the
 narrowest, newest on ties), or NIL."
   (when (and wanted (not (table-without-rowid table)) (not (table-virtual-p table)))
@@ -491,6 +814,7 @@ narrowest, newest on ties), or NIL."
       (dolist (idx (table-indexes table) best)
         (let ((cols (mapcar #'first (index-columns idx))))
           (when (and (null (index-where idx))
+                     (or (null fs) (index-allowed-p fs idx))
                      (every #'integerp cols)
                      (loop for i below (length wanted)
                            always (or (zerop (sbit wanted i))
@@ -705,8 +1029,13 @@ Return the per-source ON expressions."
                       ;; WHERE terms for the inner table of a LEFT JOIN
                       (access-asts (cond (right nil) (left match-asts) (t filter-asts)))
                       (iterate (if (fsrc-table fs)
-                                   (plan-table-access fs i access-asts scope)
+                                   (let ((*eqp-left* (and left t)))
+                                     (plan-table-access fs i access-asts scope))
                                    (let ((rf (fsrc-rows-fn fs)))
+                                     (let ((*eqp-left* (and left t)))
+                                       (eqp-table-note (format nil "SCAN ~a" (or (fsrc-label fs)
+                                                                                 (src-name (fsrc-src fs))
+                                                                                 "(subquery)"))))
                                      (lambda (env fn)
                                        (dolist (row (funcall rf env)) (funcall fn row)))))))
                  (push (make-level :index i :fsrc fs :iterate iterate :left-p (and left t)
@@ -809,8 +1138,16 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
     (return-from compile-core (compile-values-core (second core) scope order limit offset)))
   (let ((fast (multiple-value-list (count-star-fast-path core order limit offset))))
     (when (first fast) (return-from compile-core (values-list fast))))
-  (let* ((fsrcs (mapcar (lambda (item) (make-fsrc-for item scope))
-                        (select-core-from core)))
+  (let* ((fsrcs (let ((items (select-core-from core)))
+                  (loop for item in items
+                        for i from 0
+                        collect (let ((*eqp-coroutine-ok*
+                                        (and (zerop i)
+                                             (or (null (cdr items))
+                                                 (member (getf (second items) :join)
+                                                         '(:left :right :full :cross))))))
+                                  (make-fsrc-for item scope)))))
+         (_0 (unless fsrcs (eqp-note "SCAN CONSTANT ROW")))
          (cscope (make-scope :srcs (mapcar #'fsrc-src fsrcs) :parent scope))
          (ons (apply-joins fsrcs cscope))
          (rcols (expand-result-columns core cscope))
@@ -823,7 +1160,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
          (agg-p (or group having
                     (some (lambda (rc) (contains-aggregate-p (first rc))) rcols)
                     (some (lambda (o) (contains-aggregate-p (first o))) order))))
-    (declare (ignore _))
+    (declare (ignore _ _0))
     (when (and having (not group) (not agg-p))
       (sql-error "a GROUP BY clause is required before HAVING"))
     (multiple-value-bind (levels finals order-done)
@@ -831,6 +1168,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                                  (not (select-core-windows core))
                                  (notany (lambda (rc) (contains-window-p (first rc))) rcols)
                                  (compute-order-hint order rcols cscope fsrcs)))
+              (*minmax-hint* (and agg-p (minmax-candidate core rcols having order cscope fsrcs)))
               (*order-satisfied* nil))
           (multiple-value-bind (l f) (build-levels fsrcs cscope (select-core-where core) ons)
             (values l f *order-satisfied*)))
@@ -850,6 +1188,8 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                    (when agg-p (setf (scope-agg-p cscope) t))
                    (setf (scope-windows cscope) (make-array 0 :adjustable t :fill-pointer t)
                          (scope-window-defs cscope) (select-core-windows core))))
+             ;; EQP: subqueries evaluated per group come after GROUP BY
+             (*eqp-rank* (if agg-p 4 2))
              (out-fns (mapcar (lambda (rc) (compile-expr (first rc) cscope)) rcols))
              (having-fn (and having (compile-expr having cscope)))
              (order-specs (compile-order-terms order rcols cscope))
@@ -858,6 +1198,24 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
              (aggs (coerce (scope-aggs cscope) 'list))
              (wins (scope-windows cscope)))
         (declare (ignore _2))
+        (when *eqp*
+          (when group
+            (eqp-note (lambda ()
+                        (unless (eqp-scan-order-p fsrcs (mapcar (lambda (g) (resolve-group-term g rcols)) group)
+                                                  cscope)
+                          "USE TEMP B-TREE FOR GROUP BY"))
+                      +eqp-group+))
+          (when distinct
+            (eqp-note (lambda ()
+                        (unless (eqp-scan-order-p fsrcs (mapcar #'first rcols) cscope :any-order t)
+                          "USE TEMP B-TREE FOR DISTINCT"))
+                      +eqp-distinct+))
+          (when (and order-specs (not order-done)
+                     ;; SELECT DISTINCT x ORDER BY x: SQLite turns it into a GROUP BY
+                     (not (and distinct (not agg-p) (= (length order) (length rcols))
+                               (loop for (e) in order for rc in rcols for spec in order-specs for i from 0
+                                     always (or (eql (first spec) i) (equal e (first rc)))))))
+            (eqp-note "USE TEMP B-TREE FOR ORDER BY" +eqp-order+)))
         (values
          (lambda (parent-env)
            (let* ((env (make-env :rows (make-array nsrc) :parent parent-env))
@@ -973,6 +1331,15 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
          columns
          cscope)))))
 
+(defun count-index (table)
+  "The narrowest full index of a rowid table (newest on ties), or NIL."
+  (unless (table-without-rowid table)
+    (let ((best nil))
+      (dolist (idx (table-indexes table) best)
+        (when (and (null (index-where idx))
+                   (or (null best) (<= (length (index-columns idx)) (length (index-columns best)))))
+          (setf best idx))))))
+
 (defun count-star-fast-path (core order limit offset)
   "SELECT count(*) FROM <table>: count cells without decoding any record."
   (let ((cols (select-core-cols core))
@@ -991,10 +1358,16 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
       (let ((table (lookup-table *db* (second (getf (first from) :source)) nil
                                  (fourth (getf (first from) :source)))))
         (when (and table (not (table-view-select table)) (not (table-vtab table)))
-          (let ((c (first cols)))
+          (let* ((c (first cols))
+                 (idx (count-index table))
+                 (root (if idx (index-root idx) (table-root table))))
+            (eqp-note (format nil "SCAN ~a~@[ USING COVERING INDEX ~a~]"
+                              (or (third (getf (first from) :source)) (table-name table))
+                              (and idx (index-name idx))))
             (values (lambda (parent-env)
                       (declare (ignore parent-env))
-                      (list (list (btree-count (table-owner table) (table-root table)))))
+                      ;; as SQLite: count the entries of the smallest index
+                      (list (list (btree-count (table-owner table) root))))
                     (list (list (or (third c) (fourth c) "count(*)") nil :binary))
                     nil)))))))
 
@@ -1018,6 +1391,29 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
           (sql-error "GROUP BY term out of range - should be between 1 and ~d" (length rcols)))
         (first (nth (1- k) rcols)))
       g))
+
+(defun eqp-scan-order-p (fsrcs exprs scope &key any-order)
+  "EQP: does the single table's full scan deliver rows ordered (grouped) by
+EXPRS, so that SQLite would need no temp b-tree?"
+  (let ((fs (first fsrcs)))
+    (when (and fs (null (cdr fsrcs)) (fsrc-table fs) (fsrc-scan-index fs))
+      (let* ((table (fsrc-table fs))
+             (cols (mapcar (lambda (e)
+                             (case (car e)
+                               (:srccol (and (= (second e) 0) (third e)))
+                               (:col (multiple-value-bind (depth si ci) (resolve-column scope (second e) (third e))
+                                       (and depth (= depth 0) (= si 0) ci)))))
+                           exprs))
+             (idx (funcall (fsrc-scan-index fs))))
+        (when (every #'identity cols)
+          (let ((cols (mapcar (lambda (c) (if (eql c (table-rowid-alias table)) :rowid c)) cols)))
+            (cond ((eq idx :rowid) (member :rowid cols))
+                  ((index-p idx)
+                   (let ((icols (mapcar #'first (index-columns idx))))
+                     (and (<= (length cols) (length icols))
+                          (if any-order
+                              (subsetp (subseq icols 0 (length cols)) cols)
+                              (equal (subseq icols 0 (length cols)) cols))))))))))))
 
 (defun compile-order-terms (order rcols scope)
   "Return list of (fn-or-column-index desc collation nulls)."
@@ -1059,6 +1455,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
          (columns (loop for i from 1 to n
                         collect (list (format nil "column~d" i) nil :binary))))
     (when order (sql-error "ORDER BY on VALUES is not supported without a SELECT"))
+    (eqp-note (if (cdr rows) (format nil "SCAN ~d CONSTANT ROWS" (length rows)) "SCAN CONSTANT ROW"))
     (values (lambda (parent-env)
               (let ((out (mapcar (lambda (r) (mapcar (lambda (f) (funcall f parent-env)) r)) fns))
                     (lim (eval-limit limit parent-env))
@@ -1119,6 +1516,10 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
 
 (defun register-ctes (sel)
   "Push this SELECT's WITH clause onto *CTES*."
+  (let ((*eqp* nil))
+    (register-ctes-1 sel)))
+
+(defun register-ctes-1 (sel)
   (dolist (w (sel-with sel))
     (destructuring-bind (name cols csel) w
       (let ((cte (make-cte :name name :columns cols :sel csel :env *ctes*)))
@@ -1170,13 +1571,23 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
   (compile-select sel scope :limit-one limit-one))
 
 (defun compile-compound (sel scope)
-  (let* ((compiled (mapcar (lambda (core)
-                             (multiple-value-list (compile-core core scope)))
-                           (sel-cores sel)))
+  (let* ((compiled (with-eqp-node ("COMPOUND QUERY")
+                     (loop for core in (sel-cores sel)
+                           for op in (cons nil (sel-ops sel))
+                           collect (with-eqp-node ((if op
+                                                       (ecase op
+                                                         (:union-all "UNION ALL")
+                                                         (:union "UNION USING TEMP B-TREE")
+                                                         (:intersect "INTERSECT USING TEMP B-TREE")
+                                                         (:except "EXCEPT USING TEMP B-TREE"))
+                                                       "LEFT-MOST SUBQUERY"))
+                                     (multiple-value-list (compile-core core scope))))))
+         (_ (when (sel-order sel) (eqp-note "USE TEMP B-TREE FOR ORDER BY" +eqp-order+)))
          (cols (second (first compiled)))
          (n (length cols))
          (colls (mapcar #'third cols))
          (correlated (some (lambda (c) (and (third c) (scope-outer-ref (third c)))) compiled)))
+    (declare (ignore _))
     (dolist (c compiled)
       (unless (= (length (second c)) n)
         (sql-error "SELECTs to the left and right of ~a do not have the same number of result columns"
@@ -1264,6 +1675,9 @@ row into an ephemeral index, where the last equal row wins."
                                  (dedupe-rows right colls)))))))
 
 (defun select-first-affinity (sel scope)
+  (without-eqp (select-first-affinity-1 sel scope)))
+
+(defun select-first-affinity-1 (sel scope)
   (ignore-errors
    (let ((core (first (sel-cores sel))))
      (when (and (select-core-p core) (eq (car (first (select-core-cols core))) :expr))
@@ -1274,6 +1688,9 @@ row into an ephemeral index, where the last equal row wins."
            (expr-affinity (second (first (select-core-cols core))) cscope)))))))
 
 (defun select-first-collation (sel scope)
+  (without-eqp (select-first-collation-1 sel scope)))
+
+(defun select-first-collation-1 (sel scope)
   (ignore-errors
    (let ((core (first (sel-cores sel))))
      (when (and (select-core-p core) (eq (car (first (select-core-cols core))) :expr))

@@ -60,6 +60,19 @@
 
 (defvar *message-mismatches* 0)
 
+(defun eqp-shape (sql rows)
+  "EXPLAIN QUERY PLAN rows as (depth detail): ids are SQLite's bytecode
+addresses, so only the tree's shape and wording are compared."
+  (if (not (let ((s (string-left-trim '(#\Space #\Tab #\Newline) sql)))
+             (and (>= (length s) 18) (string-equal (subseq s 0 18) "EXPLAIN QUERY PLAN"))))
+      rows
+      (let ((depth (make-hash-table)))
+        (setf (gethash 0 depth) -1)
+        (loop for (id parent nil detail) in rows
+              collect (let ((d (1+ (gethash parent depth -1))))
+                        (setf (gethash id depth) d)
+                        (list d detail))))))
+
 (defun run-case (case)
   "Return NIL on success, or a description of the first divergence."
   (destructuring-bind (name &rest steps) case
@@ -88,8 +101,8 @@
                            (:rows
                             (if err
                                 (format nil "unexpected error: ~a" err)
-                                (let ((want (mapcar (lambda (r) (mapcar #'decode-expected r)) (second more)))
-                                      (got (first result))
+                                (let ((want (eqp-shape sql (mapcar (lambda (r) (mapcar #'decode-expected r)) (second more))))
+                                      (got (eqp-shape sql (first result)))
                                       (cols (second result)))
                                   (cond ((not (compare-rows got want (ordered-statement-p sql)))
                                          (let* ((ordered (ordered-statement-p sql))

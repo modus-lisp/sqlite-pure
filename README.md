@@ -146,8 +146,13 @@ json_set json_insert json_replace json_remove json_patch json_group_array
 json_group_object json_each json_tree`.
 
 **Query planning.** Each join level uses a rowid lookup, a rowid range, an
-index prefix seek, or a scan, chosen from the `WHERE`/`ON` terms with
-SQLite's rules for when an index may be used under affinity and collation.
+index prefix seek (covering when the index holds every column read), an
+`IN (...)` probe of the rowid or an index, or a scan, chosen from the
+`WHERE`/`ON` terms with SQLite's rules for when an index may be used under
+affinity and collation; a lone `min()`/`max()` reads one end of an index or
+of the rowid order; `count(*)` counts the smallest index; `INDEXED BY` and
+`NOT INDEXED` are honoured. Joins run in `FROM` order (SQLite may reorder
+them).
 `ORDER BY` is satisfied from rowid or index order where possible (in either
 direction, stopping early for `LIMIT`); otherwise `ORDER BY … LIMIT` keeps
 only the best rows. Only referenced columns are decoded; `count(*)` comes
@@ -166,10 +171,23 @@ SQLite's, and `rtreecheck()` and `rtreenode()` are provided.  A database
 holding virtual tables of other modules (FTS5, say) opens; those tables
 report "no such module", as in SQLite.
 
+**EXPLAIN QUERY PLAN** reports the plan this library chose, in SQLite
+3.40's words and tree shape: `SEARCH t USING COVERING INDEX i (a=? AND
+b=?)`, `SCAN t`, `LEFT-JOIN`, `CO-ROUTINE` / `MATERIALIZE`, `SETUP` /
+`RECURSIVE STEP`, `(CORRELATED) SCALAR / LIST SUBQUERY n` (numbered as
+SQLite numbers them), compound parts, `SCAN n CONSTANT ROWS`, R-tree and
+table-valued `VIRTUAL TABLE INDEX` lines, and the `USE TEMP B-TREE FOR
+GROUP BY / DISTINCT / ORDER BY` steps. Where the two planners choose alike
+(most single-table and `FROM`-ordered queries) the output is identical;
+where they differ (join order, automatic indexes, subquery flattening) it
+describes what this library does. Plain `EXPLAIN` (VDBE bytecode) has no
+equivalent here.
+
 ## Not implemented
 
 Virtual tables other than R-tree (FTS3/4/5, geopoly, R-tree `MATCH`
-geometry callbacks), `EXPLAIN`. Durability depends on the Lisp's
+geometry callbacks), plain `EXPLAIN` (bytecode listings), join reordering
+and automatic indexes. Durability depends on the Lisp's
 `finish-output`; there is no portable `fsync`. File locks need SBCL
 (elsewhere they are no-ops, and cache validation still applies).
 
@@ -216,6 +234,7 @@ src/
   dml        INSERT / UPDATE / DELETE, constraints, conflicts, upsert, RETURNING
   ddl        CREATE / DROP / ALTER and sqlite_schema maintenance
   rtree      the R*Tree virtual table module
+  eqp        EXPLAIN QUERY PLAN
   integrity  PRAGMA integrity_check
   api        public API, statements, transactions, ATTACH, PRAGMAs
   vacuum     VACUUM

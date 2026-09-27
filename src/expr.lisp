@@ -549,8 +549,8 @@ coalesce(left, right)."
                                                  :cols (list (list :star nil))
                                                  :from (list (list :source (list :table (second rhs) nil nil)
                                                                    :join :first)))))))
-                (sub (multiple-value-list (compile-subselect sel scope)))
-                (correlated (second sub))
+                (sub (multiple-value-list (compile-subquery-noted "LIST" sel scope)))
+                (correlated (third sub))
                 (sub (first sub))
                 (saff (select-first-affinity sel scope))
                 (aff (comparison-affinity xaff saff))
@@ -629,8 +629,25 @@ coalesce(left, right)."
 ;;; ------------------------------------------------------------------
 ;;; Subqueries (the select engine provides COMPILE-SUBSELECT)
 
+(defun compile-subquery-noted (kind sel scope &rest args)
+  "COMPILE-SUBSELECT, recorded for EXPLAIN QUERY PLAN as a KIND subquery.
+Returns (values fn columns correlated-p)."
+  (when (and *eqp* (gethash sel *eqp-noted*))
+    (return-from compile-subquery-noted (without-eqp (apply #'compile-subselect sel scope args))))
+  (when *eqp* (setf (gethash sel *eqp-noted*) t))
+  (let* ((cell (list nil))
+         (node (eqp-note (lambda () (format nil "~:[~;CORRELATED ~]~a SUBQUERY ~a"
+                                            (car cell) kind (eqp-sel-id sel)))
+                         *eqp-rank*)))
+    (multiple-value-bind (fn cols correlated)
+        (let ((*eqp-parent* (or node *eqp-parent*)) (*eqp-rank* 2))
+          (apply #'compile-subselect sel scope args))
+      (setf (car cell) correlated)
+      (values fn cols correlated))))
+
 (defun compile-scalar-subquery (sel scope)
-  (multiple-value-bind (sub correlated) (compile-subselect sel scope :limit-one t)
+  (multiple-value-bind (sub cols correlated) (compile-subquery-noted "SCALAR" sel scope :limit-one t)
+   (declare (ignore cols))
    (let ((cache nil))
     (lambda (env)
       (if cache
@@ -643,7 +660,8 @@ coalesce(left, right)."
             v))))))
 
 (defun compile-exists (sel scope)
-  (multiple-value-bind (sub correlated) (compile-subselect sel scope :limit-one t)
+  (multiple-value-bind (sub cols correlated) (compile-subquery-noted "SCALAR" sel scope :limit-one t)
+    (declare (ignore cols))
     (let ((cache nil))
       (lambda (env)
         (if cache

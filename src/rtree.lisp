@@ -642,8 +642,14 @@ walking the tree past subtrees the coordinate constraints rule out."
          (id-eq (find-if (lambda (c) (and (eql (first c) 0) (eq (second c) :eq))) cons*))
          (coord (remove-if-not (lambda (c) (<= 1 (first c) (rtree-ndim2 rt))) cons*))
          (id-fn (and id-eq (compile-expr (third id-eq) scope)))
+         (_ (eqp-table-note
+             (format nil "SCAN ~a VIRTUAL TABLE INDEX ~:[2:~{~a~}~;1:~]" (src-name (fsrc-src fs)) id-eq
+                     (loop for (ci op) in (reverse coord)
+                           collect (format nil "~a~d" (ecase op (:eq "A") (:le "B") (:lt "C") (:ge "D") (:gt "E"))
+                                           (1- ci))))))
          (coord-fns (mapcar (lambda (c) (list (1- (first c)) (second c) (compile-expr (third c) scope)))
                             coord)))
+    (declare (ignore _))
     (lambda (env fn)
       (with-rtree (table)
         (if id-fn

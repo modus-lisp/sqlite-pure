@@ -20,11 +20,15 @@ and may return true when this row became the aggregate's witness (min/max)."
 
 (defstruct agg
   name ctor arg-fns distinct filter-fn order
+  (collation :binary)    ; of the (first) argument: min/max and DISTINCT compare with it
   step-fn final-fn seen)
+
+(defvar *agg-collation* :binary "The collation of the aggregate being instantiated.")
 
 (defun agg-instantiate (spec)
   (let ((a (copy-agg spec)))
-    (multiple-value-bind (step final) (funcall (agg-ctor spec))
+    (multiple-value-bind (step final) (let ((*agg-collation* (agg-collation spec)))
+                                        (funcall (agg-ctor spec)))
       (setf (agg-step-fn a) step (agg-final-fn a) final
             (agg-seen a) (and (agg-distinct spec) (make-hash-table :test #'equal))))
     (when (agg-order spec) (setf (agg-seen a) (or (agg-seen a) (make-hash-table :test #'equal))))
@@ -39,7 +43,7 @@ and may return true when this row became the aggregate's witness (min/max)."
                    (gethash :buffer (agg-seen a)))
              nil)
             ((and (agg-distinct a)
-                  (let ((k (group-key args)))
+                  (let ((k (group-key args (list (agg-collation a)))))
                     (if (gethash k (agg-seen a)) t (progn (setf (gethash k (agg-seen a)) t) nil))))
              nil)
             (t (funcall (agg-step-fn a) args))))))
@@ -52,7 +56,7 @@ and may return true when this row became the aggregate's witness (min/max)."
       (dolist (it items)
         (let ((args (cdr it)))
           (unless (and (agg-distinct a)
-                       (let ((k (group-key args)))
+                       (let ((k (group-key args (list (agg-collation a)))))
                          (prog1 (gethash k seen) (setf (gethash k seen) t))))
             (funcall (agg-step-fn a) args))))))
   (funcall (agg-final-fn a)))
@@ -90,6 +94,7 @@ connection shadows the built-in of that name."
            (setf (scope-agg-p scope) nil (scope-in-agg-arg scope) t)
            (let ((spec (unwind-protect
                             (make-agg :name lname :ctor ctor
+                                      :collation (or (and args (expr-collation (first args) scope)) :binary)
                                       :arg-fns (mapcar (lambda (a) (compile-expr a scope)) args)
                                       :distinct distinct
                                       :filter-fn (and filter (compile-expr filter scope))
@@ -447,11 +452,11 @@ one after numeric affinity; anything else is summed as a REAL."
             (lambda () (if (zerop n) :null (/ sum n))))))
 
 (defun make-minmax (sign)
-  (let ((best :none))
+  (let ((best :none) (coll *agg-collation*))
     (values (lambda (args)
               (let ((v (first args)))
                 (unless (eq v :null)
-                  (when (or (eq best :none) (funcall sign (compare-values v best)))
+                  (when (or (eq best :none) (funcall sign (compare-values v best coll)))
                     (setf best v)
                     t))))
             (lambda () (if (eq best :none) :null best)))))

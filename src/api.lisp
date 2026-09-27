@@ -104,6 +104,7 @@
                (vacuum-in-place target))))
        (values nil nil))
       (:pragma (exec-pragma db st))
+      (:explain-qp (explain-query-plan db (second st) text))
       (t
        (unless (write-statement-p st) (sql-error "unsupported statement"))
        (run-in-write-txn

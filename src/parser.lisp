@@ -521,10 +521,12 @@
                      (loop while (accept-op p ",") do (push (parse-expr p) args)))
                    (expect-op p ")")
                    (list :tvf name (nreverse args) (parse-alias p)))
-                 (let ((alias (parse-alias p)))
-                   (cond ((accept-kw p "INDEXED" "BY") (parse-name p t))
-                         ((accept-kw p "NOT" "INDEXED")))
-                   (list :table name alias schema)))))))
+                 (let* ((alias (parse-alias p))
+                        (hint (cond ((accept-kw p "INDEXED" "BY") (list :by (parse-name p t)))
+                                    ((accept-kw p "NOT" "INDEXED") :not))))
+                   (if hint
+                       (list :table name alias schema hint)
+                       (list :table name alias schema))))))))
 
 (defun parse-alias (p)
   (cond ((accept-kw p "AS") (parse-name p t))
@@ -1013,7 +1015,8 @@
        (list :vacuum schema (when (accept-kw p "INTO") (parse-expr p)))))
     ((accept-kw p "ANALYZE") (unless (op-p p ";") (when (name-token-p (peek-tok p) t) (parse-qualified-name p))) (list :noop))
     ((accept-kw p "REINDEX") (when (name-token-p (peek-tok p) t) (parse-qualified-name p)) (list :noop))
-    ((accept-kw p "EXPLAIN") (perr p "EXPLAIN is not supported"))
+    ((accept-kw p "EXPLAIN" "QUERY" "PLAN") (list :explain-qp (parse-statement p)))
+    ((accept-kw p "EXPLAIN") (perr p "EXPLAIN is not supported (EXPLAIN QUERY PLAN is)"))
     (t (perr p "syntax error"))))
 
 (defun parse-sql (sql)

@@ -120,6 +120,28 @@ def main():
             else:
                 lines.append('SELECT %s FROM a ORDER BY %s NULLS %s, rowid LIMIT %d OFFSET %d;'
                              % (e1, e2, r.choice(['FIRST', 'LAST']), r.randint(0, 10), r.randint(0, 5)))
+        elif k < 0.97:
+            # access paths the planner may take: IN probes, min/max, subquery equality
+            shape = r.randint(0, 6)
+            col = r.choice(['x', 'y', 'rowid', 'v', 'y COLLATE BINARY'])
+            vals = ', '.join(rnd_value(r) for _ in range(r.randint(0, 5)))
+            if shape == 0:
+                lines.append('SELECT rowid, x, y FROM a WHERE %s IN (%s) ORDER BY rowid;' % (col, vals))
+            elif shape == 1:
+                lines.append('SELECT rowid FROM a WHERE %s IN (SELECT %s FROM b) ORDER BY rowid;'
+                             % (col, r.choice(['k', 'x', 'k || \'\''])))
+            elif shape == 2:
+                lines.append('SELECT %s(%s) FROM a;' % (r.choice(['min', 'max']), r.choice(['x', 'y', 'rowid', 'z'])))
+            elif shape == 3:
+                lines.append('SELECT %s(%s), rowid, x, y FROM a;' % (r.choice(['min', 'max']), r.choice(['x', 'y', 'rowid'])))
+            elif shape == 4:
+                lines.append('SELECT rowid FROM a WHERE %s = (SELECT %s FROM b ORDER BY rowid LIMIT 1) ORDER BY rowid;'
+                             % (col, r.choice(['k', 'x'])))
+            elif shape == 5:
+                lines.append('SELECT %s(%s) FROM b;' % (r.choice(['min', 'max']), r.choice(['k', 'rowid'])))
+            else:
+                lines.append('SELECT rowid FROM a WHERE x IN (%s) AND y IN (%s) ORDER BY rowid;'
+                             % (vals or 'NULL', ', '.join(rnd_value(r) for _ in range(3))))
         else:
             c = r.choice(['x', 'y', 'v', 'u'])
             lines.append('SELECT DISTINCT %s FROM a ORDER BY 1;' % c if r.random() < 0.5

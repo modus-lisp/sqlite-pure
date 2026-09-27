@@ -56,6 +56,7 @@
                               (unless (or star (<= min (length args) (or max (length args))))
                                 (sql-error "wrong number of arguments to function ~a()" name))
                               (make-agg :name lname :ctor ctor :arg-fns arg-fns :distinct distinct
+                                        :collation (or (and args (expr-collation (first args) scope)) :binary)
                                         :filter-fn (and filter (compile-expr filter scope)))))
                   :partition-fns (mapcar (lambda (x) (compile-expr x scope)) (getf (cdr spec) :partition))
                   :partition-colls (mapcar (lambda (x) (or (expr-collation x scope) :binary))
