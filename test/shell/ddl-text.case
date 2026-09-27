@@ -1,0 +1,18 @@
+args: 
+CREATE TABLE t1(a, b)   ;
+CREATE TABLE t2(a) -- trailing comment
+;
+CREATE TABLE t3(a PRIMARY KEY) WITHOUT ROWID /* c */ ;
+CREATE INDEX i1 ON t1(a)
+;
+CREATE INDEX i2 ON t1(b) -- note
+;
+CREATE UNIQUE INDEX i3 ON t1(a,b) WHERE a>0   ;
+CREATE VIEW v1 AS SELECT 1   -- vc
+;
+CREATE TRIGGER tr1 AFTER INSERT ON t1 BEGIN SELECT 1; END  -- tc
+;
+CREATE VIRTUAL TABLE r1 USING rtree(id, x0, x1)  ;
+CREATE TABLE t4 AS SELECT 1 AS x   -- asc
+;
+SELECT name, quote(sql) FROM sqlite_schema;

@@ -346,7 +346,10 @@ equivalent here.
 
 R-tree `MATCH` geometry callbacks, the ICU tokenizer, FTS5's
 `*`-prefixed diagnostic queries, plain `EXPLAIN` (bytecode listings),
-join reordering and automatic indexes.  `fsync` and file locks need SBCL (elsewhere
+`ANALYZE` (accepted, writes no `sqlite_stat1`), join reordering and
+automatic indexes — joins run in FROM order, so a many-way join SQLite
+reorders into index lookups can be very slow here (sqllogictest's
+`select5.test`).  `fsync` and file locks need SBCL (elsewhere
 `finish-output` is the barrier and locks are no-ops, with cache
 validation still applied).
 
@@ -379,7 +382,17 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-rtree.sh` | r-trees modified alternately by SQLite and by us, checked against a plain mirror table and by SQLite's `rtreecheck()`; auto-vacuum root moves on DROP; VACUUM |
 | `test/run-wal.sh` | WAL databases shared with live SQLite connections: each side reading the other's commits, snapshots surviving the other's writes and checkpoints, the write lock both ways, stale snapshots, log restart, two processes writing at once, last-one-out cleanup, crash recovery, rebuilding SQLite's index, mode switching; `FUZZ_WAL=1 test/run-fuzz.sh` runs the file fuzzer in WAL mode (and `FUZZ_AUTOVACUUM=FULL` or `INCREMENTAL` with auto-vacuum) |
 | `test/run-locking.sh` | SQLite processes and this library on one file: lock conflicts both ways, stale-cache detection, concurrent writers |
+| `test/run-slt.sh [-j N] [FILE…]` | **sqllogictest**, SQLite's engine-independent SQL correctness corpus (622 files, ~7.4 M records, every expected result produced by SQLite), run through the library directly; values rendered, sorted and hashed exactly as the corpus's own SQLite driver does. Records where the corpus (made by an older SQLite) disagrees with SQLite 3.40 itself are listed, with the reason, in `test/slt-known.txt` |
+| `test/run-tcl.sh [-j N] [-t SECS] [FILE…]` | **SQLite's own TCL test suite** — the `test/*.test` files and `tester.tcl` of the 3.40.1 source release, unmodified — against this library: `test/tcl/sqlite3.tcl` implements tclsqlite's `[sqlite3]` command over `test/tcl/server.lisp` (one server process per database handle, callbacks for Tcl functions and collations), and `test/tcl/testfixture.c` is a tclsh that loads it. Test-only C hooks of SQLite's testfixture are stubbed and counted, so each file's line says how many it reached |
+| `test/run-web-files.sh` | real databases from the web (Chinook, Northwind, Sakila, two GeoPackages, an MBTiles file): `.dump` identical to sqlite3's; the same modifications and a VACUUM by both engines give the same output and content, pass sqlite3's `integrity_check`, and (Chinook, Northwind) byte-identical files |
 | `test/run-shell.sh [CASE…]` | `bin/sqlp` against SQLite's `sqlite3` shell (built by `test/build-oracle.sh`): every script in `test/shell/*.case` must give identical stdout, stderr and exit status. The scripts cover every output mode, the dot-commands, `.dump`, `.import`, error reports, statement completion, interactive prompts and the command-line options |
+
+Current results (SQLite 3.40.1 as reference): **sqllogictest** — every
+record of 621 of the 622 files passes (5.94 M records; two records listed as
+3.40-versus-corpus differences); `select5.test`, 18-way joins, does not
+finish (see Not implemented).  **SQLite's TCL suite** — of the 628 files
+that use no testfixture-only C hooks, 144 880 of 156 948 tests pass (92.3%);
+over all 1042 files that run to the end, 188 220 of 215 098.
 
 ## Layout
 
@@ -417,6 +430,7 @@ src/
   api        public API, statements, transactions, ATTACH, PRAGMAs
   vacuum     VACUUM
 shell/       bin/sqlp, the sqlite3-compatible shell (system sqlite-pure/shell)
+test/tcl/    the [sqlite3] Tcl command and testfixture for SQLite's TCL suite
 bin/         sqlp launcher and build-sqlp.sh
 test/        see above
 ```

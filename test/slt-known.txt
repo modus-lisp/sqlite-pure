@@ -1,0 +1,5 @@
+# sqllogictest records whose expected output came from an older SQLite and
+# differs from SQLite 3.40 itself (checked with the 3.40.1 sqlite3 shell).
+# FILE-SUFFIX:LINE REASON
+evidence/slt_lang_aggfunc.test:484 printf("%.3f") of -9223372036854775802.0: 3.40 prints -9223372036854775000.000 (16 significant digits, then zeros); the corpus has ...776000.000 from an older printf
+evidence/slt_lang_aggfunc.test:496 same printf("%.3f") difference, for total(DISTINCT x): SQLite 3.40 prints -9223372036854775000.000
