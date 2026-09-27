@@ -302,7 +302,8 @@ when not given).  True if the row existed."
             (fts5-insert-row fts rowid values)
             (setf (db-last-insert-rowid (conn *db*)) rowid)
             (incf (wc-changes ctx))
-            (setf (svref row (+ n 2)) rowid)
+            ;; RETURNING sees the values as given (and rowid -1), as in SQLite
+            (when (eq (svref row (+ n 2)) :null) (setf (svref row (+ n 2)) -1))
             (collect-returning ctx row)
             t)))))
 

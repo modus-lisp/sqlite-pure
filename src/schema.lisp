@@ -234,7 +234,7 @@
                (let ((ast (car (first (parse-sql sql)))))
                  (setf (gethash (schema-key name) (schema-tables schema))
                        (if (eq (car ast) :create-virtual)
-                           (virtual-table-from-ast name ast sql)
+                           (virtual-table-from-ast name ast sql schema)
                            (table-from-ast name ast root sql)))))
               ((and (equal type "view") (stringp sql))
                (let ((ast (car (first (parse-sql sql)))))
@@ -243,6 +243,16 @@
                                    :view-select (getf (cdr ast) :select)
                                    :view-columns (getf (cdr ast) :columns)
                                    :columns #())))))))
+    ;; FTS4 tables that take their columns from their content= table
+    (dolist (r rows)
+      (destructuring-bind (rowid type name tbl root sql &rest ignore) r
+        (declare (ignore rowid tbl root ignore))
+        (when (and (equal type "table") (stringp sql))
+          (let ((tb (gethash (schema-key name) (schema-tables schema))))
+            (when (and tb (consp (table-vtab tb)) (eq (first (table-vtab tb)) :unknown)
+                       (fts3-module-p (second (table-vtab tb))))
+              (setf (gethash (schema-key name) (schema-tables schema))
+                    (virtual-table-from-ast name (car (first (parse-sql sql))) sql schema)))))))
     (dolist (r rows)
       (destructuring-bind (rowid type name tbl root sql &rest ignore) r
         (declare (ignore rowid ignore))

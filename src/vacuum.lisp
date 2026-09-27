@@ -87,7 +87,13 @@
            (put-u32 h +hdr-change-counter+ old))
          (setf (db-page-count db) n))))
     (truncate-file db)
-    (clrhash (db-cache db))
+    ;; a file's cache can go; an in-memory database's cache is its content
+    (if (db-stream db)
+        (clrhash (db-cache db))
+        (let ((n (db-page-count db)))
+          (loop for pg being the hash-keys of (db-cache db)
+                when (> pg n) collect pg into gone
+                finally (dolist (p gone) (remhash p (db-cache db))))))
     (setf (db-schema db) nil)
     nil))
 

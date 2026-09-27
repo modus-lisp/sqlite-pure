@@ -18,6 +18,8 @@
 
 (in-package #:sqlite-pure)
 
+(defvar *xroot* nil)
+
 (defstruct (fphrase (:conc-name fph-))
   index                  ; 0-based, in query order
   terms                  ; list of (token prefix-p)
@@ -558,7 +560,6 @@ whose filtered position list is empty stay (with empty data), as SQLite's do."
       (xn-zero-poslist n))
     (setf (xn-rowid n) ilast)))
 
-(defvar *xroot* nil)
 
 (defun xn-compare (a b)
   (cond ((xn-eof b) -1) ((xn-eof a) 1)

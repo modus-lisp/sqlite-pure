@@ -168,7 +168,7 @@ reinserts the contents of underfull nodes; queries prune by bounding box
 using the `WHERE` clause's constraints on coordinates, and look up `id =`
 directly.  Conflict handling, value coercions and error messages follow
 SQLite's, and `rtreecheck()` and `rtreenode()` are provided.  A database
-holding virtual tables of other modules (FTS3/4, say) opens; those tables
+holding virtual tables of other modules (geopoly, say) opens; those tables
 report "no such module", as in SQLite.
 
 **Full-text search (FTS5).** `CREATE VIRTUAL TABLE t USING fts5(...)` with
@@ -198,6 +198,36 @@ and the `automerge` / `crisismerge` / `usermerge` / `pgsz` / `rank` /
 `hashsize` settings; `fts5vocab` tables (`row`, `col`, `instance`) are
 there too.
 
+**Full-text search (FTS3 and FTS4).** `CREATE VIRTUAL TABLE t USING
+fts3(...)` / `fts4(...)` with `tokenize=` and, for FTS4, `prefix=`,
+`content=` (external content, and contentless `content=''`),
+`languageid=`, `notindexed=`, `order=desc`, `matchinfo=fts3` and
+`compress=` / `uncompress=` (any SQL function, user-defined included), in
+SQLite's on-disk format: the `_content` / `_segments` / `_segdir` /
+`_docsize` / `_stat` shadow tables, segment b-trees with prefix-compressed
+leaves and interior nodes, doclists and position lists, delete markers,
+per-language and per-prefix-index levels.  Pending terms are written out
+when SQLite writes them — at the end of a transaction, when docids go
+backwards, and when a statement SQLite gives a statement journal starts —
+and segments are merged 16 at a time, so the shadow tables come out
+byte-for-byte as SQLite's do; `merge=X,Y` and `automerge=N` run SQLite's
+incremental merge (appendable segments, the merge hint in `_stat`), so
+either side can pick up a merge the other left half done, and each reads,
+writes and `integrity-check`s the other's indexes.  Tokenizers: `simple`,
+`porter` and `unicode61` (tables taken from SQLite's source;
+`remove_diacritics=0/1/2`, `tokenchars=`, `separators=`).  Queries use the
+enhanced syntax SQLite is normally built with: implicit AND, `AND`, `OR`,
+`NOT`, `"phrases"`, prefix `*`, `^first` (FTS4), `col:term`, `NEAR` and
+`NEAR/n`, parentheses, with SQLite's rebalancing and error messages.  The
+evaluator is a port of SQLite's (whole and incremental doclists, deferred
+tokens, NEAR trimming of position lists), so `snippet()`, `offsets()` and
+`matchinfo()` (every format character: `p c n a l s x y b`) return what
+SQLite returns for each row.  `docid`, `rowid` and the language id are
+hidden columns; `MATCH` on the table or a column, `docid =` / ranges and
+`ORDER BY docid` are used by the scan; `INSERT INTO t(t) VALUES (...)` runs
+`optimize`, `rebuild`, `integrity-check`, `merge=` and `automerge=`, and
+`optimize(t)` works too.  `fts4aux` and `fts3tokenize` tables are there.
+
 **EXPLAIN QUERY PLAN** reports the plan this library chose, in SQLite
 3.40's words and tree shape: `SEARCH t USING COVERING INDEX i (a=? AND
 b=?)`, `SCAN t`, `LEFT-JOIN`, `CO-ROUTINE` / `MATERIALIZE`, `SETUP` /
@@ -212,9 +242,10 @@ equivalent here.
 
 ## Not implemented
 
-FTS3/4 and geopoly, R-tree `MATCH` geometry callbacks, user-defined FTS5
-tokenizers and auxiliary functions (there is no C-style extension API),
-FTS5's `*`-prefixed diagnostic queries, plain `EXPLAIN` (bytecode
+Geopoly, R-tree `MATCH` geometry callbacks, user-defined FTS3/FTS5
+tokenizers and auxiliary functions (there is no C-style extension API, so
+no `fts3_tokenizer()` and no ICU tokenizer), FTS5's `*`-prefixed diagnostic
+queries, plain `EXPLAIN` (bytecode
 listings), join reordering and automatic indexes. Durability depends on the Lisp's
 `finish-output`; there is no portable `fsync`. File locks need SBCL
 (elsewhere they are no-ops, and cache validation still applies).
@@ -236,6 +267,9 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
+| `test/run-fts3-interop.sh` | FTS3/4 indexes shared through the file: SQLite-built deep segment trees (small pages, prefix index, an unfinished incremental merge) queried and modified here and the merge finished by SQLite; the same statements on both sides giving identical shadow tables; external content, language ids, `order=desc`; every step checked by SQLite's `integrity-check` |
+| `test/run-fts3fuzz.sh` | random documents (short and long, negative docids) and random FTS3/4 queries (every operator, NEAR/n, prefixes, `^`, column filters, malformed queries) on six table configurations against SQLite: docids, `snippet()`, `offsets()`, `matchinfo()` |
+| `test/run-fts3-tokens.sh` | the `simple`, `porter` and `unicode61` tokenizers (with arguments) against SQLite's `fts3tokenize`: tokens, byte offsets, positions |
 | `test/run-fts5-interop.sh` | FTS5 indexes shared through the file: SQLite-built multi-segment indexes (small pages, doclist indexes, unfinished merges) queried and modified here, ours queried and modified by SQLite, every step checked by SQLite's `integrity-check` |
 | `test/run-fts5fuzz.sh` | random documents and random FTS5 queries (every operator, column filters, NEAR, prefixes, detail modes) against SQLite: rowids, `bm25()`, `highlight()`, `snippet()` |
 | `test/run-fts5-tokens.sh` | every tokenizer configuration against SQLite's, token for token, over random text and a stemming word list |
@@ -267,6 +301,9 @@ src/
   rtree      the R*Tree virtual table module
   fts5-*     FTS5: tokenizers and their Unicode data, the index, the query language
   fts5       the FTS5 and fts5vocab virtual tables, bm25 / highlight / snippet
+  fts3-*     FTS3/4: tokenizers and their Unicode data, the segment index and
+             merges, the query parser, the evaluator, snippet / offsets / matchinfo
+  fts3       the FTS3/FTS4, fts4aux and fts3tokenize virtual tables
   eqp        EXPLAIN QUERY PLAN
   integrity  PRAGMA integrity_check
   api        public API, statements, transactions, ATTACH, PRAGMAs

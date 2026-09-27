@@ -71,6 +71,7 @@
   (user-collations (make-hash-table :test #'equal))  ; NAME -> (compare . key)
   (fk-deferred nil)          ; a deferred foreign key was violated in this transaction
   (stmt-cache (make-hash-table :test #'equal))
+  (vtab-state nil)           ; plist: virtual-table transaction bookkeeping (FTS3)
   (closed nil))
 
 (defmethod print-object ((db db) s)

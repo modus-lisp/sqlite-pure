@@ -72,10 +72,20 @@
                                       ((<= i (rtree-ndim2 rt)) (if (rtree-int-p rt) " INT" " REAL"))
                                       (t ""))))))
 
-(defun virtual-table-from-ast (name ast sql)
+(defun virtual-table-from-ast (name ast sql &optional (db *db*))
   "The TABLE for a CREATE VIRTUAL TABLE row.  An unknown module still loads
 (as SQLite does); using the table then fails."
   (destructuring-bind (&key module args &allow-other-keys) (cdr ast)
+    (flet ((unknown () (make-table :name name :root 0 :sql sql :columns #() :vtab (list :unknown module))))
+      (cond ((fts3-module-p module)
+             (return-from virtual-table-from-ast
+               (handler-case (fts3-table-from-ast name ast sql db) (sqlite-error () (unknown)))))
+            ((name= module "fts4aux")
+             (return-from virtual-table-from-ast
+               (handler-case (fts4aux-table-from-ast name ast sql) (sqlite-error () (unknown)))))
+            ((name= module "fts3tokenize")
+             (return-from virtual-table-from-ast
+               (handler-case (fts3tok-table-from-ast name ast sql) (sqlite-error () (unknown)))))))
     (when (name= module "fts5vocab")
       (return-from virtual-table-from-ast
         (handler-case (fts5vocab-table-from-ast name ast sql)
@@ -124,6 +134,14 @@
       (check-new-name name :table)
       (when (name= module "fts5")
         (return-from exec-create-virtual (exec-create-fts5 st)))
+      (when (fts3-module-p module)
+        (return-from exec-create-virtual (exec-create-fts3 st)))
+      (when (member module '("fts4aux" "fts3tokenize") :test #'name=)
+        (if (name= module "fts4aux") (fts4aux-spec args) (fts3tok-spec args))
+        (ensure-write-txn *db*)
+        (add-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
+        (bump-schema-cookie)
+        (return-from exec-create-virtual nil))
       (when (name= module "fts5vocab")
         (return-from exec-create-virtual (exec-create-fts5vocab st)))
       (unless (member module '("rtree" "rtree_i32") :test #'name=)
@@ -573,30 +591,33 @@ Returns T, or :IGNORE if a constraint skipped the row."
       (if cell (car cell) t))))
 
 (defun vtab-read-only-check (table)
-  (unless (or (fts5-p (table-vtab table)) (rtree-p (table-vtab table)))
+  (unless (or (fts5-p (table-vtab table)) (rtree-p (table-vtab table)) (fts3-p (table-vtab table)))
     (sql-error "table ~a may not be modified" (table-name table))))
 
 (defun vtab-insert (ctx row)
   (vtab-read-only-check (wc-table ctx))
-  (if (fts5-p (table-vtab (wc-table ctx)))
-      (fts5-vtab-insert ctx row)
-      (rtree-vtab-insert ctx row)))
+  (cond ((fts5-p (table-vtab (wc-table ctx))) (fts5-vtab-insert ctx row))
+        ((fts3-p (table-vtab (wc-table ctx))) (fts3-vtab-insert ctx row))
+        (t (rtree-vtab-insert ctx row))))
 
 (defun vtab-update (ctx old new)
   (vtab-read-only-check (wc-table ctx))
-  (if (fts5-p (table-vtab (wc-table ctx)))
-      (fts5-vtab-update ctx old new)
-      (rtree-vtab-update ctx old new)))
+  (cond ((fts5-p (table-vtab (wc-table ctx))) (fts5-vtab-update ctx old new))
+        ((fts3-p (table-vtab (wc-table ctx))) (fts3-vtab-update ctx old new))
+        (t (rtree-vtab-update ctx old new))))
 
 (defun vtab-delete (table row)
   (vtab-read-only-check table)
-  (if (fts5-p (table-vtab table))
-      (fts5-vtab-delete table row)
-      (rtree-vtab-delete table row)))
+  (cond ((fts5-p (table-vtab table)) (fts5-vtab-delete table row))
+        ((fts3-p (table-vtab table)) (fts3-vtab-delete table row))
+        (t (rtree-vtab-delete table row))))
 
 (defun vtab-plan-access (fs li conjuncts scope)
   (let ((v (table-vtab (fsrc-table fs))))
     (cond ((fts5-p v) (fts5-plan-access fs li conjuncts scope))
+          ((fts3-p v) (fts3-plan-access fs li conjuncts scope))
+          ((fts4aux-p v) (fts4aux-plan-access fs li conjuncts scope))
+          ((fts3tok-p v) (fts3tok-plan-access fs li conjuncts scope))
           ((fts5vocab-p v) (fts5vocab-plan-access fs li conjuncts scope))
           ((rtree-p v) (rtree-plan-access fs li conjuncts scope))
           (t (sql-error "no such module: ~a" (second v))))))
@@ -721,6 +742,7 @@ walking the tree past subtrees the coordinate constraints rule out."
   (let ((v (table-vtab table)))
     (cond ((rtree-p v) '("rowid" "node" "parent"))
           ((fts5-p v) (fts5-shadow-suffixes v))
+          ((fts3-p v) (progn (fts3-of table) (fts3-shadow-suffixes v)))
           (t '()))))
 
 (defun vtab-drop (table)
@@ -752,7 +774,16 @@ database dropping one moves another)."
                                            (concatenate 'string (subseq sql 0 (tok-pos tk))
                                                         (format nil "\"~a\"" (substitute-string "\"" "\"\"" nn))
                                                         (subseq sql (tok-end tk)))
-                                           sql))))))))
+                                           sql))))
+        ;; and the shadow table's automatic indexes
+        (dolist (r (schema-rows (db-schema* *db*)))
+          (when (and (equal (second r) "index") (stringp (fourth r)) (name= (fourth r) old))
+            (let* ((nm (third r))
+                   (pre (format nil "sqlite_autoindex_~a_" old)))
+              (rewrite-schema-row r :tbl nn
+                                    :name (if (and (> (length nm) (length pre)) (name= (subseq nm 0 (length pre)) pre))
+                                              (format nil "sqlite_autoindex_~a_~a" nn (subseq nm (length pre)))
+                                              nm)))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; SQL functions: rtreenode(ndim, blob) and rtreecheck([schema,] table)

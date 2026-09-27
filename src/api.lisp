@@ -40,7 +40,8 @@
                 (handler-bind ((sqlite-conflict
                                  (lambda (c)
                                    (case (conflict-action c)
-                                     (:rollback (rollback-all db) (setf (db-explicit db) nil (first state) t))
+                                     (:rollback (rollback-all db) (fts3-end-transaction db nil)
+                                      (setf (db-explicit db) nil (first state) t))
                                      (:fail (setf (first state) t))))))
                   (multiple-value-prog1 (funcall thunk) (setf (first state) t)))
              (dolist (d (conn-dbs db))
@@ -54,7 +55,7 @@
                (handler-bind ((error (lambda (c) (declare (ignore c)) (rollback-all db))))
                  (fk-check-deferred db)
                  (commit-all db))
-               (rollback-all db))))))))
+               (progn (rollback-all db) (fts3-end-transaction db nil)))))))))
 
 (defun exec-ast (db st text)
   "Execute one parsed statement.  Return (values rows column-names)."
@@ -69,6 +70,7 @@
        (values nil nil))
       (:commit
        (unless (db-explicit db) (sql-error "cannot commit - no transaction is active"))
+       (fts3-end-transaction db t)
        (fk-check-deferred db)
        (commit-all db)
        (setf (db-explicit db) nil (db-savepoint-txn db) nil)
@@ -76,9 +78,11 @@
       (:rollback
        (unless (db-explicit db) (sql-error "cannot rollback - no transaction is active"))
        (rollback-all db)
+       (fts3-end-transaction db nil)
        (setf (db-explicit db) nil)
        (values nil nil))
       (:savepoint
+       (fts3-sync-all db)
        (unless (db-explicit db) (setf (db-explicit db) t (db-savepoint-txn db) t))
        (dolist (d (conn-dbs db)) (savepoint-push d (second st)))
        (values nil nil))
@@ -86,12 +90,14 @@
        (let ((outermost (savepoint-outermost-p db (second st))))
          (dolist (d (conn-dbs db)) (savepoint-pop d (second st)))
          (when (and outermost (db-savepoint-txn db))
+           (fts3-end-transaction db t)
            (commit-all db)
            (setf (db-explicit db) nil (db-savepoint-txn db) nil)))
        (values nil nil))
       (:rollback-to
        (savepoint-outermost-p db (second st))   ; signals if unknown
        (dolist (d (conn-dbs db)) (savepoint-restore d (second st)))
+       (fts3-rollback-to db)
        (values nil nil))
       (:attach (exec-attach db (second st) (third st)) (values nil nil))
       (:detach (exec-detach db (second st)) (values nil nil))
@@ -107,9 +113,11 @@
       (:explain-qp (explain-query-plan db (second st) text))
       (t
        (unless (write-statement-p st) (sql-error "unsupported statement"))
+       (let ((journal (and (db-explicit (conn db)) (fts3-statement-journal-p st))))
        (run-in-write-txn
         db
         (lambda ()
+          (when journal (fts3-sync-all db))
           (let ((*index-expr-cache* nil) (*fts5-touched* '()) (flushed nil))
            (unwind-protect
                 (multiple-value-prog1
@@ -125,10 +133,13 @@
               (:drop (exec-drop st))
               (:alter (exec-alter st))
               (:pragma (exec-pragma db st)))
-                  ;; FTS5 writes are buffered per statement
+                  ;; FTS5 writes are buffered per statement; FTS3 per transaction
                   (fts5-flush-touched)
+                  (unless (db-explicit (conn db)) (fts3-end-transaction db t))
                   (setf flushed t))
-             (unless flushed (fts5-discard-touched))))))))))
+             (unless flushed
+               (fts5-discard-touched)
+               (fts3-statement-end db nil journal)))))))))))
 
 (defun bind-params (params nparam)
   (declare (ignore nparam))

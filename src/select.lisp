@@ -849,7 +849,7 @@ narrowest, newest on ties), or NIL."
   "Can the rows of this single-table query be produced in ORDER BY order?"
   (let* ((fs (first fsrcs))
          (table (and fs (null (cdr fsrcs)) (fsrc-table fs))))
-    (when (and table order (not (table-vtab table))
+    (when (and table order (or (not (table-vtab table)) (fts3-p (table-vtab table)))
                (every (lambda (o) (null (fourth o))) order))    ; default NULLS placement
       (let ((cols (mapcar (lambda (o) (order-term-source-column (first o) rcols scope)) order))
             (colls (mapcar (lambda (o)
@@ -863,8 +863,11 @@ narrowest, newest on ties), or NIL."
             ;; ORDER BY rowid
             ((and (null (cdr cols))
                   (not (table-without-rowid table))
-                  (or (eq (first cols) :rowid) (eql (first cols) (table-rowid-alias table))))
+                  (or (eq (first cols) :rowid) (eql (first cols) (table-rowid-alias table))
+                      ;; an FTS3/4 table's docid (xBestIndex consumes ORDER BY docid)
+                      (and (fts3-p (table-vtab table)) (eql (first cols) (- (length (table-columns table)) 2)))))
              (list :rowid (if (first descs) :desc :asc)))
+            ((table-vtab table) nil)
             (t
              (dolist (idx (table-indexes table) nil)
                (let ((icols (index-columns idx)))

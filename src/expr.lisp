@@ -322,10 +322,16 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
         (t (sql-error "cannot bind value ~s" v))))
 
 (defun compile-vtab-special (e scope)
-  "x MATCH q and ft = q on FTS5 tables; NIL for anything else."
-  (cond ((and (eq (car e) :fn) (equal (second e) "match") (= (length (third e)) 2))
+  "x MATCH q and ft = q on FTS5 tables, MATCH and the auxiliary functions
+on FTS3/4 tables; NIL for anything else."
+  (cond ((and (eq (car e) :col) (compile-fts3-hidden-column e scope)))
+        ((and (eq (car e) :fn) (equal (second e) "match") (= (length (third e)) 2))
          (or (compile-fts5-match (second (third e)) (first (third e)) scope)
-             (sql-error "unable to use function MATCH in the requested context")))
+             (compile-fts3-match (second (third e)) (first (third e)) scope e)
+             (progn (compile-expr (second (third e)) scope)   ; "no such column", if that
+                    (compile-expr (first (third e)) scope)
+                    (sql-error "unable to use function MATCH in the requested context"))))
+        ((and (eq (car e) :fn) (stringp (second e)) (compile-fts3-function (second e) (third e) scope)))
         ((and (eq (car e) :binary) (eq (second e) :eq))
          (flet ((hidden-p (x)
                   (and (eq (car x) :col)
