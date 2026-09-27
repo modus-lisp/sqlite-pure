@@ -63,8 +63,8 @@
                   :order (compile-order-terms (getf (cdr spec) :order) nil scope)
                   :frame (let ((f (getf (cdr spec) :frame)))
                            (when f
-                             (destructuring-bind (unit start end) f
-                               (list unit (compile-bound start) (compile-bound end))))))))
+                             (destructuring-bind (unit start end &optional exclude) f
+                               (list unit (compile-bound start) (compile-bound end) exclude)))))))
         (when winfn (check-window-arity lname (length args)))
         (let ((k (vector-push-extend ws (scope-windows scope))))
           (lambda (env) (svref (env-win env) k)))))))
@@ -163,14 +163,15 @@
                                 (t :null)))))))
           ((member name '("first_value" "last_value" "nth_value") :test #'string=)
            (dotimes (i n)
-             (multiple-value-bind (lo hi) (frame-bounds ws part i peer-start peer-end group-no)
-               (store i (cond ((> lo hi) :null)
-                              ((string= name "first_value") (arg lo 0))
-                              ((string= name "last_value") (arg hi 0))
+             (let ((rows (frame-rows ws part i peer-start peer-end group-no)))
+               (store i (cond ((null rows) :null)
+                              ((string= name "first_value") (arg (first rows) 0))
+                              ((string= name "last_value") (arg (car (last rows)) 0))
                               (t (let ((m (value-to-integer (arg i 1))))
                                    (unless (and (integerp m) (plusp m))
                                      (sql-error "second argument to nth_value must be a positive integer"))
-                                   (if (<= (+ lo m -1) hi) (arg (+ lo m -1) 0) :null))))))))
+                                   (let ((j (nth (1- m) rows)))
+                                     (if j (arg j 0) :null)))))))))
           (t (compute-window-aggregate ws part #'store #'env-at peer-start peer-end group-no)))))))
 
 (defun ntile-bucket (i n b)
@@ -188,7 +189,8 @@
                     (if (wspec-order ws)
                         '(:range (:unbounded-preceding) (:current-row))
                         '(:range (:unbounded-preceding) (:unbounded-following))))))
-    (destructuring-bind (unit start end) frame
+    (destructuring-bind (unit start end &optional exclude) frame
+      (declare (ignore exclude))
       (flet ((bound (b startp)
                (ecase (first b)
                  (:unbounded-preceding 0)
@@ -209,6 +211,20 @@
         (let ((lo (max 0 (bound start t)))
               (hi (min (1- n) (bound end nil))))
           (values lo hi))))))
+
+(defun frame-exclude (ws)
+  (fourth (wspec-frame ws)))
+
+(defun frame-rows (ws part i peer-start peer-end group-no)
+  "The row indices in row I's frame, in order, after its EXCLUDE clause."
+  (multiple-value-bind (lo hi) (frame-bounds ws part i peer-start peer-end group-no)
+    (let ((ex (frame-exclude ws)))
+      (loop for j from lo to hi
+            unless (case ex
+                     (:current-row (= j i))
+                     (:group (<= (aref peer-start i) j (aref peer-end i)))
+                     (:ties (and (/= j i) (<= (aref peer-start i) j (aref peer-end i)))))
+              collect j))))
 
 (defun range-bound (ws part i off sign startp)
   "RANGE n PRECEDING/FOLLOWING: compare the single numeric ORDER BY key."
@@ -240,7 +256,8 @@
   (let* ((n (length part))
          (tmpl (wspec-agg ws))
          (frame (wspec-frame ws))
-         (from-start (or (null frame) (eq (first (second frame)) :unbounded-preceding))))
+         (from-start (and (null (fourth frame))
+                          (or (null frame) (eq (first (second frame)) :unbounded-preceding)))))
     (if from-start
         ;; the frame only ever grows: step an accumulator forward
         (let ((acc (agg-instantiate tmpl)) (upto -1))
@@ -251,10 +268,10 @@
                     do (incf upto) (agg-step acc (funcall env-at upto)))
               (funcall store i (agg-final-value acc)))))
         (dotimes (i n)
-          (multiple-value-bind (lo hi) (frame-bounds ws part i peer-start peer-end group-no)
-            (let ((acc (agg-instantiate tmpl)))
-              (loop for j from lo to hi do (agg-step acc (funcall env-at j)))
-              (funcall store i (agg-final-value acc))))))))
+          (let ((acc (agg-instantiate tmpl)))
+            (dolist (j (frame-rows ws part i peer-start peer-end group-no))
+              (agg-step acc (funcall env-at j)))
+            (funcall store i (agg-final-value acc)))))))
 
 (defun agg-final-value (a)
   "The aggregate's current value, without consuming it."

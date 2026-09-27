@@ -36,9 +36,15 @@
   (prog1 (peek-tok p) (incf (ps-pos p))))
 
 (defun perr (p fmt &rest args)
-  (if (eq (tok-kind (peek-tok p)) :eof)
-      (error 'sqlite-parse-error :message "incomplete input")
-      (apply #'parse-error-at (ps-sql p) (tok-pos (peek-tok p)) fmt args)))
+  (let ((tok (peek-tok p)))
+    (cond ((eq (tok-kind tok) :eof)
+           (error 'sqlite-parse-error :message "incomplete input"))
+          ((and (equal fmt "syntax error") (tok-end tok))
+           ;; SQLite's own wording: the offending token's text
+           (error 'sqlite-parse-error
+                  :message (format nil "near \"~a\": syntax error"
+                                   (subseq (ps-sql p) (tok-pos tok) (tok-end tok)))))
+          (t (apply #'parse-error-at (ps-sql p) (tok-pos tok) fmt args)))))
 
 (defun kw-tok-p (tok kw)
   (and (eq (tok-kind tok) :id) (not (tok-quoted tok)) (name= (tok-value tok) kw)))
@@ -362,16 +368,20 @@
     (let ((unit (cond ((accept-kw p "ROWS") :rows) ((accept-kw p "RANGE") :range)
                       ((accept-kw p "GROUPS") :groups))))
       (when unit
-        (let (start end)
+        (let (start end (exclude nil))
           (if (accept-kw p "BETWEEN")
               (progn (setf start (parse-frame-bound p))
                      (expect-kw p "AND")
                      (setf end (parse-frame-bound p)))
               (setf start (parse-frame-bound p) end '(:current-row)))
           (when (accept-kw p "EXCLUDE")
-            (cond ((accept-kw p "NO" "OTHERS"))
-                  (t (perr p "EXCLUDE is not supported"))))
-          (setf frame (list unit start end)))))
+            (setf exclude (cond ((accept-kw p "NO" "OTHERS") nil)
+                                ((accept-kw p "CURRENT" "ROW") :current-row)
+                                ((accept-kw p "GROUP") :group)
+                                ((accept-kw p "TIES") :ties)
+                                (t (perr p "syntax error")))))
+          (setf frame (if exclude (list unit start end exclude) (list unit start end))))))
+    (unless (op-p p ")") (perr p "syntax error"))
     (list :spec :base base :partition partition :order order :frame frame)))
 
 ;;; ------------------------------------------------------------------
