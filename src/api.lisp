@@ -110,7 +110,9 @@
        (run-in-write-txn
         db
         (lambda ()
-          (let ((*index-expr-cache* nil))
+          (let ((*index-expr-cache* nil) (*fts5-touched* '()) (flushed nil))
+           (unwind-protect
+                (multiple-value-prog1
             (ecase (car st)
               (:insert (exec-insert st))
               (:update (exec-update st))
@@ -122,7 +124,11 @@
               (:create-virtual (exec-create-virtual st))
               (:drop (exec-drop st))
               (:alter (exec-alter st))
-              (:pragma (exec-pragma db st))))))))))
+              (:pragma (exec-pragma db st)))
+                  ;; FTS5 writes are buffered per statement
+                  (fts5-flush-touched)
+                  (setf flushed t))
+             (unless flushed (fts5-discard-touched))))))))))
 
 (defun bind-params (params nparam)
   (declare (ignore nparam))
@@ -151,6 +157,7 @@
             (*param-names* names)
             (rows nil) (cols nil))
         (dolist (s stmts)
+          (clrhash *fts5-cursors*)
           (let ((*json-values* (make-hash-table :test #'eq)))
             (unwind-protect
                  (progn
@@ -502,14 +509,15 @@ non-local exit.  Nested uses become savepoints."
            (loop with cid = -1
                  for c across cols
                  for i from 0
-                 unless (and (column-generated c) (not xinfo))
+                 unless (and (or (column-generated c) (column-hidden c)) (not xinfo))
                  collect (append
                           (list (incf cid) (column-name c) (or (column-type c) "")
                                 (if (column-not-null c) 1 0)
                                 (if (column-default c) (default-text (column-default c)) :null)
                                 (let ((pos (position i (table-pk tb))))
                                   (if pos (1+ pos) 0)))
-                          (when xinfo (list (cond ((column-virtual-p c) 2)
+                          (when xinfo (list (cond ((column-hidden c) 1)
+                                                  ((column-virtual-p c) 2)
                                                   ((column-generated c) 3)
                                                   (t 0))))))
            (append '("cid" "name" "type" "notnull" "dflt_value" "pk")

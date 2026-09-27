@@ -103,6 +103,7 @@ columns are decoded; the others read as NULL."
   join            ; :first :inner :left :cross :comma
   on using natural
   index-hint      ; NOT INDEXED -> :not; INDEXED BY i -> the INDEX
+  vtab-args       ; t('query', ...) on an FTS5 table: the argument ASTs
   label           ; EXPLAIN QUERY PLAN: what a non-table source's loop is called
   scan-index)     ; EQP: thunk -> the index (or :rowid) a full scan reads in order, if any
 
@@ -113,6 +114,7 @@ columns are decoded; the others read as NULL."
               :affinities (map 'vector #'column-affinity cols)
               :collations (map 'vector #'column-collation cols)
               :table table
+              :star-hidden (loop for c across cols for i from 0 when (column-hidden c) collect i)
               :rowid-p (not (table-without-rowid table))
               :used (make-array (length cols) :element-type 'bit :initial-element 0))))
 
@@ -250,6 +252,12 @@ columns are decoded; the others read as NULL."
                       (setf (fsrc-tvf fs)
                             (cons (lambda (fns) (fsrc-rows-fn (pragma-table-source name fns alias))) args))
                       fs))
+                   ((let ((tb (lookup-table *db* name nil)))
+                      (and tb (fts5-p (table-vtab tb))))
+                    (let ((tb (lookup-table *db* name nil)))
+                      (when (> (length args) 2)
+                        (sql-error "too many arguments on ~a() - max 2" name))
+                      (make-fsrc :src (make-table-src tb alias) :table tb :vtab-args args)))
                    ((lookup-table *db* name nil) (sql-error "'~a' is not a function" name))
                    (t (sql-error "no such table: ~a" name))))))))
       (setf (fsrc-join fs) join (fsrc-on fs) on (fsrc-using fs) using (fsrc-natural fs) natural)

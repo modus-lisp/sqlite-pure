@@ -76,6 +76,11 @@
   "The TABLE for a CREATE VIRTUAL TABLE row.  An unknown module still loads
 (as SQLite does); using the table then fails."
   (destructuring-bind (&key module args &allow-other-keys) (cdr ast)
+    (when (name= module "fts5")
+      (return-from virtual-table-from-ast
+        (handler-case (fts5-table-from-ast name ast sql)
+          (sqlite-error () (make-table :name name :root 0 :sql sql :columns #()
+                                       :vtab (list :unknown module))))))
     (let ((rt (and (member module '("rtree" "rtree_i32") :test #'name=)
                    (ignore-errors (rtree-spec module args)))))
       (if rt
@@ -97,11 +102,12 @@
       (corrupt "database disk image is malformed")))
 
 (defun rtree-shadow-p (db name)
-  "Is NAME one of an r-tree's shadow tables in DB?"
+  "Is NAME one of a virtual table's shadow tables in DB?"
   (let ((p (position #\_ name :from-end t)))
-    (and p (member (subseq name (1+ p)) '("node" "rowid" "parent") :test #'name=)
+    (and p
          (let ((tb (find-table-in db (subseq name 0 p))))
-           (and tb (rtree-p (table-vtab tb)))))))
+           (and tb (table-vtab tb)
+                (member (subseq name (1+ p)) (vtab-shadow-suffixes tb) :test #'name=))))))
 
 (defun exec-create-virtual (st)
   (destructuring-bind (&key name schema if-not-exists module args sql &allow-other-keys) (cdr st)
@@ -111,6 +117,8 @@
             (return-from exec-create-virtual nil)
             (sql-error "table ~a already exists" name)))
       (check-new-name name :table)
+      (when (name= module "fts5")
+        (return-from exec-create-virtual (exec-create-fts5 st)))
       (unless (member module '("rtree" "rtree_i32") :test #'name=)
         (sql-error "no such module: ~a" module))
       (let* ((rt (rtree-spec module args))
@@ -558,6 +566,27 @@ Returns T, or :IGNORE if a constraint skipped the row."
       (if cell (car cell) t))))
 
 (defun vtab-insert (ctx row)
+  (if (fts5-p (table-vtab (wc-table ctx)))
+      (fts5-vtab-insert ctx row)
+      (rtree-vtab-insert ctx row)))
+
+(defun vtab-update (ctx old new)
+  (if (fts5-p (table-vtab (wc-table ctx)))
+      (fts5-vtab-update ctx old new)
+      (rtree-vtab-update ctx old new)))
+
+(defun vtab-delete (table row)
+  (if (fts5-p (table-vtab table))
+      (fts5-vtab-delete table row)
+      (rtree-vtab-delete table row)))
+
+(defun vtab-plan-access (fs li conjuncts scope)
+  (let ((v (table-vtab (fsrc-table fs))))
+    (cond ((fts5-p v) (fts5-plan-access fs li conjuncts scope))
+          ((rtree-p v) (rtree-plan-access fs li conjuncts scope))
+          (t (sql-error "no such module: ~a" (second v))))))
+
+(defun rtree-vtab-insert (ctx row)
   (with-rtree ((wc-table ctx))
     (let* ((*rt-depth* (rtree-depth))
            (id (rtree-write ctx nil row)))
@@ -569,14 +598,14 @@ Returns T, or :IGNORE if a constraint skipped the row."
         (collect-returning ctx row)
         t))))
 
-(defun vtab-update (ctx old new)
+(defun rtree-vtab-update (ctx old new)
   (with-rtree ((wc-table ctx))
     (let ((*rt-depth* (rtree-depth)))
       (unless (eq (rtree-write ctx old new) :ignore)
         (incf (wc-changes ctx))
         t))))
 
-(defun vtab-delete (table row)
+(defun rtree-vtab-delete (table row)
   (with-rtree (table)
     (let ((*rt-depth* (rtree-depth)))
       (rtree-delete-id (rt-int64 (svref row 0)))
@@ -633,7 +662,7 @@ Returns T, or :IGNORE if a constraint skipped the row."
           (try (fourth c) (third c)
                (ecase (second c) (:eq :eq) (:lt :gt) (:le :ge) (:gt :lt) (:ge :le))))))))
 
-(defun vtab-plan-access (fs li conjuncts scope)
+(defun rtree-plan-access (fs li conjuncts scope)
   "Iterate an r-tree's rows: by id when the WHERE clause names one, else by
 walking the tree past subtrees the coordinate constraints rule out."
   (let* ((table (fsrc-table fs))
@@ -673,11 +702,17 @@ walking the tree past subtrees the coordinate constraints rule out."
 ;;; ------------------------------------------------------------------
 ;;; DROP and RENAME
 
+(defun vtab-shadow-suffixes (table)
+  (let ((v (table-vtab table)))
+    (cond ((rtree-p v) '("rowid" "node" "parent"))
+          ((fts5-p v) (fts5-shadow-suffixes v))
+          (t '()))))
+
 (defun vtab-drop (table)
-  "Drop an r-tree's shadow tables (all roots at once: in an auto-vacuum
+  "Drop a virtual table's shadow tables (all roots at once: in an auto-vacuum
 database dropping one moves another)."
-  (when (rtree-p (table-vtab table))
-    (let ((shadows (loop for suffix in '("node" "rowid" "parent")
+  (progn
+    (let ((shadows (loop for suffix in (vtab-shadow-suffixes table)
                          for sh = (find-table-in *db* (shadow-name table suffix))
                          when sh collect sh)))
       (drop-btrees (mapcar #'table-root shadows))
@@ -685,17 +720,24 @@ database dropping one moves another)."
         (delete-schema-rows (lambda (r) (and (stringp (fourth r)) (name= (fourth r) (table-name sh)))))))))
 
 (defun vtab-rename (table new)
-  "Rename the shadow tables along with the r-tree."
-  (when (rtree-p (table-vtab table))
-    (dolist (suffix '("rowid" "node" "parent"))
+  "Rename the shadow tables along with the virtual table."
+  (progn
+    (dolist (suffix (vtab-shadow-suffixes table))
       (let* ((old (shadow-name table suffix))
              (nn (format nil "~a_~a" new suffix))
              (r (find-if (lambda (r) (and (equal (second r) "table") (name= (third r) old)))
                          (schema-rows (db-schema* *db*)))))
         (when r
-          (rewrite-schema-row r :name nn :tbl nn
-                                :sql (replace-token-text (sixth r) (lambda (tk) (name= (tok-value tk) old))
-                                                         nn t)))))))
+          (let* ((sql (sixth r))
+                 (tk (find-if (lambda (tk) (and (member (tok-kind tk) '(:id :string))
+                                                (equal (princ-to-string (tok-value tk)) old)))
+                              (tokenize sql))))
+            (rewrite-schema-row r :name nn :tbl nn
+                                  :sql (if tk
+                                           (concatenate 'string (subseq sql 0 (tok-pos tk))
+                                                        (format nil "\"~a\"" (substitute-string "\"" "\"\"" nn))
+                                                        (subseq sql (tok-end tk)))
+                                           sql))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; SQL functions: rtreenode(ndim, blob) and rtreecheck([schema,] table)

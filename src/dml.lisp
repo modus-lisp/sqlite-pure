@@ -524,7 +524,9 @@ column may use one declared after it)."
                                     ci))
                                 columns)
                         (loop for i below ncols
-                              unless (column-generated (aref (table-columns tb) i)) collect i)))
+                              unless (or (column-generated (aref (table-columns tb) i))
+                                         (column-hidden (aref (table-columns tb) i)))
+                                collect i)))
            (rows (cond ((eq source :default) (list '()))
                        (t (let ((sel source))
                             (multiple-value-bind (fn cols) (compile-select sel (root-scope))
