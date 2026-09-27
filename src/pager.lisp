@@ -69,9 +69,11 @@
   (user-functions (make-hash-table :test #'equal))   ; name -> (min max fn)
   (user-aggregates (make-hash-table :test #'equal))  ; name -> (min max ctor)
   (user-collations (make-hash-table :test #'equal))  ; NAME -> (compare . key)
+  (user-tokenizers (make-hash-table :test #'equal))  ; name -> function, for FTS3/4/5
   (fk-deferred nil)          ; a deferred foreign key was violated in this transaction
   (stmt-cache (make-hash-table :test #'equal))
   (vtab-state nil)           ; plist: virtual-table transaction bookkeeping (FTS3)
+  (safety-level 3)           ; PRAGMA synchronous + 1: 1 OFF, 2 NORMAL, 3 FULL, 4 EXTRA
   (closed nil))
 
 (defmethod print-object ((db db) s)
@@ -106,6 +108,22 @@
                  (and errorp (sql-error "unknown database ~a" name)))))))
 
 (defun memory-db-p (db) (null (db-stream db)))
+
+(defun fsync-only (stream db &optional (min-level 2))
+  #+sbcl (when (>= (db-safety-level db) min-level)
+           (sb-posix:fsync (sb-sys:fd-stream-fd stream)))
+  #-sbcl (declare (ignore stream db min-level))
+  nil)
+
+(defun sync-stream (stream db &optional (min-level 2))
+  "Write STREAM out and, unless PRAGMA synchronous is below MIN-LEVEL
+(1 OFF, 2 NORMAL, 3 FULL), fsync it (SBCL; elsewhere finish-output is all
+there is)."
+  (finish-output stream)
+  #+sbcl (when (>= (db-safety-level db) min-level)
+           (sb-posix:fsync (sb-sys:fd-stream-fd stream)))
+  #-sbcl (declare (ignore db min-level))
+  nil)
 
 ;;; ------------------------------------------------------------------
 ;;; Header fields (all on page 1)
@@ -394,7 +412,7 @@
             (put-u32 b4 0 p) (write-sequence b4 j)
             (write-sequence img j)
             (put-u32 b4 0 (journal-checksum nonce img)) (write-sequence b4 j))))
-      (finish-output j))))
+      (sync-stream j db))))
 
 (defun delete-journal (db)
   (let ((p (probe-file (journal-path db))))
@@ -429,7 +447,7 @@
                 (incf written)
                 (file-position s (page-offset db p))
                 (write-sequence (gethash p (db-cache db)) s)))
-            (finish-output s)
+            (sync-stream s db)
             (when (< (db-page-count db) (floor (file-length s) (db-page-size db)))
               (truncate-file db))
             (when journaled (delete-journal db))))))
@@ -469,7 +487,7 @@
                       (when (<= pgno orig-size)
                         (file-position s (* (1- pgno) ps))
                         (write-sequence img s)))))
-                (finish-output s)
+                (sync-stream s db)
                 (delete-file jp)))))))))
 
 ;;; ------------------------------------------------------------------

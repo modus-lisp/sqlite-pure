@@ -81,3 +81,22 @@ CREATE TABLE t(s TEXT);
 INSERT INTO t VALUES ('héllo'), ('日本語'), ('emoji 😀'), ('');
 SELECT s, length(s), upper(s), hex(s) FROM t ORDER BY rowid;
 SELECT substr('日本語テキスト', 2, 3), instr('日本語', '語'), unicode('日');
+
+== pragma-synchronous
+PRAGMA synchronous;
+PRAGMA synchronous = OFF;
+PRAGMA synchronous;
+PRAGMA synchronous = normal;
+PRAGMA synchronous;
+PRAGMA synchronous = 3;
+PRAGMA synchronous;
+PRAGMA synchronous = 'full';
+PRAGMA synchronous;
+PRAGMA synchronous = 9;
+PRAGMA synchronous;
+PRAGMA synchronous = bogus;
+PRAGMA synchronous;
+PRAGMA synchronous = yes;
+PRAGMA synchronous;
+PRAGMA main.synchronous = 0;
+PRAGMA main.synchronous;

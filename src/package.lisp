@@ -12,6 +12,10 @@
    #:last-insert-rowid #:changes
    ;; extending SQL
    #:define-function #:define-aggregate #:define-collation #:undefine-function
+   #:define-tokenizer #:define-fts5-function
+   #:fts5-api-rowid #:fts5-api-column-count #:fts5-api-column-text #:fts5-api-column-size
+   #:fts5-api-row-count #:fts5-api-column-total-size #:fts5-api-phrase-count
+   #:fts5-api-phrase-size #:fts5-api-instances #:fts5-api-tokenize
    ;; transactions
    #:with-transaction #:begin-transaction #:commit #:rollback #:in-transaction-p
    ;; values

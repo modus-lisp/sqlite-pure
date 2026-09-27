@@ -51,6 +51,8 @@
      (:file "fts3-eval")
      (:file "fts3-snippet")
      (:file "fts3")
+     (:file "dbstat")
+     (:file "extend-fts")
      (:file "integrity")
      (:file "api")
      (:file "vacuum"))))

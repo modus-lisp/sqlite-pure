@@ -13,7 +13,8 @@
   (token-chars '())      ; codepoints forced to be token characters
   (separators '())       ; ... forced to be separators
   (case-sensitive nil)   ; trigram
-  parent)                ; porter: the tokenizer it wraps
+  parent                 ; porter: the tokenizer it wraps
+  user-name user-args)   ; :user (define-tokenizer)
 
 ;;; ------------------------------------------------------------------
 ;;; Character data (fts5-unicode-data.lisp)
@@ -68,7 +69,9 @@
     (:ascii (tokenize-ascii tok text))
     (:porter (let ((out (fts5-tokenize (ftok-parent tok) text)))
                (map 'vector (lambda (e) (list (porter-stem (first e)) (second e) (third e))) out)))
-    (:trigram (tokenize-trigram tok text))))
+    (:trigram (tokenize-trigram tok text))
+    (:user (map 'vector (lambda (x) (subseq x 0 3))   ; FTS5 numbers tokens itself
+                (user-tokenize (ftok-user-name tok) t (ftok-user-args tok) text)))))
 
 (defun tokenize-unicode61 (tok text)
   (let ((out (make-array 16 :adjustable t :fill-pointer 0))
@@ -358,4 +361,6 @@ that matches is the only one tried, whether or not its condition holds."
                         (sql-error "error in tokenizer constructor"))
                       (setf (ftok-case-sensitive tok) (string= v "1")))
                      (t (sql-error "error in tokenizer constructor")))))))
+        ((user-tokenizer-function (first words) t)
+         (make-fts5-tokenizer :kind :user :user-name (first words) :user-args (rest words)))
         (t (sql-error "no such tokenizer: ~a" (first words)))))))

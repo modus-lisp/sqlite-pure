@@ -123,15 +123,17 @@ column may use one declared after it)."
           (index-delete (table-owner table) (index-root idx) (index-key table idx row)))))))
 
 (defun write-row (table row)
-  "Store ROW (a full row vector, rowid last) and its index entries."
+  "Store ROW (a full row vector, rowid last) and its index entries (the
+index entries first, as SQLite writes them, so pages are allocated in the
+same order)."
   (let ((n (length (table-columns table))))
+    (insert-index-entries table row)
     (if (table-without-rowid table)
         (let* ((pkidx (find-if #'index-pk-index (table-indexes table)))
                (*index-cmp* (index-full-cmp table pkidx)))
           (index-insert (table-owner table) (table-root table) (wr-record table row)))
         (table-insert (table-owner table) (table-root table) (svref row n)
-                      (encode-record (table-record table row))))
-    (insert-index-entries table row)))
+                      (encode-record (table-record table row))))))
 
 (defun delete-row (table row)
   (delete-index-entries table row)
@@ -473,7 +475,9 @@ column may use one declared after it)."
     copy))
 
 (defun writable-table (name &optional event schema)
-  (let ((table (lookup-table *db* name t schema)))
+  (let ((table (or (and (name= name "dbstat") (null (lookup-table *db* name nil schema))
+                        (sql-error "table dbstat may not be modified"))
+                   (lookup-table *db* name t schema))))
     (when (table-view-select table)
       (if (and event (triggers-for table event :instead-of))
           (return-from writable-table (view-as-table table))

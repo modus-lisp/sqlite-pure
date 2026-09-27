@@ -203,6 +203,8 @@ columns are decoded; the others read as NULL."
                      (cte (cte-source cte alias))
                      ((and (pragma-vtab-spec name) (null (lookup-table *db* name nil schema)))
                       (pragma-table-source name '() alias))
+                     ((and (name= name "dbstat") (null (lookup-table *db* name nil schema)))
+                      (dbstat-fsrc alias '()))
                      (t (let ((table (lookup-table *db* name t schema)))
                           (if (table-view-select table)
                               (let ((*ctes* '()))
@@ -243,6 +245,8 @@ columns are decoded; the others read as NULL."
                       (setf (fsrc-tvf fs)
                             (cons (lambda (fns) (fsrc-rows-fn (json-table-source name fns alias))) args))
                       fs))
+                   ((and (name= name "dbstat") (null (lookup-table *db* name nil)))
+                    (dbstat-fsrc alias args))
                    ((pragma-vtab-spec name)
                     (let ((fs (pragma-table-source name nil alias)))
                       (setf (fsrc-label fs) (format nil "~a VIRTUAL TABLE INDEX 0:" (or alias (string-downcase-ascii name))))
@@ -849,7 +853,7 @@ narrowest, newest on ties), or NIL."
   "Can the rows of this single-table query be produced in ORDER BY order?"
   (let* ((fs (first fsrcs))
          (table (and fs (null (cdr fsrcs)) (fsrc-table fs))))
-    (when (and table order (or (not (table-vtab table)) (fts3-p (table-vtab table)))
+    (when (and table order (or (not (table-vtab table)) (fts3-p (table-vtab table)) (dbstat-p (table-vtab table)))
                (every (lambda (o) (null (fourth o))) order))    ; default NULLS placement
       (let ((cols (mapcar (lambda (o) (order-term-source-column (first o) rcols scope)) order))
             (colls (mapcar (lambda (o)
@@ -867,6 +871,10 @@ narrowest, newest on ties), or NIL."
                       ;; an FTS3/4 table's docid (xBestIndex consumes ORDER BY docid)
                       (and (fts3-p (table-vtab table)) (eql (first cols) (- (length (table-columns table)) 2)))))
              (list :rowid (if (first descs) :desc :asc)))
+            ;; dbstat returns rows ordered by (name, path)
+            ((and (dbstat-p (table-vtab table)) (notany #'identity descs)
+                  (or (equal cols '(0)) (equal cols '(0 1))))
+             (list :dbstat))
             ((table-vtab table) nil)
             (t
              (dolist (idx (table-indexes table) nil)

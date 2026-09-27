@@ -360,6 +360,16 @@ non-local exit.  Nested uses become savepoints."
 
 (defun pragma-rows (names rows) (values rows names))
 
+(defun safety-level-of (value)
+  "getSafetyLevel(value, 0, 1): a number, or on/off/no/yes/true/false/extra/full."
+  (let ((z (if (stringp value) value (value-to-text value))))
+    (if (and (plusp (length z)) (digit-char-p (char z 0)))
+        (ldb (byte 8 0) (parse-integer z :junk-allowed t))
+        (let ((hit (assoc z '(("on" . 1) ("no" . 0) ("off" . 0) ("false" . 0) ("yes" . 1)
+                              ("true" . 1) ("extra" . 3) ("full" . 2))
+                          :test #'string-equal)))
+          (if hit (cdr hit) 1)))))
+
 (defun pragma-boolean (value)
   (let ((v (if (stringp value) (string-downcase-ascii value) value)))
     (not (member v '(0 "0" "off" "false" "no") :test #'equal))))
@@ -448,7 +458,13 @@ non-local exit.  Nested uses become savepoints."
                (pragma-rows '("recursive_triggers")
                             (list (list (if (db-recursive-triggers (conn db)) 1 0))))))
           ((string= n "foreign_key_list") (pragma-foreign-key-list db value))
-          ((member n '("synchronous" "cache_size" "temp_store" "locking_mode"
+          ((string= n "synchronous")
+           (if value
+               (let ((lv (logand (1+ (safety-level-of value)) 7)))
+                 (setf (db-safety-level db) (if (zerop lv) 1 lv))
+                 (values nil nil))
+               (pragma-rows '("synchronous") (list (list (1- (db-safety-level db)))))))
+          ((member n '("cache_size" "temp_store" "locking_mode"
                        "busy_timeout" "case_sensitive_like"
                        "secure_delete" "count_changes" "legacy_file_format" "writable_schema"
                        "ignore_check_constraints" "defer_foreign_keys" "mmap_size" "optimize"

@@ -85,7 +85,10 @@
                (handler-case (fts4aux-table-from-ast name ast sql) (sqlite-error () (unknown)))))
             ((name= module "fts3tokenize")
              (return-from virtual-table-from-ast
-               (handler-case (fts3tok-table-from-ast name ast sql) (sqlite-error () (unknown)))))))
+               (handler-case (fts3tok-table-from-ast name ast sql) (sqlite-error () (unknown)))))
+            ((name= module "dbstat")
+             (return-from virtual-table-from-ast
+               (dbstat-table name sql (and args (fts3-dequote (first args))))))))
     (when (name= module "fts5vocab")
       (return-from virtual-table-from-ast
         (handler-case (fts5vocab-table-from-ast name ast sql)
@@ -136,8 +139,10 @@
         (return-from exec-create-virtual (exec-create-fts5 st)))
       (when (fts3-module-p module)
         (return-from exec-create-virtual (exec-create-fts3 st)))
-      (when (member module '("fts4aux" "fts3tokenize") :test #'name=)
-        (if (name= module "fts4aux") (fts4aux-spec args) (fts3tok-spec args))
+      (when (member module '("fts4aux" "fts3tokenize" "dbstat") :test #'name=)
+        (cond ((name= module "fts4aux") (fts4aux-spec args))
+              ((name= module "dbstat") (dbstat-spec args))
+              (t (fts3tok-spec args)))
         (ensure-write-txn *db*)
         (add-schema-row "table" name name 0 (concatenate 'string "CREATE VIRTUAL TABLE " sql))
         (bump-schema-cookie)
@@ -618,6 +623,7 @@ Returns T, or :IGNORE if a constraint skipped the row."
           ((fts3-p v) (fts3-plan-access fs li conjuncts scope))
           ((fts4aux-p v) (fts4aux-plan-access fs li conjuncts scope))
           ((fts3tok-p v) (fts3tok-plan-access fs li conjuncts scope))
+          ((dbstat-p v) (dbstat-plan-access fs li conjuncts scope))
           ((fts5vocab-p v) (fts5vocab-plan-access fs li conjuncts scope))
           ((rtree-p v) (rtree-plan-access fs li conjuncts scope))
           (t (sql-error "no such module: ~a" (second v))))))

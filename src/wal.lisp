@@ -589,7 +589,7 @@ from it, start it over with new salts (walRestartLog)."
                (file-position s (frame-offset db f))
                (write-sequence fh s)
                (write-sequence img s))
-      (finish-output s)
+      (sync-stream s db 3)                 ; synchronous=FULL syncs the log per commit
       ;; index the frames, then publish: only now is the transaction in
       (shm-append-frames w (1+ mx) pages mx)
       (nput-u32 hdr 8 (ldb (byte 32 0) (1+ (hdr-change hdr))))
@@ -651,6 +651,7 @@ needs.  Returns (values busy log-frames checkpointed-frames)."
                               (s (db-stream db))
                               (buf (make-octets (db-page-size db))))
                           (shm-write-u32 w 128 safe)
+                          (fsync-only ws db)          ; the log is durable before we copy out of it
                           (loop for p in (shm-frame-pgnos w (1+ backfill) safe)
                                 for f from (1+ backfill)
                                 do (setf (gethash p latest) f))
@@ -660,7 +661,7 @@ needs.  Returns (values busy log-frames checkpointed-frames)."
                               (read-sequence buf ws)
                               (file-position s (* (1- p) ps))
                               (write-sequence buf s)))
-                          (finish-output s)
+                          (sync-stream s db)
                           (when (and (= safe mx) (> (file-length s) (* npage ps)))
                             (stream-truncate s (* npage ps)))
                           (shm-write-u32 w 96 safe)

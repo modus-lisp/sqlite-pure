@@ -13,7 +13,8 @@
   delim           ; simple: 128-element vector of booleans
   (diacritics 1)  ; unicode61: remove_diacritics 0/1/2
   (exceptions #()); unicode61: sorted codepoints whose alnum-ness is inverted
-  spec)           ; the tokenizer name and arguments, as given
+  spec            ; the tokenizer name and arguments, as given
+  user-name user-args) ; :user (define-tokenizer)
 
 (defun bytes-to-bstring (b &optional (start 0) (end (length b)))
   (let ((s (make-string (- end start))))
@@ -116,6 +117,8 @@
                     (u61-add-exceptions tk nil (subseq a 11)))
                    (t (bad))))
            tk))
+        ((user-tokenizer-function name nil)
+         (make-fts3-tokenizer :kind :user :user-name name :user-args args :spec spec))
         (t (sql-error "unknown tokenizer: ~a" name))))))
 
 ;;; ------------------------------------------------------------------
@@ -125,7 +128,11 @@
   (ecase (f3tok-kind tk)
     (:simple (fts3-simple-tokenize tk bytes end))
     (:porter (fts3-porter-tokenize bytes end))
-    (:unicode61 (fts3-u61-tokenize tk bytes end))))
+    (:unicode61 (fts3-u61-tokenize tk bytes end))
+    (:user (let ((toks (user-tokenize (f3tok-user-name tk) nil (f3tok-user-args tk)
+                                      (utf8-decode-lenient (subseq bytes 0 end)))))
+             (map 'vector (lambda (x) (list (text-to-bstring (first x)) (second x) (third x) (fourth x)))
+                  toks)))))
 
 (defun fts3-text-bytes (v)
   "The UTF-8 bytes a column value is tokenized as, cut at the first NUL

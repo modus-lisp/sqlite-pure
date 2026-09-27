@@ -1,0 +1,33 @@
+== dbstat-basic
+CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c BLOB);
+CREATE INDEX tb ON t(b) WHERE a % 10 = 0;
+WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i<400) INSERT INTO t SELECT i, printf('%06d%.*c', i, i % 97 + 3, 'x'), zeroblob(i % 5 * 1000) FROM r;
+CREATE TABLE u(x UNIQUE, y);
+INSERT INTO u VALUES(zeroblob(9000), 1), ('short', 2);
+SELECT name, path, pagetype, ncell, payload, unused, mx_payload, pgsize FROM dbstat;
+SELECT name, path, pageno, pgoffset FROM dbstat WHERE name <> 't';
+SELECT name, path, pagetype, ncell, payload, unused FROM dbstat WHERE name = 't' AND path LIKE '/00%';
+SELECT * FROM dbstat WHERE aggregate = 1;
+SELECT name, pageno, ncell, payload, unused, mx_payload, pgsize FROM dbstat WHERE aggregate = 1 ORDER BY name;
+SELECT * FROM dbstat('main', 1);
+SELECT * FROM dbstat('main') WHERE name = 'u';
+SELECT name, schema, aggregate FROM dbstat LIMIT 3;
+SELECT count(*), sum(pgsize) FROM dbstat;
+SELECT name, path FROM dbstat ORDER BY name, path LIMIT 12;
+SELECT * FROM dbstat('nosuch');
+EXPLAIN QUERY PLAN SELECT * FROM dbstat WHERE name = 't';
+EXPLAIN QUERY PLAN SELECT * FROM dbstat WHERE aggregate = 1 ORDER BY name;
+EXPLAIN QUERY PLAN SELECT * FROM dbstat('main', 1);
+CREATE VIRTUAL TABLE s USING dbstat;
+SELECT count(*) FROM s;
+CREATE VIRTUAL TABLE s2 USING dbstat(nosuch);
+DELETE FROM dbstat;
+INSERT INTO s VALUES(1,2,3,4,5,6,7,8,9,10);
+SELECT * FROM dbstat(1, 2, 3);
+PRAGMA page_size;
+
+== dbstat-empty
+SELECT * FROM dbstat;
+SELECT * FROM dbstat WHERE aggregate = 1;
+CREATE TABLE a(x);
+SELECT * FROM dbstat;

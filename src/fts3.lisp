@@ -938,7 +938,8 @@ table's table-named column: (lambda (env)) reading the cursor, or NIL."
     (make-fts3tok
      :tokenizer (if words
                     (let ((name (first words)))
-                      (unless (member name '("simple" "porter" "unicode61") :test #'string=)
+                      (unless (or (member name '("simple" "porter" "unicode61") :test #'string=)
+                                  (user-tokenizer-function name nil))
                         (sql-error "unknown tokenizer: ~a" name))
                       (make-fts3-tokenizer-from
                        (format nil "~a~{ ~a~}" name (mapcar (lambda (a) (format nil "\"~a\"" (substitute-string "\"" "\"\"" a)))
