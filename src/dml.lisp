@@ -33,27 +33,30 @@
 
 (defun index-key (table index row)
   "The full entry stored in INDEX for ROW (row vector with rowid last)."
-  (let* ((n (length (table-columns table)))
+  (let* ((cols (table-columns table))
+         (n (length cols))
          (rowid (svref row n))
          (vals (loop for (c) in (index-columns index)
-                     collect (cond ((integerp c) (svref row c))
+                     ;; a column as the table record stores it; an expression's
+                     ;; value as computed
+                     collect (cond ((integerp c) (table-record-value (svref row c) (aref cols c)))
                                    ((eq c :rowid) rowid)
                                    (t (eval-on-row (index-expr-fn table c) table row))))))
     (cond ((index-pk-index index) (wr-record table row))
           ((table-without-rowid table)
-           (append vals (loop for ci in (table-pk table)
-                              unless (member ci (index-columns index) :key #'first)
-                                collect (svref row ci))))
+           (append vals (loop for (ci) in (index-pk-tail table index)
+                              collect (table-record-value (svref row ci) (aref cols ci)))))
           (t (append vals (list rowid))))))
 
 (defun wr-entry-pk (table index vals)
   "The primary key of the WITHOUT ROWID row an entry VALS of the secondary
-INDEX belongs to: a key column the index already holds is not repeated
-after its own columns (see INDEX-KEY)."
-  (let* ((key-cols (mapcar #'first (index-columns index)))
-         (k (length key-cols)))
-    (loop for ci in (table-pk table)
-          collect (let ((i (position ci key-cols)))
+INDEX belongs to: a key column the index already holds (with the same
+collation) is not repeated after its own columns (see INDEX-PK-TAIL)."
+  (let* ((key (index-columns index))
+         (k (length key)))
+    (loop for (ci coll) in (table-pk-spec table)
+          collect (let ((i (position-if (lambda (c) (and (eql (first c) ci) (collation= (second c) coll)))
+                                        key)))
                     (if i (nth i vals) (prog1 (nth k vals) (incf k)))))))
 
 (defun index-full-cmp (table index)
@@ -65,23 +68,39 @@ after its own columns (see INDEX-KEY)."
            (let ((cmp (index-key-cmp colls descs)))
              (lambda (a b) (funcall cmp (subseq a 0 nkey) (subseq b 0 (min nkey (length b)))))))
           ((table-without-rowid table)
-           (let ((tail-colls (loop for ci in (table-pk table)
-                                   unless (member ci (index-columns index) :key #'first)
-                                     collect (collate-of (aref (table-columns table) ci)))))
-             (index-key-cmp (append colls tail-colls) descs)))
+           (let ((tail (index-pk-tail table index)))
+             (index-key-cmp (append colls (mapcar #'second tail))
+                            (append descs (mapcar #'third tail)))))
           (t (index-key-cmp colls descs)))))
 
 (defun index-applies-p (table index row)
   (or (null (index-where index))
       (eq (truth (eval-on-row (index-expr-fn table (index-where index)) table row)) t)))
 
+(defun integral-double-p (v lo hi)
+  (and (floatp v) (not (float-infinity-p v)) (not (float-nan-p v))
+       (= v (ftruncate v)) (<= lo (rational v) hi)))
+
+(defun table-record-value (v col)
+  "OP_MakeRecord with the table's affinity: in a REAL column an integral
+value that fits in 6 bytes is stored as an integer (MEM_IntReal)."
+  (if (and (eq (column-affinity col) :real)
+           (integral-double-p v -140737488355328 140737488355327))
+      (truncate v)
+      v))
+
 (defun wr-record (table row)
   "Stored record of a WITHOUT ROWID table: primary key first."
-  (mapcar (lambda (ci) (svref row ci)) (record-column-order table)))
+  (let ((cols (table-columns table)))
+    (mapcar (lambda (ci) (table-record-value (svref row ci) (aref cols ci)))
+            (record-column-order table))))
 
 (defun table-record (table row)
-  (mapcar (lambda (i) (if (eql i (table-rowid-alias table)) :null (svref row i)))
-          (record-column-order table)))
+  (let ((cols (table-columns table)))
+    (mapcar (lambda (i) (if (eql i (table-rowid-alias table))
+                            :null
+                            (table-record-value (svref row i) (aref cols i))))
+            (record-column-order table))))
 
 (defun compute-generated (table row &key virtual-only)
   "Fill ROW's generated columns from their expressions (twice over, so a

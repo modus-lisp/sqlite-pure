@@ -204,7 +204,7 @@ tables and `ATTACH`/`DETACH`**, `VACUUM` and `VACUUM INTO`, and the common
 `PRAGMA`s (`table_info`, `table_xinfo`, `index_list`, `index_info`,
 `foreign_key_list`, `foreign_keys`, `user_version`, `application_id`,
 `integrity_check`, `page_size`, `page_count`, `freelist_count`,
-`database_list`, `table_list`, `encoding`, …).
+`database_list`, `table_list`, `encoding`, `case_sensitive_like`, …).
 
 **Functions.** Core: `abs changes char coalesce concat concat_ws format
 glob hex ifnull iif instr last_insert_rowid length like likely lower ltrim
@@ -238,7 +238,11 @@ copies of the outer `WHERE` terms that constrain only them (push-down), and
 terms get SQLite's treatment: `x=1 OR x=2` also works as `x IN (1,2)`,
 `x=A OR x>A` as `x>=A`, and when every disjunct can use an index the table
 may be read as a `MULTI-INDEX OR` loop — one indexed lookup per disjunct,
-each planned as its own sub-query, duplicates skipped. `RIGHT` and `FULL`
+each planned as its own sub-query, duplicates skipped. `x LIKE 'abc%'`
+(or `GLOB`, with a literal or bound pattern) also reads as the range
+`x >= 'ABC' AND x < 'abd'` on a `NOCASE` index — `BINARY` for `GLOB` or
+under `PRAGMA case_sensitive_like` — as SQLite's LIKE optimization does,
+prefixes that could read as numbers excepted. `RIGHT` and `FULL`
 joins run as SQLite runs them: the right table's matched rows are
 remembered by rowid (or primary key), and a final pass — its own
 single-table plan over the `WHERE` terms, shown as `RIGHT-JOIN` in
@@ -365,8 +369,8 @@ equivalent here.
 
 R-tree `MATCH` geometry callbacks, the ICU tokenizer, FTS5's
 `*`-prefixed diagnostic queries, plain `EXPLAIN` (bytecode listings),
-`ANALYZE` (accepted, writes no `sqlite_stat1`), and in the planner: the
-`LIKE` optimization, skip-scans, Bloom filters, and flattening of compound
+`ANALYZE` (accepted, writes no `sqlite_stat1`), and in the planner:
+skip-scans, Bloom filters, and flattening of compound
 (`UNION ALL`) subqueries.  `fsync` and file
 locks need SBCL (elsewhere `finish-output` is the barrier and locks are
 no-ops, with cache validation still applied).
@@ -385,7 +389,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 |---|---|
 | `test/run-tests.sh` (also `(asdf:test-system "sqlite-pure")`) | the Lisp API tests (`test/api.lisp`), and the **differential suite**: `test/cases/*.test` are SQL scripts; `test/gen-expected.py` records SQLite's rows or error for every statement; each is replayed here and compared, error messages included |
 | `test/run-qfuzz.sh FIRST N Q` | **query fuzzer**: random expressions, joins, subqueries, compounds, windows and CTEs over random mixed-type data, compared statement by statement |
-| `python3 test/planfuzz.py SQLITE3 bin/sqlp FIRST N [Q]` | **planner fuzzer**: random schemas (indexes, WITHOUT ROWID, INTEGER PRIMARY KEY), data and joins; `EXPLAIN QUERY PLAN` output and rows (in order) must match sqlite3. FROM-subqueries (with joins, `*`, `ORDER BY`/`LIMIT`, `DISTINCT`, aggregates, views), `OR` terms of many shapes and `RIGHT`/`FULL` joins (by `ON` or `USING`) are included; `PLANFUZZ_NO_SUBQ=1` / `PLANFUZZ_NO_OR=1` / `PLANFUZZ_NO_RIGHT=1` leave them out |
+| `python3 test/planfuzz.py SQLITE3 bin/sqlp FIRST N [Q]` | **planner fuzzer**: random schemas (indexes, WITHOUT ROWID, INTEGER PRIMARY KEY), data and joins; `EXPLAIN QUERY PLAN` output and rows (in order) must match sqlite3. FROM-subqueries (with joins, `*`, `ORDER BY`/`LIMIT`, `DISTINCT`, aggregates, views), `OR` terms of many shapes, `RIGHT`/`FULL` joins (by `ON` or `USING`) and `LIKE`/`GLOB` terms (with `NOCASE` index columns and `PRAGMA case_sensitive_like`) are included; `PLANFUZZ_NO_SUBQ=1` / `PLANFUZZ_NO_OR=1` / `PLANFUZZ_NO_RIGHT=1` / `PLANFUZZ_NO_LIKE=1` leave them out |
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
@@ -409,8 +413,8 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 Current results (SQLite 3.40.1 as reference): **sqllogictest** — every
 record of all 622 files passes (two records listed as 3.40-versus-corpus
 differences), `select5.test`'s 18-way joins included.  **SQLite's TCL suite** — of the 627 files
-that use no testfixture-only C hooks, 145 237 of 156 905 tests pass (92.6%);
-over all 1045 files that run to the end, 188 761 of 215 158.
+that use no testfixture-only C hooks, 145 241 of 156 905 tests pass (92.6%);
+over all 1045 files that run to the end, 188 791 of 215 158.
 
 ## Layout
 

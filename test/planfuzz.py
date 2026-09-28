@@ -35,7 +35,8 @@ def gen_schema(r):
         out.append("CREATE TABLE %s(%s)%s;" % (name, ", ".join(decl), " WITHOUT ROWID" if wr else ""))
         for k in range(r.randint(0, 3)):
             ic = r.sample(cols, r.randint(1, min(3, ncol)))
-            parts = [c + (" DESC" if r.random() < 0.15 else "") for c in ic]
+            parts = [c + (" COLLATE NOCASE" if not NO_LIKE and r.random() < 0.15 else "")
+                     + (" DESC" if r.random() < 0.15 else "") for c in ic]
             uniq = "UNIQUE " if r.random() < 0.2 else ""
             out.append("CREATE %sINDEX IF NOT EXISTS %s_i%d ON %s(%s);" % (uniq, name, k, name, ", ".join(parts)))
         nrow = r.randint(0, 30)
@@ -124,6 +125,19 @@ def gen_or(r, col):
         return "(%s = %s OR %s %s %s)" % (c, v, c, r.choice(["<", ">", "<=", ">="]), v)
     return "(" + " OR ".join(atom() for _ in range(r.randint(2, 3))) + ")"
 
+NO_LIKE = bool(os.environ.get("PLANFUZZ_NO_LIKE"))
+
+def gen_like(r, col):
+    """x LIKE / GLOB with a prefix (the LIKE optimization), or not."""
+    pre = r.choice(["a", "A", "x", "1", "-", "ab", "a_", "@", "a\\%", ""])
+    op = r.choice(["LIKE", "LIKE", "GLOB", "NOT LIKE"])
+    tail = r.choice(["%", "%", "", "_%", "%b"]) if op != "GLOB" else r.choice(["*", "", "?*"])
+    pat = "'" + pre + tail + "'"
+    esc = " ESCAPE '\\'" if "\\" in pre and op != "GLOB" else ""
+    if op == "GLOB":
+        pat = pat.replace("%", "*").replace("_", "?")
+    return "%s %s %s%s" % (col(), op, pat, esc)
+
 def gen_query(r, tables):
     k = r.randint(1, min(3, len(tables)))
     picked = r.sample(tables, k)
@@ -154,6 +168,8 @@ def gen_query(r, tables):
             conds.append("%s IS %sNULL" % (col(), r.choice(["", "NOT "])))
         elif kind < 0.9:
             conds.append("%s BETWEEN %s AND %s" % (col(), r.randint(0, 3), r.randint(3, 8)))
+        elif kind < 0.95 and not NO_LIKE:
+            conds.append(gen_like(r, col))
         elif not os.environ.get("PLANFUZZ_NO_OR"):
             conds.append(gen_or(r, col))
     # FROM with joins
@@ -225,6 +241,8 @@ def main():
         tables, schema = gen_schema(r)
         queries = [gen_query(r, tables) for _ in range(per)]
         script = "\n".join(schema) + "\n"
+        if not NO_LIKE and seed % 5 == 0:
+            script = "PRAGMA case_sensitive_like=1;\n" + script
         for i, q in enumerate(queries):
             script += ".print ==%d EQP\nEXPLAIN QUERY PLAN %s;\n.print ==%d ROWS\n%s;\n" % (i, q, i, q)
         (a, ea), (b, eb) = run(ref, script), run(ours, script)

@@ -61,7 +61,8 @@
   in-agg-arg
   windows                ; window functions of this query level (NIL: not allowed here)
   window-defs            ; alist from the WINDOW clause
-  coalesce)              ; RIGHT/FULL JOIN USING: ((lsi . lci) . (rsi . rci)) ...
+  coalesce               ; FULL JOIN USING: ((lsi . lci) . (rsi . rci)) ...
+  right-using)           ; RIGHT JOIN USING: ((lsi . lci) . (rsi . rci)), latest first
 
 (defun src-ncols (s) (length (src-columns s)))
 
@@ -90,8 +91,19 @@
                (when (cdr hits)
                  (sql-error-at name "ambiguous column name: ~@[~a.~]~a" table name))
                (destructuring-bind (si ci s) (car hits)
+                 ;; a RIGHT JOIN's USING column names the right table's
+                 (let ((r (and (null table) (right-using-target sc si ci))))
+                   (when r
+                     (return-from resolve-column
+                       (values depth (car r) (cdr r) (nth (car r) (scope-srcs sc))))))
                  (return-from resolve-column (values depth si ci s))))))
   nil)
+
+(defun right-using-target (scope si ci)
+  "(rsi . rci) when column CI of source SI, unqualified, is a RIGHT JOIN's
+USING column: the right-most such table's (resolve.c: \"a RIGHT JOIN.
+Use the right-most table\")."
+  (cdr (assoc (cons si ci) (scope-right-using scope) :test #'equal)))
 
 (defun mark-correlated (scope depth)
   (loop repeat depth
@@ -240,10 +252,41 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
   "S up to its first NUL: SQLite's pattern matchers see C strings."
   (let ((z (position (code-char 0) s))) (if z (subseq s 0 z) s)))
 
-(defun like-match (pattern string escape)
-  "SQL LIKE: % and _, ASCII case-insensitive."
+(defun case-sensitive-like-p ()
+  "PRAGMA case_sensitive_like, on the connection running the statement."
+  (and *db* (eq (db-case-sensitive-like (conn *db*)) :on)))
+
+(defparameter +volatile-functions+
+  '("random" "randomblob" "changes" "total_changes" "last_insert_rowid" "load_extension")
+  "Built-in functions SQLite does not treat as constant for given arguments.")
+
+(defun function-constant-p (lname)
+  "EP_ConstFunc: a built-in registered SQLITE_FUNC_CONSTANT (or slowly
+changing); not a user function, and not like() once PRAGMA
+case_sensitive_like has re-registered it (sqlite3RegisterLikeFunctions,
+without SQLITE_DETERMINISTIC)."
+  (let ((c (and *db* (conn *db*))))
+    (not (or (member lname +volatile-functions+ :test #'string=)
+             (and c (gethash lname (db-user-functions c)))
+             (and (string= lname "like") c (db-case-sensitive-like c))))))
+
+(defun expr-nonconstant-call-p (e)
+  "Does E call a function that is not constant for given arguments?"
+  (cond ((atom e) nil)
+        ((not (keywordp (car e))) (some #'expr-nonconstant-call-p e))
+        ((member (car e) '(:subquery :exists)) nil)
+        ((and (eq (car e) :like) (not (function-constant-p (if (eq (second e) :glob) "glob" "like")))) t)
+        ((and (eq (car e) :fn) (stringp (second e))
+              (not (function-constant-p (string-downcase-ascii (second e)))))
+         t)
+        (t (some #'expr-nonconstant-call-p (cdr e)))))
+
+(defun like-match (pattern string escape &optional (case-sensitive (case-sensitive-like-p)))
+  "SQL LIKE: % and _, ASCII case-insensitive unless PRAGMA
+case_sensitive_like is on."
   (let ((pn (length pattern)) (sn (length string)))
-    (labels ((m (pj si)
+    (labels ((fold (c) (if case-sensitive c (ascii-char-fold c)))
+             (m (pj si)
                (loop
                  (when (>= pj pn) (return (= si sn)))
                  (let ((pc (char pattern pj)))
@@ -251,8 +294,8 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
                           (incf pj)
                           (when (>= pj pn) (return nil))
                           (unless (and (< si sn)
-                                       (char= (ascii-char-fold (char pattern pj))
-                                              (ascii-char-fold (char string si))))
+                                       (char= (fold (char pattern pj))
+                                              (fold (char string si))))
                             (return nil))
                           (incf pj) (incf si))
                          ((char= pc #\%)
@@ -271,7 +314,7 @@ the Debian/Ubuntu libsqlite3 uses).  T: match the blob's bytes as text.")
                           (incf pj) (incf si))
                          (t
                           (unless (and (< si sn)
-                                       (char= (ascii-char-fold pc) (ascii-char-fold (char string si))))
+                                       (char= (fold pc) (fold (char string si))))
                             (return nil))
                           (incf pj) (incf si)))))))
       (m 0 0))))

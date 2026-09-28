@@ -1161,7 +1161,10 @@ the newest on ties; or NIL."
                             for ci from 0
                             do (unless (and (null tname) (or (member ci (src-hidden s))
                                                              (member ci (src-star-hidden s))))
-                                 (push (list (list :srccol si ci) name) out)))))
+                                 (let ((r (and (null tname) (right-using-target scope si ci))))
+                                   (push (list (if r (list :srccol (car r) (cdr r)) (list :srccol si ci))
+                                               name)
+                                         out))))))
            (unless any
              (if tname (sql-error "no such table: ~a" tname) (sql-error "no tables specified")))))
         (:expr
@@ -1208,9 +1211,11 @@ Return the per-source ON expressions."
                       (unless left
                         (sql-error "cannot join using column ~a - column not present in both tables" name))
                       (push ri (src-hidden src))
-                      (when (member (fsrc-join fs) '(:right :full))
-                        (push (cons (cons (first left) (second left)) (cons i ri))
-                              (scope-coalesce scope)))
+                      (case (fsrc-join fs)
+                        (:full (push (cons (cons (first left) (second left)) (cons i ri))
+                                     (scope-coalesce scope)))
+                        (:right (push (cons (cons (first left) (second left)) (cons i ri))
+                                      (scope-right-using scope))))
                       (let ((cond (list :binary :eq (list :srccol (first left) (second left) :raw)
                                         (list :srccol i ri :raw))))
                         (setf on (if on (list :binary :and on cond) cond)))))
@@ -1726,8 +1731,9 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                (unless (= sat (length group))
                  (eqp-note "USE TEMP B-TREE FOR GROUP BY" +eqp-group+)))
               (:distinct-group
+               ;; the DISTINCT made a GROUP BY: its sorter, where GROUP BY's is
                (unless (= sat (length rcols))
-                 (eqp-note "USE TEMP B-TREE FOR DISTINCT" +eqp-distinct+))))
+                 (eqp-note "USE TEMP B-TREE FOR DISTINCT" +eqp-group+))))
             (when (and distinct (not (eq kind :distinct-group)) plan
                        (not (member (plan-distinct plan) '(:unique :ordered))))
               (eqp-note "USE TEMP B-TREE FOR DISTINCT" +eqp-distinct+))

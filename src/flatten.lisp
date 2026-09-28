@@ -570,9 +570,6 @@ stands for (SQLite expands them before it flattens), or NIL."
 ;;; subquery then filters (and can use an index) before its rows reach the
 ;;; outer query.  The terms stay in the outer WHERE clause as well.
 
-(defparameter +volatile-functions+
-  '("random" "randomblob" "changes" "total_changes" "last_insert_rowid")
-  "Built-in functions SQLite does not treat as constant for given arguments.")
 
 (defun pushable-term-p (e si scope)
   "sqlite3ExprIsTableConstant: does E read nothing but source SI (a
@@ -590,13 +587,13 @@ no function whose result may vary?"
                         (:in (and (ok (second x))
                                   (let ((rhs (third x)))
                                     (and (eq (car rhs) :list) (every #'ok (second rhs))))))
-                        (:fn (let* ((lname (string-downcase-ascii (second x)))
-                                    (c (and *db* (conn *db*))))
+                        (:fn (let ((lname (string-downcase-ascii (second x))))
                                (and (not (aggregate-call-p x))
-                                    (not (member lname +volatile-functions+ :test #'string=))
-                                    (not (and c (gethash lname (db-user-functions c))))
+                                    (function-constant-p lname)
                                     (every #'ok (third x))
                                     (ok (fifth x)))))
+                        (:like (and (function-constant-p (if (eq (second x) :glob) "glob" "like"))
+                                    (every #'ok (cddr x))))
                         (t (every #'ok (cdr x))))))))
     (ok e)))
 
@@ -753,13 +750,13 @@ expression tree."
                         (:in (and (ok (second x))
                                   (let ((rhs (third x)))
                                     (and (eq (car rhs) :list) (every #'ok (second rhs))))))
-                        (:fn (let* ((lname (string-downcase-ascii (second x)))
-                                    (c (and *db* (conn *db*))))
+                        (:fn (let ((lname (string-downcase-ascii (second x))))
                                (and (not (aggregate-call-p x))
-                                    (not (member lname +volatile-functions+ :test #'string=))
-                                    (not (and c (gethash lname (db-user-functions c))))
+                                    (function-constant-p lname)
                                     (every #'ok (third x))
                                     (ok (fifth x)))))
+                        (:like (and (function-constant-p (if (eq (second x) :glob) "glob" "like"))
+                                    (every #'ok (cddr x))))
                         (t (every #'ok (cdr x))))))))
     (ok e)))
 

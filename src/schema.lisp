@@ -289,6 +289,17 @@
              (schema-tables schema))
     schema))
 
+(defun index-pk-tail (table index)
+  "sqlite3CreateIndex, WITHOUT ROWID: the primary-key columns a secondary
+INDEX stores after its own, as (column collation desc) -- each one that is
+not already a key column with the same collation (isDupColumn).  A UNIQUE
+constraint's index was made before the primary key, and takes its columns
+ascending whatever their order (convertToWithoutRowidTable, bAscKeyBug)."
+  (loop for (ci coll desc) in (table-pk-spec table)
+        unless (find-if (lambda (k) (and (eql (first k) ci) (collation= (second k) coll)))
+                        (index-columns index))
+          collect (list ci coll (and desc (not (index-auto index))))))
+
 (defun auto-index-for (table name root)
   "The index behind sqlite_autoindex_<table>_<N>."
   (let* ((prefix (format nil "sqlite_autoindex_~a_" (table-name table)))

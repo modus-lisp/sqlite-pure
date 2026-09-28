@@ -32,12 +32,14 @@ def gen(seed):
     def mk_table():
         name = 't%d' % len(tables)
         kind = random.random()
+        # a REAL column stores integral values as integers (and so do its indexes)
+        d = random.choice(['d', 'd REAL'])
         if kind < 0.6:
-            out.append('CREATE TABLE %s(a INTEGER PRIMARY KEY, b, c, d);' % name); tables[name] = 'rowid'
+            out.append('CREATE TABLE %s(a INTEGER PRIMARY KEY, b, c, %s);' % (name, d)); tables[name] = 'rowid'
         elif kind < 0.8:
-            out.append('CREATE TABLE %s(a, b, c, d);' % name); tables[name] = 'plain'
+            out.append('CREATE TABLE %s(a, b, c, %s);' % (name, d)); tables[name] = 'plain'
         else:
-            out.append('CREATE TABLE %s(a, b, c, d, PRIMARY KEY(a, b)) WITHOUT ROWID;' % name); tables[name] = 'wr'
+            out.append('CREATE TABLE %s(a, b, c, %s, PRIMARY KEY(a, b)) WITHOUT ROWID;' % (name, d)); tables[name] = 'wr'
     mk_table()
     nid = 1
     for step in range(random.randint(25, 60)):

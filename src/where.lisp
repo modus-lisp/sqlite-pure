@@ -149,11 +149,10 @@ SQLite's pIndex order."
                    do (setf cols (append cols (list i)) colls (append colls (list :binary))
                             descs (append descs (list nil)))))
           (t
-           (dolist (p (table-pk table))
-             (unless (member p (subseq cols 0 n-key))
-               (setf cols (append cols (list p))
-                     colls (append colls (list (column-collation (aref (table-columns table) p))))
-                     descs (append descs (list nil)))))))
+           (loop for (p coll desc) in (index-pk-tail table idx)
+                 do (setf cols (append cols (list p))
+                          colls (append colls (list coll))
+                          descs (append descs (list desc))))))
     (let* ((unique (or pk (index-unique idx)))
            ;; sized for every column and zeroed, as sqlite3AllocateIndexObject does
            (a (make-array (1+ (length cols)) :initial-element 0))
@@ -315,6 +314,7 @@ the set of fixed column nodes."
   constraint-mask ; the tables a folded x IS NULL still mentions
   base            ; one of the original (non-virtual) conjuncts
   copied          ; TERM_COPIED: col = col with a commuted virtual copy
+  likeopt         ; TERM_LIKEOPT: a LIKE range bound (the >= bound holds its < partner)
   or-wc           ; an OR term: its disjuncts, a WCLAUSE (WhereOrInfo)
   (indexable 0)   ; ... and the tables every disjunct can index
   and-wc)         ; a disjunct of several ANDed terms: them (WhereAndInfo)
@@ -533,13 +533,25 @@ virtual children."
                 (setf (wt-constraint-mask term) prereq-all
                       (wt-op term) nil
                       (wt-prereq-all term) 0))
+              ;; col op <pushed-down fixed column>: SQLite's copy has the other
+              ;; cursor's column on the left -- no use to an index here, but a
+              ;; term all the same (the covering lookup estimate counts it)
+              (when (and rhs (wt-src term) (member op '(:eq :lt :le :gt :ge :is))
+                         (eq (car (skip-collate rhs)) :pushed-fixed))
+                (setf (wt-copied term) t)
+                (add-wterm wc (make-wterm :expr (list :binary (commute-op op) rhs lhs)
+                                          :virtual t :parent term :truth (wt-truth term)
+                                          :outer-on outer-on :inner-on (wt-inner-on term)
+                                          :prereq-right prereq-left :prereq-all prereq-all)))
               ;; col op col: a commuted copy lets the right column drive an index
               (when (and rhs (not (member op '(:in :isnull))) (not (fixed-col-p (skip-collate rhs))))
                 (multiple-value-bind (rsrc rcol) (column-ref rhs scope)
                   (when rsrc
                     (let ((equiv (and (wt-src term)
                                       (term-is-equivalence-p lhs rhs op outer-on scope)))
-                          (new (if (wt-src term)
+                          ;; a pushed-down fixed column is a column of another
+                          ;; cursor to SQLite: the term keeps it, the copy is new
+                          (new (if (or (wt-src term) (eq (car (skip-collate lhs)) :pushed-fixed))
                                    (add-wterm wc (make-wterm :expr e :virtual t :parent term
                                                              :truth (wt-truth term) :outer-on outer-on
                                                              :inner-on (wt-inner-on term)))
@@ -562,6 +574,9 @@ virtual children."
         ;; x OR y OR ...: WhereOrInfo, and perhaps x IN (...) or x>=A
         ((and (eq kind :binary) (eq (second e) :or) (eq (wc-op wc) :and))
          (analyze-or-term wc term))
+        ;; x LIKE 'abc%': x >= 'ABC' AND x < 'abd' (the LIKE optimization)
+        ((and (eq kind :like) (eq (wc-op wc) :and))
+         (analyze-like-term wc term))
         ;; x IS NOT NULL: a virtual x>NULL (TERM_VNULL) an index can use
         ((and (eq kind :isnull) (third e) (not outer-on))
          (multiple-value-bind (src col) (column-ref (second e) scope)
@@ -575,6 +590,100 @@ virtual children."
                                        :outer-on outer-on :inner-on (wt-inner-on term)))))))
       (setf (wt-prereq-right term) (logior (wt-prereq-right term) extra-right))
       term)))
+
+;;; ------------------------------------------------------------------
+;;; The LIKE optimization (isLikeOrGlob and exprAnalyze, whereexpr.c)
+
+(defun like-or-glob-prefix (e scope)
+  "isLikeOrGlob: for the LIKE/GLOB E, (values prefix complete-p nocase-p)
+-- the pattern's literal prefix with escapes removed, whether the only
+wildcard is a final % or *, and whether case is insignificant -- or NIL."
+  (destructuring-bind (kind lhs pat esc negated) (cdr e)
+    (let* ((c (and *db* (conn *db*)))
+           (wc (if (eq kind :glob) '(#\* #\? #\[) '(#\% #\_)))
+           (nocase (and (eq kind :like) (not (case-sensitive-like-p))))
+           (escape nil)
+           (z nil))
+      ;; the built-in function only (sqlite3IsLikeFunction)
+      (when (or negated
+                (and c (gethash (if (eq kind :glob) "glob" "like") (db-user-functions c))))
+        (return-from like-or-glob-prefix nil))
+      (when esc
+        (unless (and (eq (car esc) :lit) (stringp (second esc)) (= (length (second esc)) 1)
+                     (not (member (char (second esc) 0) (subseq wc 0 2))))
+          (return-from like-or-glob-prefix nil))
+        (setf escape (char (second esc) 0)))
+      (let ((p (skip-collate pat)))
+        (case (car p)
+          (:lit (when (stringp (second p)) (setf z (second p))))
+          (:param (let ((v (ignore-errors (param-value (second p)))))
+                    (when (stringp v) (setf z v))))))
+      (unless z (return-from like-or-glob-prefix nil))
+      (setf z (c-string z))
+      ;; the characters before the first wildcard
+      (let ((cnt 0) (n (length z)))
+        (loop while (and (< cnt n) (not (member (char z cnt) wc)))
+              do (let ((ch (char z cnt)))
+                   (incf cnt)
+                   (when (and escape (char= ch escape) (< cnt n)) (incf cnt))))
+        (unless (and (/= cnt 0) (or (> cnt 1) (not (eql (char z 0) escape))))
+          (return-from like-or-glob-prefix nil))
+        (let ((complete (and (< cnt n) (char= (char z cnt) (first wc)) (= (1+ cnt) n)))
+              (prefix (with-output-to-string (out)
+                        (loop with i = 0
+                              while (< i cnt)
+                              do (when (and escape (char= (char z i) escape)) (incf i))
+                                 (when (< i cnt) (write-char (char z i) out))
+                                 (incf i)))))
+          ;; a pattern that might be compared as a number cannot bound an
+          ;; index range, unless x is a column with TEXT affinity
+          (unless (and (member (car lhs) '(:col :srccol))
+                       (eq (expr-affinity lhs scope) :text)
+                       (multiple-value-bind (si) (column-ref lhs scope)
+                         (let ((tb (and si (src-table (nth si (scope-srcs scope))))))
+                           (not (and tb (table-virtual-p tb))))))
+            (when (or (text-numeric-value prefix)
+                      (string= prefix "-")
+                      (text-numeric-value (increment-last-char prefix)))
+              (return-from like-or-glob-prefix nil)))
+          (values prefix complete nocase))))))
+
+(defun increment-last-char (s)
+  (let ((new (copy-seq s)) (k (1- (length s))))
+    (setf (char new k) (code-char (1+ (char-code (char new k)))))
+    new))
+
+(defun analyze-like-term (wc term)
+  "exprAnalyze for x LIKE/GLOB 'abc%': virtual terms x >= 'ABC' and
+x < 'abd' (TERM_LIKEOPT, used only as a pair), collated NOCASE when case
+is insignificant, BINARY otherwise; children of the LIKE when its only
+wildcard is the final one."
+  (let* ((e (wt-expr term)) (lhs (third e)))
+    (multiple-value-bind (prefix complete nocase) (like-or-glob-prefix e (wc-scope wc))
+      (when prefix
+        (let ((lo prefix) (hi (copy-seq prefix)))
+          (when nocase
+            (setf lo (map 'string (lambda (c) (if (char<= #\a c #\z) (char-upcase c) c)) prefix)
+                  hi (map 'string #'ascii-char-fold prefix)))
+          (let* ((k (1- (length hi))) (c (char hi k)))
+            (when nocase
+              ;; '@'+1 is 'A', where case folding would upset the range
+              (when (char= c #\@) (setf complete nil))
+              (setf c (ascii-char-fold c)))
+            (setf (char hi k) (code-char (1+ (char-code c)))))
+          (let* ((coll (if nocase "NOCASE" "BINARY"))
+                 (parent (and complete term))
+                 (t1 (make-wterm :expr (list :binary :ge (list :collate lhs coll) (list :lit lo))
+                                 :virtual t :parent parent
+                                 :outer-on (wt-outer-on term) :inner-on (wt-inner-on term)))
+                 (t2 (make-wterm :expr (list :binary :lt (list :collate lhs coll) (list :lit hi))
+                                 :virtual t :parent parent
+                                 :outer-on (wt-outer-on term) :inner-on (wt-inner-on term))))
+            (add-wterm wc t1)
+            (analyze-term wc t1)
+            (add-wterm wc t2)
+            (analyze-term wc t2)
+            (setf (wt-likeopt t1) t2 (wt-likeopt t2) t)))))))
 
 (defun column-can-be-null-p (si ci scope)
   (let* ((s (nth si (scope-srcs scope))) (table (src-table s)))
@@ -859,6 +968,8 @@ by one more constraint on the next index column, insert, and recurse."
                        (index-column-not-null-p ws wx j))
               (return-from one))
             (when (logtest (wt-prereq-right term) (ws-mask ws)) (return-from one))
+            ;; a LIKE range's upper bound only with its own lower bound
+            (when (and (wt-likeopt term) (eq op :lt)) (return-from one))
             (when (and (ws-outer-restricted-p ws)
                        (not (constraint-compatible-with-outer-join-p term ws)))
               (return-from one))
@@ -892,7 +1003,14 @@ by one more constraint on the next index column, insert, and recurse."
                   ((:gt :ge)
                    (setf (wl-flags new) (logior (wl-flags new) +where-column-range+ +where-btm-limit+)
                          (wl-n-btm new) 1
-                         lower term upper nil))
+                         lower term upper nil)
+                   ;; LIKE optimization bounds are always used in pairs
+                   (when (wterm-p (wt-likeopt term))
+                     (let ((top (wt-likeopt term)))
+                       (setf (wl-lterms new) (append (wl-lterms new) (list top))
+                             (wl-flags new) (logior (wl-flags new) +where-top-limit+)
+                             (wl-n-top new) 1
+                             upper top))))
                   ((:lt :le)
                    (setf (wl-flags new) (logior (wl-flags new) +where-column-range+ +where-top-limit+)
                          (wl-n-top new) 1
@@ -1593,7 +1711,8 @@ that constrain only this table make it a partial index."
            (eql (wt-outer-on term) (ws-i ws))
            (not (wt-outer-on term)))
        (not (member (ws-join ws) '(:right :full)))
-       (not (expr-has-subquery-p (wt-origin term)))))
+       (not (expr-has-subquery-p (wt-origin term)))
+       (not (expr-nonconstant-call-p (wt-origin term)))))
 
 (defun expr-has-subquery-p (e)
   (and (consp e)

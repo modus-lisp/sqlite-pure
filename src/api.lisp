@@ -486,6 +486,17 @@ non-local exit.  Nested uses become savepoints."
                  (setf (db-safety-level db) (if (zerop lv) 1 lv))
                  (values nil nil))
                (pragma-rows '("synchronous") (list (list (1- (db-safety-level db)))))))
+          ((string= n "case_sensitive_like")
+           ;; LIKE becomes case-sensitive (like() re-registered with
+           ;; SQLITE_FUNC_CASE); nothing is returned either way
+           (when value
+             (let ((v (value-to-text value)))
+               (setf (db-case-sensitive-like (conn db))
+                     (if (if (and (plusp (length v)) (digit-char-p (char v 0)))
+                             (/= 0 (or (parse-integer v :junk-allowed t) 0))
+                             (member v '("on" "yes" "true") :test #'string-equal))
+                         :on :off))))
+           (values nil nil))
           ((string= n "secure_delete")
            ;; 0, 1 or FAST (2); a value sets it (for every database when no
            ;; schema is named) and the result is the setting, either way
@@ -502,7 +513,7 @@ non-local exit.  Nested uses become savepoints."
            (pragma-rows '("secure_delete")
                         (list (list (case (db-secure-delete db) (:fast 2) ((nil) 0) (t 1))))))
           ((member n '("cache_size" "temp_store" "locking_mode"
-                       "busy_timeout" "case_sensitive_like"
+                       "busy_timeout"
                        "count_changes" "legacy_file_format"
                        "ignore_check_constraints" "defer_foreign_keys" "mmap_size" "optimize"
                        "shrink_memory" "automatic_index")
@@ -668,12 +679,10 @@ non-local exit.  Nested uses become savepoints."
                    (loop for col across (table-columns tb) for ci from 0
                          unless (member ci used)
                            collect (list n ci (column-name col) 0 "BINARY" 0) and do (incf n)))
-                  (t (let ((pk (find-if #'index-pk-index (table-indexes tb))))
-                       (loop for (c coll desc) in (index-columns pk)
-                             unless (member c used)
-                               collect (list n c (column-name (aref (table-columns tb) c))
-                                             (if desc 1 0) (collation-name coll) 0)
-                               and do (incf n))))))))
+                  (t (loop for (c coll desc) in (index-pk-tail tb idx)
+                           collect (list n c (column-name (aref (table-columns tb) c))
+                                         (if desc 1 0) (collation-name coll) 0)
+                           do (incf n)))))))
            (append '("seqno" "cid" "name") (when xinfo '("desc" "coll" "key"))))))))
 
 (defun pragma-table-list (db &optional only)
