@@ -534,7 +534,7 @@ from it, start it over with new salts (walRestartLog)."
         (when (and (plusp (info-backfill info)) (shm-lock w +wr+ (lk-read 1) 4))
           (let ((hdr (copy-seq (wal-hdr w))))
             (put-u32 hdr 32 (ldb (byte 32 0) (1+ (get-u32 hdr 32))))
-            (put-u32 hdr 36 (random #x100000000))
+            (put-u32 hdr 36 (random #x100000000 (sql-random-state)))
             (nput-u32 hdr 16 0)
             (write-shm-header w hdr)
             (shm-write-u32 w 96 0)
@@ -563,7 +563,7 @@ from it, start it over with new salts (walRestartLog)."
             (h (make-octets 32)))
         (if restarted
             (incf seq)
-            (dotimes (i 8) (setf (aref hdr (+ 32 i)) (random 256))))
+            (dotimes (i 8) (setf (aref hdr (+ 32 i)) (random 256 (sql-random-state)))))
         (setf (aref hdr 13) (if *native-big* 1 0))
         (put-u32 h 0 (if *native-big* (1+ +wal-magic+) +wal-magic+))
         (put-u32 h 4 +wal-version+)

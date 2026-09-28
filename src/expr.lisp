@@ -27,7 +27,19 @@
   star-hidden            ; ... hidden from unqualified * only (table-valued functions' hidden columns)
   table                  ; TABLE or NIL
   (rowid-p t)
-  (used nil))            ; bit vector of referenced columns, or :ALL
+  (used nil)             ; bit vector of referenced columns, or :ALL
+  display                ; the name EXPLAIN QUERY PLAN shows, when not NAME
+  invisible)             ; merged in by the flattener: only qualified references see it
+
+(defun src-label (s) (or (src-display s) (src-name s)))
+
+(defvar *null-rows* (make-hash-table :test #'eq :weakness :key)
+  "The rows a LEFT JOIN stands in for an unmatched right table.")
+
+(defun make-null-row (n)
+  (let ((row (make-array n :initial-element :null)))
+    (setf (gethash row *null-rows*) t)
+    row))
 
 (defun mark-used (s ci)
   "Record that compiled code reads column CI of source S."
@@ -65,7 +77,9 @@
         do (let ((hits '()))
              (loop for s in (scope-srcs sc)
                    for si from 0
-                   do (when (or (null table) (and (src-name s) (name= table (src-name s))))
+                   do (when (if table
+                                (and (src-name s) (name= table (src-name s)))
+                                (not (src-invisible s)))
                         (let ((ci (position name (src-columns s) :test #'name=)))
                           (cond ((and ci (or table (not (member ci (src-hidden s)))))
                                  (push (list si ci s) hits))
@@ -74,7 +88,7 @@
                                  (push (list si :rowid s) hits))))))
              (when hits
                (when (cdr hits)
-                 (sql-error "ambiguous column name: ~@[~a.~]~a" table name))
+                 (sql-error-at name "ambiguous column name: ~@[~a.~]~a" table name))
                (destructuring-bind (si ci s) (car hits)
                  (return-from resolve-column (values depth si ci s))))))
   nil)
@@ -102,6 +116,9 @@
                (if (eq ci :rowid) :integer (svref (src-affinities s) ci))))
     (:cast (type-affinity (third e)))
     (:collate (expr-affinity (second e) scope))
+    (:icollate (expr-affinity (second e) scope))
+    (:ifnullrow (expr-affinity (third e) scope))
+    (:pushed-fixed (expr-affinity (second e) scope))
     (:subquery (select-first-affinity (second e) scope))
     (:affine (third e))
     (t nil)))
@@ -110,6 +127,10 @@
   "Return (values collation explicit-p); collation NIL when none."
   (case (car e)
     (:collate (values (collation-keyword (third e)) t))
+    ;; a flattened subquery column's implicit collation
+    (:icollate (values (third e) nil))
+    (:ifnullrow (expr-collation (third e) scope))
+    (:pushed-fixed (expr-collation (second e) scope))
     (:affine (values (fourth e) nil))
     (:srccol (let ((s (nth (second e) (scope-srcs scope))) (ci (third e)))
                (values (if (eq ci :rowid) :binary (svref (src-collations s) ci)) nil)))
@@ -377,7 +398,7 @@ on FTS3/4 tables; NIL for anything else."
              ;; SQLite treats an unresolvable double-quoted name as a string
              ((and (null (second e)) (stringp (third e)) (eq (fourth e) :quoted))
               (let ((s (third e))) (lambda (env) (declare (ignore env)) s)))
-             (t (sql-error "no such column: ~@[~a.~]~a" (second e) (third e))))))
+             (t (sql-error-at (third e) "no such column: ~@[~a.~]~a" (second e) (third e))))))
     (:srccol (if (assoc (cons (second e) (third e)) (scope-coalesce scope) :test #'equal)
                  (compile-coalesced (cons (second e) (third e)) scope)
                  (progn (mark-used (nth (second e) (scope-srcs scope)) (third e))
@@ -386,6 +407,28 @@ on FTS3/4 tables; NIL for anything else."
     (:unary (compile-unary e scope))
     (:binary (compile-binary e scope))
     (:collate (compile-expr (second e) scope))
+    (:icollate (compile-expr (second e) scope))
+    ;; TK_IF_NULL_ROW: NULL while the source (a flattened LEFT JOIN
+    ;; subquery's table) is on its null row
+    (:ifnullrow
+     (let ((f (compile-expr (third e) scope)))
+       (multiple-value-bind (depth si)
+           (loop for sc = scope then (scope-parent sc)
+                 for depth from 0
+                 while sc
+                 do (let ((si (position (second e) (scope-srcs sc) :key #'src-name :test #'equal)))
+                      (when si (return (values depth si)))))
+         (if (null si)
+             f
+             (lambda (env)
+               (let ((ev env))
+                 (loop repeat depth do (setf ev (env-parent ev)))
+                 (if (gethash (svref (env-rows ev) si) *null-rows*)
+                     :null
+                     (funcall f env))))))))
+    ;; an outer query's constant-propagated column, pushed into a subquery
+    (:pushed-fixed (compile-expr (second e) scope))
+    (:outer-on (compile-expr (third e) scope))
     (:isnull
      (let ((f (compile-expr (second e) scope)) (neg (third e)))
        (lambda (env) (bool (if neg (not (eq (funcall f env) :null)) (eq (funcall f env) :null))))))

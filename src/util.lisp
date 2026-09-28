@@ -25,6 +25,17 @@
 
 (defun sql-error (fmt &rest args)
   (error 'sqlite-error :message (apply #'format nil fmt args)))
+
+(defvar *executing-sql* nil "The SQL text of the statement(s) being run.")
+
+(defun sql-error-at (name fmt &rest args)
+  "SQL-ERROR pointing at the reference NAME (a column-name string from the
+parser) when it was parsed from the SQL being run."
+  (let ((loc (and (boundp '*ident-positions*) (stringp name)
+                  (gethash name (symbol-value '*ident-positions*)))))
+    (if (and loc *executing-sql* (equal (car loc) *executing-sql*))
+        (error 'sqlite-error :message (apply #'format nil fmt args) :offset (cdr loc))
+        (apply #'sql-error fmt args))))
 (defun corrupt (fmt &rest args)
   (error 'sqlite-corrupt-error :message (apply #'format nil fmt args)))
 (defun constraint-error (fmt &rest args)
@@ -372,3 +383,17 @@
 (defun ascii-search (needle haystack)
   (search needle haystack
           :test (lambda (x y) (char= (ascii-char-fold x) (ascii-char-fold y)))))
+
+;;; ------------------------------------------------------------------
+;;; Randomness
+
+(defvar *sql-random-state* nil
+  "(pid . random-state): SQLite seeds its PRNG from the OS in each process;
+a state saved in a Lisp core would repeat the same numbers in every process
+started from it, so it is made afresh whenever the process changes.")
+
+(defun sql-random-state ()
+  (let ((pid #+sbcl (sb-unix:unix-getpid) #-sbcl 0))
+    (unless (eql (car *sql-random-state*) pid)
+      (setf *sql-random-state* (cons pid (make-random-state t))))
+    (cdr *sql-random-state*)))

@@ -625,6 +625,18 @@ sqlite3_prepare would take them one after another."
                                        (equal (sqlite-pure::tok-value (aref toks (1+ k))) ".")
                                        (tok= (+ k 2) col))
                                return (sqlite-pure::tok-pos (aref toks k)))))))
+               (find-bare (name)
+                 ;; NAME as a token of its own: not qualifying, not qualified
+                 (let ((toks (ignore-errors (sqlite-pure::tokenize sql))))
+                   (when toks
+                     (flet ((dot-p (k) (and (< -1 k (length toks))
+                                            (equal (sqlite-pure::tok-value (aref toks k)) "."))))
+                       (loop for k below (length toks)
+                             for tk = (aref toks k)
+                             when (and (member (sqlite-pure::tok-kind tk) '(:id :string))
+                                       (string-equal (princ-to-string (sqlite-pure::tok-value tk)) name)
+                                       (not (dot-p (1- k))) (not (dot-p (1+ k))))
+                               return (sqlite-pure::tok-pos tk))))))
                (find-ident (name &optional before-paren (update-p (string-prefix-ci-p "UPDATE" (string-left-trim " " sql))))
                  (let ((toks (ignore-errors (sqlite-pure::tokenize sql))))
                    (when toks
@@ -653,7 +665,11 @@ sqlite3_prepare would take them one after another."
                 ((starts-with-p msg "unknown database ")
                  (find-ident (subseq msg 17)))
                 ((starts-with-p msg "ambiguous column name: ")
-                 (find-ident (subseq msg 23)))
+                 (let* ((name (subseq msg 23)) (dot (position #\. name :from-end t)))
+                   (if dot
+                       (or (find-qualified (subseq name 0 dot) (subseq name (1+ dot)))
+                           (find-ident (subseq name (1+ dot))))
+                       (or (find-bare name) (find-ident name)))))
                 ((starts-with-p msg "no such function: ")
                  (find-ident (subseq msg 18) t))
                 ((starts-with-p msg "wrong number of arguments to function ")
@@ -1889,7 +1905,8 @@ its phase prefix and context, as save_err_msg builds it)."
 
 (defun toplevel ()
   "Entry point for a saved image or a script: arguments from the command line."
-  (setf sqlite-pure::*where-trace* (sb-ext:posix-getenv "SQLP_WHERETRACE"))
+  (setf sqlite-pure::*where-trace* (sb-ext:posix-getenv "SQLP_WHERETRACE")
+        sqlite-pure::*flatten* (not (sb-ext:posix-getenv "SQLP_NO_FLATTEN")))
   (let* ((argv sb-ext:*posix-argv*)
          (pos (position "--end-toplevel-options" argv :test #'string=))
          (name (or (sb-ext:posix-getenv "SQLP_ARGV0") (first argv) "sqlp"))

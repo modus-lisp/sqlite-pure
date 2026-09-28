@@ -54,10 +54,51 @@ def gen_schema(r):
                 vals.append(str(v))
             out.append("INSERT OR IGNORE INTO %s VALUES(%s);" % (name, ", ".join(vals)))
         tables.append((name, cols))
+        out.append("CREATE VIEW v_%s AS SELECT * FROM %s;" % (name, name))
     return tables, out
 
 def rand_value(r):
     return r.choice([str(r.randint(0, 8)), "'a'", "'x'", "'10'", "NULL", "2.5"])
+
+def gen_subquery(r, name, cols, tables, depth=0):
+    """A FROM subquery over NAME: returns (sql, column names)."""
+    shape = r.random()
+    if shape < 0.12:
+        return "(SELECT * FROM %s)" % name, list(cols)
+    if shape < 0.2 and depth == 0:
+        inner, icols = gen_subquery(r, name, cols, tables, depth + 1)
+        pick = r.sample(icols, r.randint(1, len(icols)))
+        return "(SELECT %s FROM %s AS s%d)" % (", ".join(pick), inner, depth), pick
+    if shape < 0.28 and depth == 0:
+        return "v_%s" % name, list(cols)          # a view: SELECT * FROM name
+    sub_cols = r.sample(cols, r.randint(1, len(cols)))
+    exprs = list(sub_cols)
+    names = list(sub_cols)
+    if r.random() < 0.25:
+        c = r.choice(cols)
+        exprs.append(r.choice(["%s + 1" % c, "%s || 'z'" % c, "5", "%s COLLATE NOCASE" % c, "upper(%s)" % c]) + " AS e0")
+        names.append("e0")
+    frm = name
+    if r.random() < 0.15 and len(tables) > 1:
+        other = r.choice([t for t in tables if t[0] != name])
+        if r.random() < 0.5:
+            frm = "%s, %s AS j" % (name, other[0])
+        else:
+            frm = "%s LEFT JOIN %s AS j ON j.%s = %s.%s" % (name, other[0], r.choice(other[1]), name, r.choice(cols))
+        exprs = ["%s.%s" % (name, e) if e in cols else e.replace(" AS e0", "").replace("(" , "(%s." % name, 1) + " AS e0" if "(" in e else ("%s.%s" % (name, e) if e.split(" ")[0] in cols else e) for e in exprs]
+    tail = ""
+    k = r.random()
+    if k < 0.3:
+        tail += " WHERE %s > %s" % ("%s.%s" % (name, r.choice(cols)), rand_value(r))
+    if k > 0.85:
+        return "(SELECT %s, count(*) AS n FROM %s GROUP BY %s)" % (sub_cols[0], name, sub_cols[0]), [sub_cols[0], "n"]
+    if 0.75 < k <= 0.85:
+        return "(SELECT DISTINCT %s FROM %s%s)" % (", ".join(sub_cols), name, tail), sub_cols
+    if r.random() < 0.15:
+        tail += " ORDER BY %s" % r.choice(sub_cols)
+        if r.random() < 0.5:
+            tail += " LIMIT %d" % r.randint(1, 20)
+    return "(SELECT %s FROM %s%s)" % (", ".join(exprs), frm, tail), names
 
 def gen_query(r, tables):
     k = r.randint(1, min(3, len(tables)))
@@ -65,13 +106,9 @@ def gen_query(r, tables):
     aliases = ["a", "b", "c", "d"]
     srcs = []
     for i, (name, cols) in enumerate(picked):
-        if r.random() < 0.1 and not os.environ.get("PLANFUZZ_NO_SUBQ"):
-            # a subquery in FROM
-            sub_cols = r.sample(cols, r.randint(1, len(cols)))
-            where = ""
-            if r.random() < 0.5:
-                where = " WHERE %s > %s" % (r.choice(sub_cols), rand_value(r))
-            srcs.append(("(SELECT %s FROM %s%s)" % (", ".join(sub_cols), name, where), aliases[i], sub_cols))
+        if r.random() < 0.15 and not os.environ.get("PLANFUZZ_NO_SUBQ"):
+            srcs.append((gen_subquery(r, name, cols, tables), aliases[i], None))
+            srcs[-1] = (srcs[-1][0][0], aliases[i], srcs[-1][0][1])
         else:
             srcs.append((name, aliases[i], cols))
     def col(i=None):
@@ -132,9 +169,9 @@ def run(exe, script):
         path = f.name
     try:
         p = subprocess.run([exe, ":memory:"], stdin=open(path), capture_output=True, timeout=300)
-        return p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")
+        return (p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace"))
     except subprocess.TimeoutExpired:
-        return "TIMEOUT"
+        return ("TIMEOUT", "")
     finally:
         os.unlink(path)
 
@@ -149,27 +186,35 @@ def main():
         script = "\n".join(schema) + "\n"
         for i, q in enumerate(queries):
             script += ".print ==%d EQP\nEXPLAIN QUERY PLAN %s;\n.print ==%d ROWS\n%s;\n" % (i, q, i, q)
-        a, b = run(ref, script), run(ours, script)
+        (a, ea), (b, eb) = run(ref, script), run(ours, script)
         total += len(queries)
+        if a == b and ea != eb:
+            fails += 1
+            la, lb = ea.split("\n"), eb.split("\n")
+            k = next((j for j in range(min(len(la), len(lb))) if la[j] != lb[j]), min(len(la), len(lb)))
+            print("seed %d: errors differ" % seed)
+            print("    sqlite3:", (la[k] if k < len(la) else "<end>")[:150])
+            print("    sqlp:   ", (lb[k] if k < len(lb) else "<end>")[:150])
         if a != b:
-            # report the first differing query
-            sa, sb = a.split("\n"), b.split("\n")
-            for k in range(min(len(sa), len(sb))):
-                if sa[k] != sb[k]:
-                    # find the query marker above k
-                    m = k
-                    while m > 0 and not sa[m].startswith("=="):
-                        m -= 1
-                    qi = int(sa[m][2:].split()[0]) if sa[m].startswith("==") else -1
+            # report the first query whose section differs
+            def sections(out):
+                d, cur = {}, None
+                for line in out.split("\n"):
+                    if line.startswith("==") and line[2:].split(" ")[0].isdigit():
+                        cur = int(line[2:].split(" ")[0])
+                    d.setdefault(cur, []).append(line)
+                return d
+            sa, sb = sections(a), sections(b)
+            for qi in sorted(set(sa) | set(sb), key=lambda k: -1 if k is None else k):
+                if sa.get(qi) != sb.get(qi):
+                    la, lb = sa.get(qi, []), sb.get(qi, [])
+                    k = next((j for j in range(min(len(la), len(lb))) if la[j] != lb[j]), min(len(la), len(lb)))
                     fails += 1
-                    print("seed %d query %d (%s)" % (seed, qi, sa[m][2:].strip()))
-                    print("   ", queries[qi] if qi >= 0 else "?")
-                    print("    sqlite3:", sa[k][:150])
-                    print("    sqlp:   ", sb[k][:150])
+                    print("seed %d query %s" % (seed, qi))
+                    print("   ", queries[qi] if qi is not None else "(schema)")
+                    print("    sqlite3:", (la[k] if k < len(la) else "<end>")[:150])
+                    print("    sqlp:   ", (lb[k] if k < len(lb) else "<end>")[:150])
                     break
-            else:
-                fails += 1
-                print("seed %d: output lengths differ" % seed)
     print("planfuzz: %d seeds, %d queries, %d seeds differ" % (n, total, fails))
     sys.exit(1 if fails else 0)
 

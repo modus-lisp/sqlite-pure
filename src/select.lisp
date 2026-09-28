@@ -128,7 +128,11 @@ columns are decoded; the others read as NULL."
   scan-index      ; EQP: thunk -> the index (or :rowid) a full scan reads in order, if any
   row-est         ; a derived source's estimated row count (LogEst): its nSelectRow
   correlated      ; a derived source that reads the enclosing query
-  recursive-ref)  ; a recursive CTE's reference to itself
+  recursive-ref   ; a recursive CTE's reference to itself
+  derived-sel     ; a subquery's or view's SEL, for WHERE-term push-down
+  coroutine       ; EXPLAIN QUERY PLAN called it a CO-ROUTINE
+  was-left        ; a LEFT JOIN simplified before this source was made
+  rebuild)        ; (lambda (sel)) -> this source compiled from SEL instead, same plan node
 
 (defun make-table-src (table &optional alias)
   (let ((cols (table-columns table)))
@@ -152,16 +156,23 @@ columns are decoded; the others read as NULL."
   (make-src :name name :columns (coerce columns 'vector)
             :affinities (coerce affinities 'vector)
             :collations (coerce collations 'vector)
-            :rowid-p nil))
+            :rowid-p nil
+            ;; colUsed, as for a table: an automatic index on the source
+            ;; holds the columns the query reads
+            :used (make-array (length columns) :element-type 'bit :initial-element 0)))
 
-(defun select-derived-source (sel alias scope &optional rename)
+(defun select-derived-source (sel alias scope &optional rename materialized)
+  "A FROM source from SEL.  MATERIALIZED: SQLite stores its rows in a table
+first (rather than running it as a co-routine); a compound's rows then get
+its columns' affinities as they are stored."
   (multiple-value-bind (fn cols correlated) (compile-select sel scope)
     (let* ((names (if rename
                       (progn (unless (= (length rename) (length cols))
                                (sql-error "expected ~d columns for ~a but got ~d"
                                           (length rename) alias (length cols)))
                              rename)
-                      (mapcar #'first cols)))
+                      ;; sqlite3ColumnsFromExprList: a repeated name gets ":N"
+                      (dedupe-names (mapcar #'first cols))))
            (src (derived-src alias names (mapcar #'second cols) (mapcar #'third cols)))
            (cache nil))
       (make-fsrc :src src
@@ -171,6 +182,12 @@ columns are decoded; the others read as NULL."
                             (if cache
                                 (cdr cache)
                                 (let ((rows (rows-to-vectors (funcall fn env))))
+                                  (when (and materialized (sel-ops sel))
+                                    (let ((affs (coerce (mapcar #'second cols) 'vector)))
+                                      (dolist (r rows)
+                                        (dotimes (k (length affs))
+                                          (when (svref affs k)
+                                            (setf (svref r k) (apply-affinity (svref r k) (svref affs k))))))))
                                   (unless correlated (setf cache (cons t rows)))
                                   rows)))))))
 
@@ -265,12 +282,42 @@ each other."
                                    (lambda (fn) (materialize-cte cte fn))
                                    (progn (materialize-cte cte) (cte-rows cte)))))))))
 
+(defun rebuildable-derived-source (detail sel build)
+  "A derived source from SEL, compiled by BUILD under a new plan node
+DETAIL; it can be compiled again from an amended SEL (push-down), its plan
+note refilled in place."
+  (let* ((coroutine *eqp-coroutine-ok*)
+         (node (eqp-note detail +eqp-materialize+))
+         (noted-before (and *eqp* (hash-table-p *eqp-noted*)
+                            (loop for k being the hash-keys of *eqp-noted* collect k)))
+         (ctes-before *eqp-ctes-done*))
+    (flet ((run (sel) (let ((*eqp-parent* (or node *eqp-parent*)) (*eqp-coroutine-ok* coroutine))
+                        (funcall build sel))))
+      (let* ((fs (run sel))
+             (noted-by (and noted-before
+                            (loop for k being the hash-keys of *eqp-noted*
+                                  unless (member k noted-before :test #'eq) collect k)))
+             (ctes-by (ldiff *eqp-ctes-done* ctes-before)))
+        (setf (fsrc-derived-sel fs) sel
+              (fsrc-coroutine fs) coroutine
+              (fsrc-rebuild fs)
+              (lambda (new-sel)
+                ;; forget what the first compile described
+                (when node (setf (eqp-node-children node) '()))
+                (dolist (k noted-by) (remhash k *eqp-noted*))
+                (setf *eqp-ctes-done* (set-difference *eqp-ctes-done* ctes-by))
+                (let ((new (run new-sel)))
+                  (setf (fsrc-derived-sel new) new-sel (fsrc-rebuild new) nil
+                        (fsrc-coroutine new) coroutine)
+                  new)))
+        fs))))
+
 (defun eqp-labelled (fs label)
   (setf (fsrc-label fs) label)
   fs)
 
 (defun make-fsrc-for (item scope)
-  (destructuring-bind (&key source join on using natural) item
+  (destructuring-bind (&key source join on using natural display invisible was-left) item
     (let ((fs
             (ecase (car source)
               (:table
@@ -285,15 +332,18 @@ each other."
                       (dbstat-fsrc alias '()))
                      (t (let ((table (lookup-table *db* name t schema)))
                           (if (table-view-select table)
-                              (let ((*ctes* '()))
-                                (with-eqp-node ((format nil "~a ~a" (eqp-derived-kind) (or alias name))
-                                                +eqp-materialize+)
-                                  (let ((*eqp-coroutine-ok* nil))
-                                    (eqp-labelled
-                                     (select-derived-source (table-view-select table) (or alias name)
-                                                            (make-scope)
-                                                            (table-view-columns table))
-                                     (or alias name)))))
+                              (let ((shown (or display alias name)))
+                                (rebuildable-derived-source
+                                 ;; "%!S": a view is named by its name, not its alias
+                                 (format nil "~a ~@[~a.~]~a" (eqp-derived-kind) schema name)
+                                 (table-view-select table)
+                                 (lambda (sel)
+                                   (let ((materialized (not *eqp-coroutine-ok*))
+                                         (*ctes* '()) (*eqp-coroutine-ok* nil))
+                                     (eqp-labelled
+                                      (select-derived-source sel (or alias name) (make-scope)
+                                                             (table-view-columns table) materialized)
+                                      shown)))))
                               (let ((hint (fifth source)))
                                 (make-fsrc :src (make-table-src table alias) :table table
                                            :index-hint
@@ -302,11 +352,16 @@ each other."
                                                                  :key #'index-name :test #'name=)
                                                            (sql-error "no such index: ~a" (second hint))))))))))))))
               (:subquery
-               (let ((label (or (third source)
+               (let ((label (or display
+                                (and (not invisible) (third source))
                                 (format nil "(subquery-~a)" (eqp-sel-id (second source))))))
-                 (with-eqp-node ((format nil "~a ~a" (eqp-derived-kind) label) +eqp-materialize+)
-                   (let ((*eqp-coroutine-ok* nil))
-                     (eqp-labelled (select-derived-source (second source) (third source) scope) label)))))
+                 (rebuildable-derived-source
+                  (format nil "~a ~a" (eqp-derived-kind) label)
+                  (second source)
+                  (lambda (sel)
+                    (let ((materialized (not *eqp-coroutine-ok*)) (*eqp-coroutine-ok* nil))
+                      (eqp-labelled (select-derived-source sel (third source) scope nil materialized)
+                                    label))))))
               (:join-group
                (let ((*eqp-coroutine-ok* nil))
                  (select-derived-source
@@ -343,6 +398,9 @@ each other."
                    ((lookup-table *db* name nil) (sql-error "'~a' is not a function" name))
                    (t (sql-error "no such table: ~a" name))))))))
       (setf (fsrc-join fs) join (fsrc-on fs) on (fsrc-using fs) using (fsrc-natural fs) natural)
+      (when display (setf (src-display (fsrc-src fs)) display))
+      (when invisible (setf (src-invisible (fsrc-src fs)) t))
+      (when was-left (setf (fsrc-was-left fs) t))
       fs)))
 
 ;;; ------------------------------------------------------------------
@@ -350,6 +408,9 @@ each other."
 
 (defun split-conjuncts (e)
   (cond ((null e) '())
+        ;; a flattened LEFT JOIN subquery's WHERE: each conjunct stays marked
+        ((eq (car e) :outer-on)
+         (mapcar (lambda (c) (list :outer-on (second e) c)) (split-conjuncts (third e))))
         ((and (eq (car e) :binary) (eq (second e) :and))
          (append (split-conjuncts (third e)) (split-conjuncts (fourth e))))
         (t (list e))))
@@ -368,6 +429,10 @@ subquery (whose references we do not chase)."
                                   (walk (alias-expr scope (third x)))))))
                    (:srccol (pushnew (second x) refs))
                    ((:subquery :exists) (return-from expr-refs :all))
+                   (:ifnullrow (let ((si (position (second x) (scope-srcs scope)
+                                                   :key #'src-name :test #'equal)))
+                                 (when si (pushnew si refs))
+                                 (walk (third x))))
                    (:in (walk (second x))
                     (if (eq (car (third x)) :list)
                         (mapc #'walk (second (third x)))
@@ -1086,7 +1151,9 @@ the newest on ties; or NIL."
          (let ((tname (second c)) (any nil))
            (loop for s in (scope-srcs scope)
                  for si from 0
-                 do (when (or (null tname) (and (src-name s) (name= tname (src-name s))))
+                 do (when (if tname
+                              (and (src-name s) (name= tname (src-name s)))
+                              (not (src-invisible s)))
                       (setf any t)
                       (loop for name across (src-columns s)
                             for ci from 0
@@ -1096,8 +1163,8 @@ the newest on ties; or NIL."
            (unless any
              (if tname (sql-error "no such table: ~a" tname) (sql-error "no tables specified")))))
         (:expr
-         (destructuring-bind (e alias text) (cdr c)
-           (push (list e (or alias (result-column-name e scope text))) out)))))))
+         (destructuring-bind (e alias text &optional name) (cdr c)
+           (push (list e (or alias name (result-column-name e scope text))) out)))))))
 
 (defun result-column-name (e scope text)
   (let ((e* e))
@@ -1346,7 +1413,8 @@ source SI is not NULL?"
              (when (consp x)
                (case (car x)
                  ((:col :srccol) (multiple-value-bind (s) (column-ref x scope) (eql s si)))
-                 ((:isnull :in :case :fn :winfn :rowvalue :like :subquery :exists :lit :param :raise) nil)
+                 ((:isnull :in :case :fn :winfn :rowvalue :like :subquery :exists :lit :param :raise
+                   :outer-on) nil)
                  (:between (walk (second x)))
                  (:binary
                   (case (second x)
@@ -1362,6 +1430,7 @@ source SI is not NULL?"
            (top (x)
              (let ((x (skip x)))
                (cond ((null x) nil)
+                     ((eq (car x) :outer-on) nil)
                      ((and (eq (car x) :isnull) (third x)) (walk (second x)))
                      ((and (eq (car x) :binary) (eq (second x) :isnot) (null-literal-p (fourth x)))
                       (walk (third x)))
@@ -1399,7 +1468,8 @@ of a table an outer join can make NULL, as the joins stand before they are
 simplified) is the constant FALSE / TRUE, reading no column."
   (labels ((nullable-src-p (si)
              (let ((fs (nth si fsrcs)))
-               (or (member (fsrc-join fs) '(:left :full))
+               ;; as resolved: before any outer join was simplified
+               (or (member (fsrc-join fs) '(:left :full)) (fsrc-was-left fs)
                    (some (lambda (g) (member (fsrc-join g) '(:right :full)))
                          (nthcdr (1+ si) fsrcs)))))
            (can-be-null-p (x)
@@ -1408,8 +1478,11 @@ simplified) is the constant FALSE / TRUE, reading no column."
              (case (car x)
                (:lit (eq (second x) :null))
                ((:col :srccol)
-                (multiple-value-bind (si ci) (column-ref x scope)
-                  (or (null si) (nullable-src-p si) (column-can-be-null-p si ci scope))))
+                ;; a column the flattener substituted was a subquery's column
+                ;; when SQLite resolved the query: it could be NULL
+                (or (eq (fourth x) :subst)
+                    (multiple-value-bind (si ci) (column-ref x scope)
+                      (or (null si) (nullable-src-p si) (column-can-be-null-p si ci scope)))))
                (t t)))
            (walk (x)
              (cond ((atom x) x)
@@ -1471,11 +1544,24 @@ its loops are planned."
                        (loop for (e) in order unless (int32-literal-p e) collect e)))
       (when e (ignore-errors (compile-expr e dry))))))
 
+(defvar *result-aliases* :unknown
+  "The AS aliases of the SELECT whose ORDER BY is being resolved, or :UNKNOWN.")
+
+(defvar *eqp-first-loop* nil
+  "EXPLAIN QUERY PLAN: (node parent fsrc auto-index-p constant-terms-p) of
+the outermost loop just planned.")
+
+(defvar *core-in-compound* nil
+  "The SELECT being compiled is one arm of a compound (flattener rule 15).")
+
+(defvar *flatten* (not (sb-ext:posix-getenv "SQLP_NO_FLATTEN"))
+  "Merge FROM subqueries into the queries that use them (flatten.lisp).")
+
 (defun compile-core (core scope &rest keys &key order limit offset limit-one)
   "Compile one SELECT core (see COMPILE-CORE-1); the loops it plans raise
 the estimated repetition count (nQueryLoop) only for what they contain."
   (declare (ignore order limit offset limit-one))
-  (let ((*query-loop* *query-loop*))
+  (let ((*query-loop* *query-loop*) (*eqp-first-loop* nil))
     (apply #'compile-core-1 core scope keys)))
 
 (defun compile-core-1 (core scope &key order limit offset limit-one)
@@ -1483,6 +1569,8 @@ the estimated repetition count (nQueryLoop) only for what they contain."
 list of (name affinity collation), fn (lambda (parent-env)) -> rows."
   (when (and (consp core) (eq (car core) :values))
     (return-from compile-core-1 (compile-values-core (second core) scope order limit offset)))
+  (when *flatten*
+    (multiple-value-setq (core order limit) (flatten-subqueries core order limit)))
   (let ((fast (multiple-value-list (count-star-fast-path core order limit offset))))
     (when (first fast) (return-from compile-core-1 (values-list fast))))
   (let* ((fsrcs (let ((items (select-core-from core)))
@@ -1513,12 +1601,15 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                   (loop for c in (select-core-cols core)
                         when (and (eq (car c) :expr) (third c))
                           collect (cons (third c) (second c)))))
+         (_hw (when *flatten* (setf core (having-to-where core rcols cscope))))
+         (*result-aliases* (loop for c in (select-core-cols core)
+                                 when (and (eq (car c) :expr) (third c)) collect (third c)))
          (group (select-core-group core))
          (having (select-core-having core))
          (agg-p (or group having
                     (some (lambda (rc) (contains-aggregate-p (first rc))) rcols)
                     (some (lambda (o) (contains-aggregate-p (first o))) order))))
-    (declare (ignore _ _0))
+    (declare (ignore _ _0 _hw))
     (when (and having (not group) (not agg-p))
       (sql-error "a GROUP BY clause is required before HAVING"))
     (multiple-value-bind (levels finals order-done plan-info)
@@ -1539,6 +1630,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                                              when (and on (not (member (fsrc-join fs) '(:left :right :full))))
                                                collect on)))
                                cscope)))
+            (when *flatten* (push-down-where-terms fsrcs cscope (select-core-where core) ons))
             (multiple-value-bind (l f) (build-levels fsrcs cscope (select-core-where core) ons)
               (let* ((plan *plan-result*)
                      (sat (if plan (plan-n-ob-sat plan) 0)))
@@ -1594,6 +1686,17 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
             (when (and distinct (not (eq kind :distinct-group)) plan
                        (not (member (plan-distinct plan) '(:unique :ordered))))
               (eqp-note "USE TEMP B-TREE FOR DISTINCT" +eqp-distinct+))
+            ;; fixDistinctOpenEph turns the DISTINCT table's open, and the
+            ;; OP_Explain after it, into no-ops.  That Explain is meant to be
+            ;; the temp b-tree's; when the outermost loop is a co-routine and
+            ;; nothing is coded before its own note, it is that loop's.
+            (when (and distinct (not agg-p) (not (eq kind :distinct-group)) plan
+                       (member (plan-distinct plan) '(:unique :ordered))
+                       *eqp-first-loop*)
+              (destructuring-bind (node parent fs auto-p const-p) *eqp-first-loop*
+                (when (and node parent (fsrc-coroutine fs) (not auto-p) (not const-p)
+                           (every (lambda (f) (fsrc-derived-sel f)) fsrcs))
+                  (setf (eqp-node-children parent) (remove node (eqp-node-children parent))))))
             (when (and order-specs (not order-done)
                        ;; ORDER BY = GROUP BY: satisfied when the grouping
                        ;; sorted, or the loops deliver the groups sorted
@@ -1844,10 +1947,16 @@ EXPRS, so that SQLite would need no temp b-tree?"
                         (ordinal k) (length rcols)))
            (1- v)))
         ((and (eq (car e) :col) (null (second e)))
-         (position-if (lambda (rc) (and (not (eq (car (first rc)) :srccol))
-                                        (name= (second rc) (third e))
-                                        (not (equal (first rc) e))))
-                      rcols))
+         (if (listp *result-aliases*)
+             ;; resolveAsName: only an AS alias; any other name is an
+             ;; expression, resolved against the FROM clause
+             (position-if (lambda (rc) (and (member (second rc) *result-aliases* :test #'name=)
+                                            (name= (second rc) (third e))))
+                          rcols)
+             (position-if (lambda (rc) (and (not (eq (car (first rc)) :srccol))
+                                            (name= (second rc) (third e))
+                                            (not (equal (first rc) e))))
+                          rcols)))
         (t nil)))
 
 (defun compile-values-core (rows scope order limit offset)
@@ -2020,9 +2129,10 @@ unqualified, at any depth."
     (let ((cores (sel-cores sel)))
       (if (null (cdr cores))
           (multiple-value-bind (fn cols cscope)
-              (compile-core (first cores) scope :order (sel-order sel)
-                                                :limit (sel-limit sel) :offset (sel-offset sel)
-                                                :limit-one limit-one)
+              (let ((*core-in-compound* nil))
+                (compile-core (first cores) scope :order (sel-order sel)
+                                                  :limit (sel-limit sel) :offset (sel-offset sel)
+                                                  :limit-one limit-one))
             (values fn cols (and cscope (scope-outer-ref cscope))))
           (compile-compound sel scope)))))
 
@@ -2040,7 +2150,8 @@ unqualified, at any depth."
                                                          (:intersect "INTERSECT USING TEMP B-TREE")
                                                          (:except "EXCEPT USING TEMP B-TREE"))
                                                        "LEFT-MOST SUBQUERY"))
-                                     (multiple-value-list (compile-core core scope))))))
+                                     (multiple-value-list
+                                      (let ((*core-in-compound* t)) (compile-core core scope)))))))
          (_ (when (sel-order sel) (eqp-note "USE TEMP B-TREE FOR ORDER BY" +eqp-order+)))
          (cols (second (first compiled)))
          (n (length cols))

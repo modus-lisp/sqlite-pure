@@ -308,16 +308,15 @@ connection shadows the built-in of that name."
 (defsqlfun "zeroblob" (1 1) (args)
   (let ((n (value-to-integer (first args)))) (make-octets (if (integerp n) (max 0 n) 0))))
 
-(defvar *sql-random-state* (make-random-state t))
-
 (defsqlfun "random" (0 0) (args)
   (declare (ignore args))
-  (to-signed64 (random (expt 2 64) *sql-random-state*)))
+  (to-signed64 (random (expt 2 64) (sql-random-state))))
 
 (defsqlfun "randomblob" (1 1) (args)
   (let* ((n (max 1 (let ((n (value-to-integer (first args)))) (if (integerp n) n 1))))
-         (b (make-octets n)))
-    (dotimes (i n b) (setf (aref b i) (random 256 *sql-random-state*)))))
+         (b (make-octets n))
+         (state (sql-random-state)))
+    (dotimes (i n b) (setf (aref b i) (random 256 state)))))
 
 (defsqlfun "round" (1 2) (args)
   (let ((x (first args)) (digits (if (cdr args) (second args) 0)))

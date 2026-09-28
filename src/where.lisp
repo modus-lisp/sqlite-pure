@@ -235,6 +235,7 @@ table.  Returns the set of fixed column nodes."
                            (setf consts (append consts (list (list s c col (col-aff col) value))))))))
                    (find-consts (e)
                      (cond ((null e))
+                           ((eq (car e) :outer-on))
                            ((and (eq (car e) :binary) (eq (second e) :and))
                             (find-consts (fourth e)) (find-consts (third e)))
                            ((and (eq (car e) :binary) (eq (second e) :eq))
@@ -263,7 +264,7 @@ table.  Returns the set of fixed column nodes."
                    (walk (e)
                      (when (consp e)
                        (case (car e)
-                         ((:subquery :exists) nil)
+                         ((:subquery :exists :outer-on) nil)
                          ((:col :srccol) (rewrite-one e has-blob))
                          (t
                           (when (and has-blob (eq (car e) :binary)
@@ -304,7 +305,7 @@ table.  Returns the set of fixed column nodes."
   scope nsrc)
 
 (defun skip-collate (e)
-  (loop while (and (consp e) (eq (car e) :collate)) do (setf e (second e)))
+  (loop while (and (consp e) (member (car e) '(:collate :icollate))) do (setf e (second e)))
   e)
 
 (defun likelihood-wrapper (e)
@@ -342,6 +343,11 @@ correlated subquery counts as reading all of them."
                                  ((and (null depth) (null (second x)) (alias-expr scope (third x)))
                                   (walk (alias-expr scope (third x)))))))
                    (:srccol (unless (fixed-col-p x) (setf m (logior m (ash 1 (second x))))))
+                   ;; IF_NULL_ROW reads its table's row
+                   (:ifnullrow (let ((si (position (second x) (scope-srcs scope)
+                                                   :key #'src-name :test #'equal)))
+                                 (when si (setf m (logior m (ash 1 si))))
+                                 (walk (third x))))
                    ((:subquery :exists) (when (subquery-correlated-p (second x) scope)
                                           (setf m all)))
                    (:in (walk (second x))
@@ -935,6 +941,13 @@ an index definition's WHERE compares equal to a query's."
            (list :c (string-upcase-ascii (if (eq (third e) :rowid) "rowid" (svref (src-columns s) (third e)))) nil)))
         (t (mapcar (lambda (x) (canonical-expr x si)) e))))
 
+(defun pushed-fixed-eq-p (term)
+  "A pushed-down copy of col = X whose column the outer query fixed: still
+an == term on a column, of a cursor the subquery does not have."
+  (let ((e (or (wt-origin term) (wt-expr term))))
+    (and (eq (car e) :binary) (member (second e) '(:eq :is))
+         (eq (car (skip-collate (third e))) :pushed-fixed))))
+
 (defun term-covered-by-index-p (term ws wx)
   "sqlite3ExprCoveredByIndex: every column of WS the term reads is in WX."
   (let ((scope (wc-scope *wc*)) (ok t))
@@ -1015,7 +1028,8 @@ an index definition's WHERE compares equal to a query's."
                                    (if (<= (wt-truth term) 0)
                                        (incf n-lookup (wt-truth term))
                                        (progn (decf n-lookup)
-                                              (when (member (wt-op term) '(:eq :is))
+                                              (when (or (member (wt-op term) '(:eq :is))
+                                                        (pushed-fixed-eq-p term))
                                                 (decf n-lookup 19)))))
                           (setf (wl-r-run lp) (log-est-add (wl-r-run lp) n-lookup))))
                       (loop-output-adjust lp r-size)
@@ -1348,7 +1362,7 @@ X=? terms)."
 (defun trace-loop (lp)
     (let ((ws (svref *wsrcs* (wl-src lp))))
       (format *error-output* "~a ~a f ~6,'0x N ~d eq ~d cost ~d,~d,~d prereq ~b~%"
-              (src-name (fsrc-src (ws-fsrc ws)))
+              (src-label (fsrc-src (ws-fsrc ws)))
               (let ((wx (wl-wx lp))) (cond ((null wx) "-") ((wx-ipk wx) "IPK") (t (wx-name wx))))
               (wl-flags lp) (length (wl-lterms lp)) (wl-n-eq lp)
               (wl-r-setup lp) (wl-r-run lp) (wl-n-out lp) (wl-prereq lp))
@@ -1858,8 +1872,8 @@ runs, then searched."
 
 (defun source-display-name (fs)
   (if (fsrc-table fs)
-      (src-name (fsrc-src fs))
-      (or (fsrc-label fs) (src-name (fsrc-src fs)) "(subquery)")))
+      (src-label (fsrc-src fs))
+      (or (fsrc-label fs) (src-label (fsrc-src fs)) "(subquery)")))
 
 (defun omit-noop-joins (loops plan fsrcs req)
   "whereOmitNoopJoin: drop, innermost first, each LEFT JOIN loop (not the
@@ -1886,7 +1900,14 @@ DISTINCT.  The reverse-scan bits stay where they were, as in SQLite."
   "Plan FSRCS and return (values levels final-filters)."
   (let* ((n (length fsrcs))
          (conjuncts
-           (append (mapcar (lambda (c) (list c nil nil)) (split-conjuncts where))
+           (append (mapcar (lambda (c)
+                             (if (eq (car c) :outer-on)
+                                 (list (third c)
+                                       (position (second c) fsrcs :key (lambda (fs) (src-name (fsrc-src fs)))
+                                                                  :test #'equal)
+                                       nil)
+                                 (list c nil nil)))
+                           (split-conjuncts where))
                    (loop for fs in fsrcs for on in ons for i from 0
                          append (let ((outer (member (fsrc-join fs) '(:left :right :full))))
                                   (mapcar (lambda (c) (list c (and outer i) (and (not outer) i)))
@@ -1942,8 +1963,16 @@ DISTINCT.  The reverse-scan bits stay where they were, as in SQLite."
                                                              (cond (right nil) (left match-asts) (t filter-asts)))
                                                 scope))
                              (t
-                              (eqp-table-note (explain-loop lp ws (source-display-name fs)
-                                                            (or (getf req :flags) 0)))
+                              (let ((node (eqp-table-note (explain-loop lp ws (source-display-name fs)
+                                                                        (or (getf req :flags) 0)))))
+                                (when (zerop k)
+                                  (setf *eqp-first-loop*
+                                        (list node *eqp-parent* fs
+                                              (flag-p (wl-flags lp) +where-auto-index+)
+                                              ;; constant terms WhereBegin codes first
+                                              (some (lambda (term) (and (wt-base term) (not (wt-virtual term))
+                                                                        (zerop (wt-prereq-all term))))
+                                                    (wc-terms *wc*))))))
                               (setf (fsrc-scan-index fs)
                                     (let ((wx (wl-wx lp)))
                                       (lambda () (cond ((flag-p (wl-flags lp) +where-ipk+) :rowid)
@@ -1953,8 +1982,7 @@ DISTINCT.  The reverse-scan bits stay where they were, as in SQLite."
                                      :right-p (and right t)
                                      :match (mapcar (lambda (c) (compile-expr (substitute-fixed c) scope)) match-asts)
                                      :filters (mapcar (lambda (c) (compile-expr (substitute-fixed c) scope)) filter-asts)
-                                     :nullrow (make-array (1+ (src-ncols (fsrc-src fs)))
-                                                          :initial-element :null))
+                                     :nullrow (make-null-row (1+ (src-ncols (fsrc-src fs)))))
                          levels))
                  (setf bound (logior bound (ash 1 i))
                        not-ready (logand not-ready (lognot (ash 1 i))))))

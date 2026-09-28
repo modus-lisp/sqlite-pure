@@ -28,6 +28,28 @@
   order      ; list of (expr desc collate nulls)
   limit offset)
 
+(defvar *keyword-literals* (make-hash-table :test #'eq :weakness :key)
+  "The (:lit 1) / (:lit 0) nodes written TRUE / FALSE: identifiers until
+SQLite resolves them, so not yet always-false while parsing.")
+
+(defun keyword-literal (v)
+  (let ((e (list :lit v)))
+    (setf (gethash e *keyword-literals*) t)
+    e))
+
+(defun always-false-p (e &optional parsing)
+  "ExprAlwaysFalse: an integer literal 0 (and, once resolved, FALSE)."
+  (and (consp e) (eq (car e) :lit) (eql (second e) 0)
+       (not (and parsing (gethash e *keyword-literals*)))))
+
+(defun sql-and (a b &optional parsing)
+  "sqlite3ExprAnd: A AND B, except that an always-false operand makes the
+whole of it the literal 0."
+  (cond ((null a) b)
+        ((null b) a)
+        ((or (always-false-p a parsing) (always-false-p b parsing)) (list :lit 0))
+        (t (list :binary :and a b))))
+
 (defun peek-tok (p &optional (k 0))
   (let ((toks (ps-toks p)))
     (aref toks (min (+ (ps-pos p) k) (1- (length toks))))))
@@ -122,7 +144,7 @@
 
 (defun parse-and (p)
   (let ((e (parse-not p)))
-    (loop while (accept-kw p "AND") do (setf e (list :binary :and e (parse-not p))))
+    (loop while (accept-kw p "AND") do (setf e (sql-and e (parse-not p) t)))
     e))
 
 (defun parse-not (p)
@@ -283,8 +305,8 @@
        (cond
          ((tok-quoted tok) (parse-column-ref p))
          ((accept-kw p "NULL") (list :lit :null))
-         ((accept-kw p "TRUE") (list :lit 1))
-         ((accept-kw p "FALSE") (list :lit 0))
+         ((accept-kw p "TRUE") (keyword-literal 1))
+         ((accept-kw p "FALSE") (keyword-literal 0))
          ((accept-kw p "CURRENT_TIMESTAMP") (list :fn "datetime" (list (list :lit "now")) nil nil nil))
          ((accept-kw p "CURRENT_DATE") (list :fn "date" (list (list :lit "now")) nil nil nil))
          ((accept-kw p "CURRENT_TIME") (list :fn "time" (list (list :lit "now")) nil nil nil))
@@ -324,8 +346,18 @@
          (t (parse-column-ref p))))
       (t (perr p "syntax error")))))
 
+(defvar *ident-positions* (make-hash-table :test #'eq :weakness :key)
+  "Column-name string (by identity, one per token) -> (sql . offset) of the
+reference it names, for sqlite3_error_offset.")
+
+(defun note-ident-position (p name pos)
+  (when (stringp name)
+    (setf (gethash name *ident-positions*) (cons (ps-sql p) pos)))
+  name)
+
 (defun parse-column-ref (p)
-  (let ((a (tok-value (next-tok p))))
+  (let* ((start (tok-pos (peek-tok p)))
+         (a (tok-value (next-tok p))))
     (if (accept-op p ".")
         (if (accept-op p "*")
             (list :star a)
@@ -333,11 +365,13 @@
               (if (accept-op p ".")
                   (if (accept-op p "*")
                       (list :star b)
-                      (list :col b (parse-name p t)))
-                  (list :col a b))))
-        (if (eql (tok-quoted (aref (ps-toks p) (1- (ps-pos p)))) #\")
-            (list :col nil a :quoted)
-            (list :col nil a)))))
+                      (list :col b (note-ident-position p (parse-name p t) start)))
+                  (list :col a (note-ident-position p b start)))))
+        (progn
+          (note-ident-position p a start)
+          (if (eql (tok-quoted (aref (ps-toks p) (1- (ps-pos p)))) #\")
+              (list :col nil a :quoted)
+              (list :col nil a))))))
 
 (defun parse-function-call (p)
   (let ((name (tok-value (next-tok p))))

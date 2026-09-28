@@ -307,7 +307,7 @@ iIdxNoSeek), whose entry goes after the row."
             (error 'sqlite-error :code :full :message "database or disk is full")
             ;; SQLite probes random rowids when the maximum is taken
             (loop repeat 100
-                  for r = (1+ (random +i64-max+))
+                  for r = (1+ (random +i64-max+ (sql-random-state)))
                   unless (table-lookup (table-owner table) (table-root table) r) return r
                   finally (error 'sqlite-error :code :full :message "database or disk is full"))))))
 

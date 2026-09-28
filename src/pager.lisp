@@ -405,7 +405,7 @@ there is)."
 (defun write-journal (db)
   (let* ((ps (db-page-size db))
          (pages (sort (loop for k being the hash-keys of (db-journal db) collect k) #'<))
-         (nonce (random #x100000000))
+         (nonce (random #x100000000 (sql-random-state)))
          (hdr (make-octets 512)))
     (replace hdr #(#xd9 #xd5 #x05 #xf9 #x20 #xa1 #x63 #xd7))
     (put-u32 hdr 8 (length pages))

@@ -232,6 +232,9 @@ columns and rows, and the error that stopped it, if any."
       (t (send "error" (format nil "unknown request ~a" op))))))
 
 (defun main ()
+  ;; each server process is a fresh testfixture: randstr() must not repeat
+  ;; the random sequence saved in the core
+  (setf *random-state* (make-random-state t))
   (let ((*in* (sb-sys:make-fd-stream 0 :input t :element-type '(unsigned-byte 8) :buffering :full))
         (*out* (sb-sys:make-fd-stream 1 :output t :element-type '(unsigned-byte 8) :buffering :full)))
     (loop for req = (read-frame)

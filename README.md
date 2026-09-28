@@ -229,7 +229,12 @@ removal), every candidate loop — full scans, covering-index scans, rowid
 and index lookups with `=`, `IN`, range and `IS NULL` constraints, automatic
 (and partial automatic) indexes — is costed with SQLite's formulas, and the
 path solver picks the join order and one loop per table, counting the cost
-of any sort an `ORDER BY`, `GROUP BY` or `DISTINCT` would need. A lone
+of any sort an `ORDER BY`, `GROUP BY` or `DISTINCT` would need. Subqueries
+and views in `FROM` are flattened into the query that uses them under
+SQLite's rules (including the right side of a `LEFT JOIN`, and moving a
+subquery's `ORDER BY` / `LIMIT` outward); those that stay subqueries get
+copies of the outer `WHERE` terms that constrain only them (push-down), and
+`HAVING` terms that read only `GROUP BY` columns move to `WHERE`. A lone
 `min()`/`max()` reads one end of an index; `count(*)` counts the smallest
 index; `INDEXED BY` and `NOT INDEXED` are honoured. A differential fuzzer
 (`test/planfuzz.py`) compares plans and rows with sqlite3 over random
@@ -343,20 +348,19 @@ SQLite numbers them), compound parts, `SCAN n CONSTANT ROWS`, R-tree and
 table-valued `VIRTUAL TABLE INDEX` lines, and the `USE TEMP B-TREE FOR
 GROUP BY / DISTINCT / ORDER BY` steps. Where the two planners choose alike
 (most single-table and `FROM`-ordered queries) the output is identical;
-where they differ (subquery flattening, the `OR` multi-index optimization,
-`LIKE` prefixes, `sqlite_stat1` statistics) it describes what this library
-does. Plain `EXPLAIN` (VDBE bytecode) has no
+where they differ (the `OR` multi-index optimization, `LIKE` prefixes,
+`sqlite_stat1` statistics) it describes what this library does. Plain `EXPLAIN` (VDBE bytecode) has no
 equivalent here.
 
 ## Not implemented
 
 R-tree `MATCH` geometry callbacks, the ICU tokenizer, FTS5's
 `*`-prefixed diagnostic queries, plain `EXPLAIN` (bytecode listings),
-`ANALYZE` (accepted, writes no `sqlite_stat1`), and in the planner:
-subquery flattening, the `OR` (multi-index) and `LIKE` optimizations,
-skip-scans and Bloom filters.  `fsync` and file locks need SBCL (elsewhere
-`finish-output` is the barrier and locks are no-ops, with cache
-validation still applied).
+`ANALYZE` (accepted, writes no `sqlite_stat1`), and in the planner: the
+`OR` (multi-index) and `LIKE` optimizations, skip-scans, Bloom filters,
+and flattening of compound (`UNION ALL`) subqueries.  `fsync` and file
+locks need SBCL (elsewhere `finish-output` is the barrier and locks are
+no-ops, with cache validation still applied).
 
 ## Performance (SBCL, one core)
 
@@ -416,6 +420,7 @@ src/
   expr       expression compiler (closures)
   select     query engine: sources, joins, aggregates, sorting, compounds, CTEs
   where      the query planner (a port of SQLite's where.c) and the loops it runs
+  flatten    subquery flattening, WHERE-term push-down, HAVING-to-WHERE
   window     window functions
   functions, printf, math, datetime, json    built-in functions
   triggers   trigger execution

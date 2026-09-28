@@ -167,6 +167,7 @@
     (multiple-value-bind (stmts nparam names) (parse-sql-cached db sql)
       (let ((*params* (bind-params params nparam))
             (*param-names* names)
+            (*executing-sql* sql)
             (rows nil) (cols nil))
         (dolist (s stmts)
           (clrhash *fts5-cursors*)

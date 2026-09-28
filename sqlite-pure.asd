@@ -30,6 +30,7 @@
      (:file "expr")
      (:file "select")
      (:file "where")
+     (:file "flatten")
      (:file "window")
      (:file "functions")
      (:file "printf")
