@@ -18,6 +18,9 @@
 
 (in-package #:sqlite-pure)
 
+(defvar *join-wsrcs* nil
+  "In a RIGHT JOIN's unmatched-row pass: the query's own sources, whose
+joins say which columns can be NULL.")
 (defvar *or-branch-plan* nil
   "Planning one disjunct of a MULTI-INDEX OR (WHERE_OR_SUBCLAUSE): no
 automatic indexes.")
@@ -218,13 +221,14 @@ SQLite generates for an EP_FixedCol column reads the constant)."
   "Is NODE a column that constant propagation fixed (EP_FixedCol)?"
   (and *fixed-cols* (gethash node *fixed-cols*)))
 
-(defun propagate-constants (conjunct-trees scope)
+(defun propagate-constants (conjunct-trees scope &optional rewrite-only)
   "For each COLUMN = <literal> among the top-level AND terms of the WHERE
 clause (and the inner joins' ON clauses), mark the other references to
 that column in those clauses as fixed.  A fixed column is still read and
 compared as before (its value is the literal wherever the clause holds);
 what changes is that the planner no longer counts it as a use of its
-table.  Returns the set of fixed column nodes."
+table.  REWRITE-ONLY trees are rewritten but hold no constants.  Returns
+the set of fixed column nodes."
   (let ((fixed (make-hash-table :test #'eq)))
     (let ((*fixed-cols* fixed))
       (loop
@@ -276,7 +280,9 @@ table.  Returns the set of fixed column nodes."
                          ((:col :srccol) (rewrite-one e has-blob))
                          (t
                           (when (and has-blob (eq (car e) :binary)
-                                     (member (second e) '(:eq :lt :le :gt :ge :is)))
+                                     (member (second e) '(:eq :lt :le :gt :ge :is))
+                                     ;; x IS NULL is TK_ISNULL (binaryToUnaryIfNull)
+                                     (not (and (eq (second e) :is) (null-literal-p (fourth e)))))
                             (rewrite-one (third e) nil)
                             (unless (eq (col-aff (third e)) :text)
                               (rewrite-one (fourth e) nil)))
@@ -285,7 +291,8 @@ table.  Returns the set of fixed column nodes."
                           (mapc #'walk (cdr e)))))))
             (dolist (tree conjunct-trees) (find-consts tree))
             (when consts
-              (dolist (tree conjunct-trees) (walk tree))))
+              (dolist (tree conjunct-trees) (walk tree))
+              (dolist (tree rewrite-only) (walk tree))))
           (when (zerop changes) (return)))))
     fixed))
 
@@ -458,10 +465,12 @@ can be NULL whatever its declaration."
     ((:col :srccol)
      (multiple-value-bind (si ci) (column-ref x scope)
        (or (null si)
-           (let ((n (length *wsrcs*)))
-             (or (member (ws-join (svref *wsrcs* si)) '(:left :full))
+           ;; (EP_CanBeNull: the joins of the query itself, also in a
+           ;; RIGHT JOIN's single-table pass)
+           (let* ((wsrcs (or *join-wsrcs* *wsrcs*)) (n (length wsrcs)))
+             (or (member (ws-join (svref wsrcs si)) '(:left :full))
                  (loop for k from (1+ si) below n
-                       thereis (member (ws-join (svref *wsrcs* k)) '(:right :full)))))
+                       thereis (member (ws-join (svref wsrcs k)) '(:right :full)))))
            (column-can-be-null-p si ci scope))))
     (t t)))
 
@@ -544,11 +553,7 @@ virtual children."
                             (wt-coll new) (binary-collation lhs rhs scope)
                             (wt-aff new) (term-cmp-affinity lhs rhs scope)
                             (wt-prereq-right new) (logior prereq-left extra-right)
-                            (wt-prereq-all new) prereq-all)))))
-              ;; x IS NULL on a column that cannot be NULL is FALSE
-              (when (and (eq op :isnull) (wt-src term) (not outer-on)
-                         (not (column-can-be-null-p (wt-src term) (wt-col term) scope)))
-                (setf (wt-op term) nil (wt-prereq-all term) 0))))))
+                            (wt-prereq-all new) prereq-all)))))))))
       (cond
         ;; BETWEEN: two virtual range terms (in an AND clause)
         ((and (eq kind :between) (not (fifth e)) (eq (wc-op wc) :and))
@@ -788,11 +793,21 @@ NIL (append)."
     (when (> (wl-n-out lp) (- n-row reduce))
       (setf (wl-n-out lp) (- n-row reduce)))))
 
+(defun ws-outer-restricted-p (ws)
+  "JT_LEFT|JT_LTORJ|JT_RIGHT: the right side of an outer join, or a table
+to the left of a RIGHT or FULL JOIN (tag-20191211-001)."
+  (or (member (ws-join ws) '(:left :right :full))
+      (loop for k from (1+ (ws-i ws)) below (length *wsrcs*)
+            thereis (member (ws-join (svref *wsrcs* k)) '(:right :full)))))
+
 (defun constraint-compatible-with-outer-join-p (term ws)
-  "constraintCompatibleWithOuterJoin: only a term from this LEFT JOIN's
-own ON clause can constrain its right-hand table."
-  (and (eql (wt-outer-on term) (ws-i ws))
-       t))
+  "constraintCompatibleWithOuterJoin: only a term from the table's own ON
+clause may constrain it -- and for an outer join's table not an inner
+join's ON term."
+  (let ((j (or (wt-outer-on term) (wt-inner-on term))))
+    (and j (eql j (ws-i ws))
+         (not (and (member (ws-join ws) '(:left :right :full))
+                   (null (wt-outer-on term)))))))
 
 (defun index-column-not-null-p (ws wx j)
   (let ((c (widx-col wx j)))
@@ -844,7 +859,7 @@ by one more constraint on the next index column, insert, and recurse."
                        (index-column-not-null-p ws wx j))
               (return-from one))
             (when (logtest (wt-prereq-right term) (ws-mask ws)) (return-from one))
-            (when (and (member (ws-join ws) '(:left :right :full))
+            (when (and (ws-outer-restricted-p ws)
                        (not (constraint-compatible-with-outer-join-p term ws)))
               (return-from one))
             (let ((new (copy-wloop* saved)))
@@ -926,7 +941,7 @@ by one more constraint on the next index column, insert, and recurse."
   "termCanDriveIndex."
   (and (eql (wt-src term) (ws-i ws))
        (member (wt-op term) '(:eq :is))
-       (or (not (member (ws-join ws) '(:left :right :full)))
+       (or (not (ws-outer-restricted-p ws))
            (constraint-compatible-with-outer-join-p term ws))
        (zerop (logand (wt-prereq-right term) not-ready))
        (integerp (wt-col term))
@@ -1084,11 +1099,20 @@ an == term on a column, of a cursor the subquery does not have."
 (defun add-all-loops (b)
   "whereLoopAddAll: prerequisites keep CROSS and outer joins in FROM order."
   (let ((m-prereq 0) (m-prior 0)
-        (fixed (some (lambda (ws) (member (ws-join ws) '(:right :full))) *wsrcs*)))
+        (has-right-join nil) (first-past-rj nil))
     (loop for ws across *wsrcs*
-          do (if (or fixed (member (ws-join ws) '(:left :right :full :cross)))
-                 (setf m-prereq (logior m-prereq m-prior))
-                 (setf m-prereq 0))
+          for i from 0
+          do ;; no reordering across CROSS and outer joins; the right operand of
+             ;; a RIGHT JOIN keeps its place (bFirstPastRJ); and nothing moves
+             ;; from the right of a LEFT JOIN to its left when that is itself
+             ;; left of a RIGHT JOIN (JT_LTORJ, hasRightJoin)
+             (let ((ltorj (loop for k from (1+ i) below (length *wsrcs*)
+                                thereis (member (ws-join (svref *wsrcs* k)) '(:right :full)))))
+               (cond ((or first-past-rj ltorj (member (ws-join ws) '(:left :right :full :cross)))
+                      (when ltorj (setf has-right-join t))
+                      (setf m-prereq (logior m-prereq m-prior)
+                            first-past-rj (and (member (ws-join ws) '(:right :full)) t)))
+                     ((not has-right-join) (setf m-prereq 0))))
              (let ((m-prereq (logior m-prereq (ws-extra-prereq ws))))
                (if (eq (ws-kind ws) :vtab)
                    (add-vtab-loops b ws m-prereq)
@@ -1460,6 +1484,15 @@ in order (an ORDER BY, or a GROUP BY with +WF-GROUPBY+).  Returns a WPLAN."
       (setf (plan-distinct plan) (or distinct (plan-distinct plan)
                                      (and (logtest flags +wf-want-distinct+) :unordered))
             (plan-wc plan) *wc* (plan-wsrcs plan) wsrcs)
+      ;; sqlite3WhereBegin, for the right table of a RIGHT/FULL JOIN: its
+      ;; loop reads the table itself (for the matched-row key), and the
+      ;; unmatched pass disturbs the output order -- so no covering index
+      ;; there, no ORDER BY/GROUP BY delivered in order, DISTINCT unordered
+      (dolist (lp (plan-loops plan))
+        (when (member (fsrc-join (ws-fsrc (svref wsrcs (wl-src lp)))) '(:right :full))
+          (setf (wl-flags lp) (logandc2 (wl-flags lp) +where-idx-only+)
+                (plan-n-ob-sat plan) 0)
+          (when (plan-distinct plan) (setf (plan-distinct plan) :unordered))))
       plan)))
 
 ;;; ------------------------------------------------------------------
@@ -1553,7 +1586,10 @@ that constrain only this table make it a partial index."
 (defun table-constraint-term-p (term ws)
   "sqlite3ExprIsTableConstraint: the term reads only this source."
   (and (zerop (logandc2 (or (wt-constraint-mask term) (wt-prereq-all term)) (ws-mask ws)))   ; a constant term counts
-       (if (eq (ws-join ws) :left)
+       ;; (3): nothing constrains a table left of a RIGHT JOIN (JT_LTORJ)
+       (loop for k from (1+ (ws-i ws)) below (length *wsrcs*)
+             never (member (ws-join (svref *wsrcs* k)) '(:right :full)))
+       (if (member (ws-join ws) '(:left :full))
            (eql (wt-outer-on term) (ws-i ws))
            (not (wt-outer-on term)))
        (not (member (ws-join ws) '(:right :full)))
@@ -1932,6 +1968,78 @@ DISTINCT.  The reverse-scan bits stay where they were, as in SQLite."
         (setf loops (coerce v 'list)))))
   loops)
 
+(defun right-join-pass (ws fs before scope fsrcs)
+  "sqlite3WhereRightJoinLoop for a stored table: note RIGHT-JOIN <table>
+and plan its own single-table loop over the WHERE terms that read only it
+and the earlier (now NULL) tables; (cons scan key) for RUN-LEVELS."
+  (unless (member (ws-kind ws) '(:btree :derived)) (return-from right-join-pass nil))
+  (let* ((table (ws-table ws))
+         (i (ws-i ws))
+         (ltorj (some (lambda (g) (member (fsrc-join g) '(:right :full))) (nthcdr (1+ i) fsrcs)))
+         (m-all (if ltorj before (logior before (ws-mask ws))))
+         (sub-terms (unless ltorj
+                      (loop for term across (wc-terms *wc*)
+                            until (wt-virtual term)
+                            when (and (zerop (logandc2 (wt-prereq-all term) m-all))
+                                      (not (wt-outer-on term)) (not (wt-inner-on term)))
+                              collect (list (or (wt-origin term) (wt-expr term)) nil nil))))
+         ;; sqlite3ExprAnd: an always-false term (a literal 0, or x IS NULL
+         ;; folded) makes the whole sub-WHERE the constant 0
+         (sub-terms (unless (some (lambda (st) (equal (first st) '(:lit 0))) sub-terms)
+                      sub-terms))
+         (*join-wsrcs* (or *join-wsrcs* *wsrcs*))
+         (sub (analyze-clause sub-terms scope (wc-nsrc *wc*)))
+         ;; the pass's FROM is this table alone, as an inner join
+         ;; (sFrom.a[0].fg.jointype = 0): no outer-join term restriction
+         (*wsrcs* (let ((v (copy-seq *wsrcs*)))
+                    (loop for k from i below (length v)
+                          do (setf (svref v k) (copy-wsrc (svref v k))
+                                   (ws-join (svref v k)) :inner))
+                    v))
+         (ws (svref *wsrcs* i))
+         (lp (let ((*wc* sub) (*or-branch-plan* t))
+               ;; whereShortCut applies (it declines only an OR sub-clause)
+               (let ((sc (short-cut (make-wbuilder) ws before)))
+                 (if sc (first (plan-loops sc)) (plan-or-branch ws before))))))
+    (with-eqp-node ((format nil "RIGHT-JOIN ~a"
+                            (if table (table-name table)
+                                (or (fsrc-table-name fs) (source-display-name fs))))
+                    +eqp-right-join+)
+      (let ((*eqp-left* nil) (*wc* sub))
+        (if (flag-p (wl-flags lp) +where-multi-or+)
+            (explain-multi-or lp ws (source-display-name fs) before)
+            (eqp-table-note (explain-loop lp ws (source-display-name fs))))))
+    (cons (let ((*wc* sub))
+            (if (flag-p (wl-flags lp) +where-multi-or+)
+                (multi-or-iterate lp ws scope before)
+                (loop-iterate lp ws scope nil)))
+          (cond ((null table) #'identity)
+                ((table-without-rowid table)
+                 (let ((pk (table-pk table))) (lambda (row) (mapcar (lambda (p) (svref row p)) pk))))
+                (t (lambda (row) (svref row (1- (length row)))))))))
+
+(defun right-join-scan (ws)
+  "For a RIGHT/FULL JOIN's right table: (cons scan key) -- SCAN every row
+(SQLite's RIGHT-JOIN pass for the rows nothing matched) and the key a row
+is remembered by as matched; NIL where the level's own loop is such a scan
+already (a virtual table)."
+  (let* ((fs (ws-fsrc ws))
+         (table (ws-table ws)))
+    (case (ws-kind ws)
+      (:btree
+       (let ((wanted (src-wanted (fsrc-src fs))))
+         (cons (lambda (env fn) (declare (ignore env)) (map-table-rows table fn :wanted wanted))
+               (if (table-without-rowid table)
+                   (let ((pk (table-pk table))) (lambda (row) (mapcar (lambda (p) (svref row p)) pk)))
+                   (lambda (row) (svref row (1- (length row))))))))
+      (:derived
+       (let ((rf (fsrc-rows-fn fs)))
+         (cons (lambda (env fn)
+                 (let ((rows (funcall rf env)))
+                   (if (functionp rows) (funcall rows fn) (dolist (row rows) (funcall fn row)))))
+               #'identity)))
+      (t nil))))
+
 (defun plan-levels (fsrcs scope where ons)
   "Plan FSRCS and return (values levels final-filters)."
   (let* ((n (length fsrcs))
@@ -1977,9 +2085,15 @@ DISTINCT.  The reverse-scan bits stay where they were, as in SQLite."
               (outer (when (aref pos outer)      ; else its join was omitted
                        (push e (aref matches (aref pos outer)))))
               (t (let* ((m (expr-usage e scope n))
-                        (at (loop for i below n when (logbitp i m) maximize (aref pos i))))
-                   (push e (aref placed (max (if (null inner) floor-level 0) (or at 0)))))))))
-    (let ((levels '()) (bound 0)
+                        (at (or (loop for i below n when (logbitp i m) maximize (aref pos i)) 0)))
+                   ;; an inner join's ON term waits, at an outer join's table (or
+                   ;; one left of a RIGHT JOIN), until its own join is reached
+                   ;; ("an ON clause that is not ripe", codeOneLoopStart)
+                   (when (and inner (aref pos inner) (< at (aref pos inner))
+                              (ws-outer-restricted-p (svref wsrcs (wl-src (nth at loops)))))
+                     (setf at (aref pos inner)))
+                   (push e (aref placed (max (if (null inner) floor-level 0) at))))))))
+    (let ((levels '()) (bound 0) (right-levels '())
           ;; an omitted join is ready from the start (whereOmitNoopJoin)
           (not-ready (reduce #'logior loops :key (lambda (lp) (ash 1 (wl-src lp))) :initial-value 0)))
       (loop for lp in loops for k from 0
@@ -2022,9 +2136,16 @@ DISTINCT.  The reverse-scan bits stay where they were, as in SQLite."
                                      :right-p (and right t)
                                      :match (mapcar (lambda (c) (compile-expr (substitute-fixed c) scope)) match-asts)
                                      :filters (mapcar (lambda (c) (compile-expr (substitute-fixed c) scope)) filter-asts)
-                                     :nullrow (make-null-row (1+ (src-ncols (fsrc-src fs)))))
-                         levels))
+                                     :nullrow (make-null-row (1+ (src-ncols (fsrc-src fs))))
+                                     :scan-all (and right (right-join-scan ws)))
+                         levels)
+                   (when right (push (list (first levels) ws fs bound) right-levels)))
                  (setf bound (logior bound (ash 1 i))
                        not-ready (logand not-ready (lognot (ash 1 i))))))
+      ;; each RIGHT/FULL JOIN's pass over its table for the rows nothing
+      ;; matched; EQP lists them outer-first, as SQLite does
+      (loop for (lv ws fs before) in (reverse right-levels)
+            do (let ((pass (right-join-pass ws fs before scope fsrcs)))
+                 (when pass (setf (level-scan-all lv) pass))))
       (values (nreverse levels)
               (mapcar (lambda (c) (compile-expr (substitute-fixed c) scope)) finals)))))

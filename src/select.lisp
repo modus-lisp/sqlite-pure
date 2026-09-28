@@ -132,6 +132,7 @@ columns are decoded; the others read as NULL."
   derived-sel     ; a subquery's or view's SEL, for WHERE-term push-down
   coroutine       ; EXPLAIN QUERY PLAN called it a CO-ROUTINE
   was-left        ; a LEFT JOIN simplified before this source was made
+  table-name      ; EQP: a derived source's pTab->zName (RIGHT-JOIN <name>)
   rebuild)        ; (lambda (sel)) -> this source compiled from SEL instead, same plan node
 
 (defun make-table-src (table &optional alias)
@@ -259,7 +260,7 @@ each other."
                            (or (cte-affinities cte) (make-list (length (cte-columns cte))))
                            (make-list (length (cte-columns cte)) :initial-element :binary))))
     (make-fsrc :src src
-               :label (or alias (cte-name cte))
+               :label (or alias (cte-name cte)) :table-name (cte-name cte)
                ;; the recursive step's reference to its own CTE: one row at a time
                :recursive-ref (eq (cte-done cte) :working)
                :rows-fn (lambda (env)
@@ -312,8 +313,8 @@ note refilled in place."
                   new)))
         fs))))
 
-(defun eqp-labelled (fs label)
-  (setf (fsrc-label fs) label)
+(defun eqp-labelled (fs label &optional (table-name label))
+  (setf (fsrc-label fs) label (fsrc-table-name fs) table-name)
   fs)
 
 (defun make-fsrc-for (item scope)
@@ -343,7 +344,7 @@ note refilled in place."
                                      (eqp-labelled
                                       (select-derived-source sel (or alias name) (make-scope)
                                                              (table-view-columns table) materialized)
-                                      shown)))))
+                                      shown name)))))
                               (let ((hint (fifth source)))
                                 (make-fsrc :src (make-table-src table alias) :table table
                                            :index-hint
@@ -462,7 +463,8 @@ subquery (whose references we do not chase)."
   filters          ; list of compiled conjuncts
   left-p           ; unmatched rows of the earlier sources survive (LEFT, FULL)
   right-p          ; unmatched rows of this source survive (RIGHT, FULL)
-  nullrow)
+  nullrow
+  scan-all)        ; RIGHT/FULL: (scan . row-key), see RIGHT-JOIN-SCAN
 
 (defun rowid-probe (v)
   "Normalise a value compared with a rowid: an integer, or NIL for 'no
@@ -1044,8 +1046,8 @@ the newest on ties; or NIL."
 
 (defun order-term-source-column (e rcols scope)
   "The (depth-0) column of source 0 an ORDER BY term sorts by, or NIL."
-  (let ((e (if (and (int32-literal-p e) (<= 1 (second e) (length rcols)))
-               (first (nth (1- (second e)) rcols))
+  (let ((e (if (and (int32-literal-p e) (<= 1 (int32-literal-p e) (length rcols)))
+               (first (nth (1- (int32-literal-p e)) rcols))
                e)))
     (when (and (eq (car e) :col) (null (second e)))
       (let ((a (alias-expr scope (third e))))
@@ -1209,7 +1211,8 @@ Return the per-source ON expressions."
                       (when (member (fsrc-join fs) '(:right :full))
                         (push (cons (cons (first left) (second left)) (cons i ri))
                               (scope-coalesce scope)))
-                      (let ((cond (list :binary :eq (cons :srccol left) (list :srccol i ri))))
+                      (let ((cond (list :binary :eq (list :srccol (first left) (second left) :raw)
+                                        (list :srccol i ri :raw))))
                         (setf on (if on (list :binary :and on cond) cond)))))
                   on)))
 
@@ -1232,7 +1235,10 @@ Return the per-source ON expressions."
     ;; A RIGHT/FULL JOIN source is read once, so that the rows no earlier
     ;; row matched can be emitted at the end.
     (dolist (lv levels)
-      (when (level-right-p lv)
+      (when (and (level-right-p lv) (level-scan-all lv))
+        ;; matched rows remembered by key; the unmatched found by a scan
+        (setf (gethash lv materialized) (make-hash-table :test #'equal)))
+      (when (and (level-right-p lv) (not (level-scan-all lv)))
         (let ((rows '()))
           (funcall (level-iterate lv) env (lambda (row) (push row rows)))
           (setf (gethash lv materialized)
@@ -1251,9 +1257,11 @@ Return the per-source ON expressions."
                               (when (all-true (level-match lv) env)
                                 (setf matched t)
                                 (when k (setf (aref (cdr mat) k) t))
+                                (when (hash-table-p mat)
+                                  (setf (gethash (funcall (cdr (level-scan-all lv)) row) mat) t))
                                 (when (all-true (level-filters lv) env)
                                   (run (cdr lvs))))))
-                       (if mat
+                       (if (consp mat)
                            (loop for row across (car mat) for k from 0 do (try row k))
                            (funcall (level-iterate lv) env (lambda (row) (try row nil)))))
                      (when (and (level-left-p lv) (not matched))
@@ -1266,18 +1274,25 @@ Return the per-source ON expressions."
       (loop for (lv . rest) on levels
             for mat = (gethash lv materialized)
             when mat
-              do (loop for row across (car mat)
-                       for hit across (cdr mat)
-                       unless hit
-                         do (let ((rows (env-rows env)))
-                              (dolist (earlier levels)
-                                (when (eq earlier lv) (return))
-                                (setf (svref rows (level-index earlier)) (level-nullrow earlier)))
-                              (setf (svref rows (level-index lv)) row)
-                              (when (loop for x in levels
-                                          always (all-true (level-filters x) env)
-                                          until (eq x lv))
-                                (run rest))))))))
+              do (dolist (earlier levels)     ; before the scan: its probes read them
+                   (when (eq earlier lv) (return))
+                   (setf (svref (env-rows env) (level-index earlier)) (level-nullrow earlier)))
+                 (flet ((unmatched (row)
+                          (let ((rows (env-rows env)))
+                            (setf (svref rows (level-index lv)) row)
+                            ;; the earlier levels' filters are their inner
+                            ;; joins' ON terms (WHERE terms are placed at or
+                            ;; after the last RIGHT/FULL JOIN), which the
+                            ;; NULL rows are not joined by
+                            (when (all-true (level-filters lv) env)
+                              (run rest)))))
+                   (if (hash-table-p mat)
+                       (let ((key (cdr (level-scan-all lv))))
+                         (funcall (car (level-scan-all lv)) env
+                                  (lambda (row) (unless (gethash (funcall key row) mat) (unmatched row)))))
+                       (loop for row across (car mat)
+                             for hit across (cdr mat)
+                             unless hit do (unmatched row))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; ORDER BY support
@@ -1312,8 +1327,28 @@ Return the per-source ON expressions."
   "The value of a LIMIT that is an integer literal, else NIL."
   (and limit (integer-literal-value limit)))
 
+(defun coalesced-column-p (e scope)
+  "E names the coalesced USING/NATURAL column of a RIGHT or FULL join."
+  (let ((e (skip-collate e)))
+    (multiple-value-bind (depth si ci)
+        (case (car e)
+          (:col (and (null (second e)) (resolve-column scope nil (third e))))
+          (:srccol (values 0 (second e) (third e))))
+      (and depth (= depth 0)
+           (assoc (cons si ci) (scope-coalesce scope) :test #'equal)))))
+
+(defun using-conditions (on)
+  "The USING/NATURAL equalities among ON's AND terms (see APPLY-JOINS)."
+  (cond ((atom on) '())
+        ((and (eq (car on) :binary) (eq (second on) :and))
+         (append (using-conditions (third on)) (using-conditions (fourth on))))
+        ((and (eq (car on) :binary) (eq (second on) :eq)
+              (eq (car (third on)) :srccol) (eq (fourth (third on)) :raw))
+         (list on))
+        (t '())))
+
 (defun obterm-for (e desc coll nulls scope n)
-  (multiple-value-bind (src col) (column-ref e scope)
+  (multiple-value-bind (src col) (unless (coalesced-column-p e scope) (column-ref e scope))
     (make-obterm :expr e :src src :col col
                  :coll (if coll (collation-keyword coll) (or (expr-collation e scope) :binary))
                  :desc (and desc t)
@@ -1443,16 +1478,16 @@ source SI is not NULL?"
 (defun simplify-outer-joins (fsrcs where ons scope)
   "sqlite3Select's LEFT JOIN simplification: when the WHERE clause (with
 the inner joins' ON clauses) cannot be true for the NULL row of a LEFT
-JOIN's right table, the join is an inner join; a FULL JOIN becomes a
-RIGHT JOIN."
+JOIN's right table, the join is an inner join.  A FULL JOIN is left as
+it is ((jointype & (JT_LEFT|JT_RIGHT))==JT_LEFT)."
   (let ((cond where))
     (loop for fs in fsrcs for on in ons
           do (when (and on (not (member (fsrc-join fs) '(:left :right :full))))
                (setf cond (if cond (list :binary :and cond on) on))))
     (loop for fs in fsrcs for i from 0
-          do (when (and (member (fsrc-join fs) '(:left :full))
+          do (when (and (eq (fsrc-join fs) :left)
                         (implies-non-null-row-p cond i scope))
-               (setf (fsrc-join fs) (if (eq (fsrc-join fs) :full) :right :inner))))))
+               (setf (fsrc-join fs) :inner)))))
 
 (defun expr-can-be-null-p (e scope)
   "sqlite3ExprCanBeNull, for a column: NULL unless declared NOT NULL (or the rowid)."
@@ -1580,7 +1615,10 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                                         (and (zerop i)
                                              (or (null (cdr items))
                                                  (member (getf (second items) :join)
-                                                         '(:left :right :full :cross))))))
+                                                         '(:left :right :full :cross)))
+                                             ;; (3): not left of a RIGHT JOIN (JT_LTORJ)
+                                             (notany (lambda (it) (member (getf it :join) '(:right :full)))
+                                                     (cdr items)))))
                                   (make-fsrc-for item scope)))))
          (_0 (unless fsrcs (eqp-note "SCAN CONSTANT ROW")))
          (cscope (make-scope :srcs (mapcar #'fsrc-src fsrcs) :parent scope))
@@ -1629,7 +1667,14 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                                        (loop for fs in fsrcs for on in ons
                                              when (and on (not (member (fsrc-join fs) '(:left :right :full))))
                                                collect on)))
-                               cscope)))
+                               cscope
+                               ;; the USING conditions of the others: only their
+                               ;; EQ node is marked as an ON term, so their
+                               ;; columns are rewritten all the same
+                               (loop for fs in fsrcs for on in ons
+                                     when (or (member (fsrc-join fs) '(:left :right :full))
+                                              (some (lambda (g) (member (fsrc-join g) '(:right :full))) fsrcs))
+                                       append (using-conditions on)))))
             (when *flatten* (push-down-where-terms fsrcs cscope (select-core-where core) ons))
             (multiple-value-bind (l f) (build-levels fsrcs cscope (select-core-where core) ons)
               (let* ((plan *plan-result*)
@@ -1886,14 +1931,19 @@ or NIL."
        (member (agg-name (car aggs)) '("min" "max") :test #'string=)))
 
 (defun int32-literal-p (e)
-  "sqlite3ExprIsInteger: an integer literal that fits in 32 bits."
-  (and (eq (car e) :lit) (integerp (second e)) (<= -2147483648 (second e) 2147483647)))
+  "sqlite3ExprIsInteger: the value of an integer literal that fits in 32
+bits, through unary + and -; NIL if E is not one."
+  (case (car e)
+    (:lit (and (integerp (second e)) (<= -2147483648 (second e) 2147483647) (second e)))
+    (:unary (case (second e)
+              (:pos (int32-literal-p (third e)))
+              (:neg (let ((v (int32-literal-p (third e)))) (and v (- v))))))))
 
 (defun resolve-group-term (g rcols &optional (pos 1))
   "GROUP BY accepts result-column numbers.  POS is the term's place in the
 GROUP BY list, for the error."
   (if (int32-literal-p g)
-      (let ((k (second g)))
+      (let ((k (int32-literal-p g)))
         (unless (<= 1 k (length rcols))
           (sql-error "~a GROUP BY term out of range - should be between 1 and ~d"
                      (ordinal pos) (length rcols)))
@@ -1941,7 +1991,7 @@ EXPRS, so that SQLite would need no temp b-tree?"
 (defun order-term-column (e rcols &optional (k 1))
   "Index of the result column an ORDER BY term names, or NIL."
   (cond ((int32-literal-p e)
-         (let ((v (second e)))
+         (let ((v (int32-literal-p e)))
            (unless (<= 1 v (length rcols))
              (sql-error "~a ORDER BY term out of range - should be between 1 and ~d"
                         (ordinal k) (length rcols)))
@@ -2165,7 +2215,7 @@ unqualified, at any depth."
                          (:intersect "INTERSECT") (t "EXCEPT")))))
     (let ((order (loop for (e desc coll nulls) in (sel-order sel)
                        collect (let ((idx (cond ((int32-literal-p e)
-                                                 (1- (second e)))
+                                                 (1- (int32-literal-p e)))
                                                 ((eq (car e) :col)
                                                  (position (third e) cols :key #'first :test #'name=))
                                                 ((eq (car e) :collate)

@@ -399,7 +399,10 @@ on FTS3/4 tables; NIL for anything else."
              ((and (null (second e)) (stringp (third e)) (eq (fourth e) :quoted))
               (let ((s (third e))) (lambda (env) (declare (ignore env)) s)))
              (t (sql-error-at (third e) "no such column: ~@[~a.~]~a" (second e) (third e))))))
-    (:srccol (if (assoc (cons (second e) (third e)) (scope-coalesce scope) :test #'equal)
+    ;; (:srccol si ci :raw), a USING/NATURAL join's own condition, reads the
+    ;; column itself rather than the RIGHT/FULL JOIN's coalesced value
+    (:srccol (if (and (not (eq (fourth e) :raw))
+                      (assoc (cons (second e) (third e)) (scope-coalesce scope) :test #'equal))
                  (compile-coalesced (cons (second e) (third e)) scope)
                  (progn (mark-used (nth (second e) (scope-srcs scope)) (third e))
                         (compile-column-access 0 (second e) (third e)))))

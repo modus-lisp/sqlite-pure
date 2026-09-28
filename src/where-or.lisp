@@ -250,7 +250,7 @@ for WS alone with the outer tables' values known."
                            (sub (analyze-clause conjuncts scope n))
                            (best (let ((*wc* sub) (*or-branch-plan* t))
                                    (plan-or-branch ws bound))))
-                      (list (1+ ii) best sub (mapcar #'first conjuncts))))))
+                      (list (1+ ii) best sub conjuncts)))))
 
 (defun plan-or-branch (ws bound)
   "The best loop for WS alone under *WC*, the outer tables BOUND."
@@ -269,6 +269,17 @@ for WS alone with the outer tables' values known."
                       (and (= cost best-cost) (< (wl-n-out lp) (wl-n-out best))))
               (setf best lp best-cost cost))))))))
 
+(defun on-term-coded-here-p (ws outer inner ready)
+  "codeOneLoopStart: at an outer join's table (or one left of a RIGHT JOIN),
+WHERE terms wait until after the join (tag-20220513a), as do inner-join
+ON terms at a LEFT JOIN's table and ON terms of a join not yet reached."
+  (if (ws-outer-restricted-p ws)
+      (let ((j (or outer inner)))
+        (and j
+             (not (and (member (ws-join ws) '(:left :full)) (null outer)))
+             (logbitp j ready)))
+      t))
+
 (defun multi-or-iterate (lp ws scope bound)
   "The rows of each disjunct's loop in turn, each row once."
   (let* ((branches (or-branch-plans lp ws bound))
@@ -283,9 +294,10 @@ for WS alone with the outer tables' values known."
          ;; (only terms on tables that are ready: the rest wait for a later loop)
          (ready (logior bound (ws-mask ws)))
          (filters (loop for br in branches
-                        collect (loop for c in (fourth br)
-                                      when (zerop (logandc2 (expr-usage c scope (wc-nsrc (root-wc *wc*)))
-                                                            ready))
+                        collect (loop for (c outer inner) in (fourth br)
+                                      when (and (zerop (logandc2 (expr-usage c scope (wc-nsrc (root-wc *wc*)))
+                                                                 ready))
+                                                (on-term-coded-here-p ws outer inner ready))
                                         collect (compile-expr (substitute-fixed c) scope)))))
     (flet ((key (row)
              (if (and table (table-without-rowid table))

@@ -196,6 +196,7 @@ inner joins' ON clauses) be true only if item I's row is not the NULL row?"
 LEFT JOIN simplification SQLite's flattening loop makes on every item (so
 it is known before sources are compiled).  Returns (values core order
 limit): a subquery's LIMIT (and ORDER BY) can become the outer query's."
+  (setf core (omit-subquery-order-bys core order))
   (loop
     (multiple-value-bind (new-core new-order new-limit) (flatten-one core order limit)
       (if new-core
@@ -210,6 +211,46 @@ limit): a subquery's LIMIT (and ORDER BY) can become the outer query's."
                      (nth i items) c
                      core (let ((k (copy-select-core core))) (setf (select-core-from k) items) k)))))
   (values core order limit))
+
+(defun droppable-order-p (src)
+  (and (eq (car src) :subquery)
+       (let ((sel (second src)))
+         (and (sel-order sel) (null (sel-limit sel)) (null (sel-ops sel)) (null (sel-with sel))
+              (select-core-p (first (sel-cores sel)))))))
+
+(defun omit-subquery-order-bys (core order)
+  "sqlite3Select, before it tries to flatten: a FROM subquery's ORDER BY that
+does nothing (the outer query has its own, or the subquery is part of a
+join; no LIMIT; no aggregate but count(), min(), max() outside) is
+dropped, whether or not the subquery is then flattened."
+  (let ((items (select-core-from core)))
+    (if (and (or order (cdr items))
+             (some (lambda (it) (let ((src (getf it :source)))
+                                  (droppable-order-p src)))
+                   items)
+             (every (lambda (n) (member n '("count" "min" "max") :test #'string=))
+                    (outer-aggregate-names
+                     (append (loop for c in (select-core-cols core) when (eq (car c) :expr) collect (second c))
+                             (list (select-core-where core) (select-core-having core))
+                             (select-core-group core)
+                             (mapcar #'first order)
+                             (loop for it in items collect (getf it :on))))))
+        (let ((k (copy-select-core core)))
+          (setf (select-core-from k)
+                (loop for it in items
+                      collect (let ((src (getf it :source)))
+                                (if (droppable-order-p src)
+                                    (let ((c (copy-list it))
+                                          (sel (copy-sel (second src))))
+                                      ;; resolved first: a bad term is still an error
+                                      (check-order-by-names (sel-order sel) (first (sel-cores sel))
+                                                            (sel-column-info sel))
+                                      (setf (sel-order sel) nil
+                                            (getf c :source) (list* :subquery sel (cddr src)))
+                                      c)
+                                    it))))
+          k)
+        core)))
 
 (defun flatten-one (core order limit)
   "Flatten the first FROM subquery of CORE that can be; NIL if none."
@@ -272,6 +313,11 @@ stands for (SQLite expands them before it flattens), or NIL."
                   items (append (subseq items 0 i) (list c) (nthcdr (1+ i) items))
                   core (let ((k (copy-select-core core))) (setf (select-core-from k) items) k))))
         (let* ((outer-cols (select-core-cols core))
+               ;; isOuterJoin: the right side of a LEFT JOIN, or a table left
+               ;; of a RIGHT JOIN (JT_LTORJ)
+               (outer-join (or (eq (getf item :join) :left)
+                               (some (lambda (it) (member (getf it :join) '(:right :full)))
+                                     (nthcdr (1+ i) items))))
                (outer-exprs (append (loop for c in outer-cols when (eq (car c) :expr) collect (second c))
                                     (list (select-core-where core) (select-core-having core))
                                     (select-core-group core)
@@ -310,9 +356,7 @@ stands for (SQLite expands them before it flattens), or NIL."
           (when (or (select-core-windows core) (some #'contains-window-p outer-exprs)) (no))  ; (25)
           (when (some #'expr-has-select-p outer-exprs) (no))
           (when (member (getf item :join) '(:right :full)) (no))                   ; (26)
-          (when (some (lambda (it) (member (getf it :join) '(:right :full))) (nthcdr (1+ i) items))
-            (no))                                                                   ; LTORJ, (3)
-          (when (eq (getf item :join) :left)                                       ; (3)
+          (when outer-join                                                         ; (3)
             (unless (and (null (cdr (select-core-from sub)))                        ; (3a)
                          (let ((it (first (select-core-from sub))))
                            (not (and (eq (car (getf it :source)) :table)          ; (3b)
@@ -354,6 +398,9 @@ stands for (SQLite expands them before it flattens), or NIL."
 (defun build-flattened (core order i sel sub alias rename view-p limit)
   (let* ((items (select-core-from core))
          (item (nth i items))
+         (outer-join (or (eq (getf item :join) :left)
+                         (some (lambda (it) (member (getf it :join) '(:right :full)))
+                               (nthcdr (1+ i) items))))
          (sub-items (select-core-from sub))
          (sub-srcs (loop for it in sub-items collect (or (item-src it) (return-from build-flattened nil))))
          (tags (loop repeat (length sub-items) collect (flatten-tag)))
@@ -393,7 +440,7 @@ stands for (SQLite expands them before it flattens), or NIL."
                            (list :col (second e) (third e) :subst)
                            (list :icollate
                                  ;; the right side of a LEFT JOIN: NULL when unmatched
-                                 (if (eq (getf item :join) :left) (list :ifnullrow (first tags) e) e)
+                                 (if outer-join (list :ifnullrow (first tags) e) e)
                                  (nth k sub-colls)))))
                    (outer-ref (e &optional top-group)
                      (destructuring-bind (q n &rest more) (cdr e)
@@ -440,8 +487,9 @@ stands for (SQLite expands them before it flattens), or NIL."
                                                           (let ((k (sub-index (third e))))
                                                             (and k (nth k sub-names)))))))
                                        (list kind (outer e) al text name)))))
-                   (sub-where (if (and sub-where (eq (getf item :join) :left))
-                                  ;; part of the LEFT JOIN's ON clause
+                   (sub-where (if (and sub-where outer-join)
+                                  ;; part of the LEFT JOIN's ON clause (or, left of
+                                  ;; a RIGHT JOIN, this table's own)
                                   (list :outer-on (first tags) sub-where)
                                   sub-where))
                    ;; the subquery's own ON clauses: SQLite has moved them into its
@@ -492,7 +540,7 @@ stands for (SQLite expands them before it flattens), or NIL."
                       (if (sel-order sel)
                           ;; the subquery's ORDER BY, now the outer query's
                           (loop for (e . rest) in (sel-order sel)
-                                collect (cons (let ((k (cond ((int32-literal-p e) (1- (second e)))
+                                collect (cons (let ((k (cond ((int32-literal-p e) (1- (int32-literal-p e)))
                                                              ((and (eq (car e) :col) (null (second e)))
                                                               (position (third e) (select-core-cols sub)
                                                                         :key (lambda (c) (and (eq (car c) :expr) (third c)))
@@ -758,6 +806,12 @@ that is not an AS alias of SUB but an ambiguous column of its FROM."
          (aliases (loop for c in (select-core-cols sub)
                         when (and (eq (car c) :expr) (third c)) collect (third c))))
     (declare (ignore info))
+    (loop for o in order for k from 1
+          do (let ((e (first o)) (n (length (select-core-cols sub))))
+               (when (and (int32-literal-p e) (not (<= 1 (int32-literal-p e) n))
+                          (notany (lambda (c) (eq (car c) :star)) (select-core-cols sub)))
+                 (sql-error "~a ORDER BY term out of range - should be between 1 and ~d"
+                            (ordinal k) n))))
     (dolist (o order)
       (let ((e (first o)))
         (unless (or (int32-literal-p e)

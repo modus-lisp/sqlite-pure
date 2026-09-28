@@ -238,11 +238,16 @@ copies of the outer `WHERE` terms that constrain only them (push-down), and
 terms get SQLite's treatment: `x=1 OR x=2` also works as `x IN (1,2)`,
 `x=A OR x>A` as `x>=A`, and when every disjunct can use an index the table
 may be read as a `MULTI-INDEX OR` loop — one indexed lookup per disjunct,
-each planned as its own sub-query, duplicates skipped. A lone
+each planned as its own sub-query, duplicates skipped. `RIGHT` and `FULL`
+joins run as SQLite runs them: the right table's matched rows are
+remembered by rowid (or primary key), and a final pass — its own
+single-table plan over the `WHERE` terms, shown as `RIGHT-JOIN` in
+`EXPLAIN QUERY PLAN` — reads the rows nothing matched. A lone
 `min()`/`max()` reads one end of an index; `count(*)` counts the smallest
 index; `INDEXED BY` and `NOT INDEXED` are honoured. A differential fuzzer
 (`test/planfuzz.py`) compares plans and rows with sqlite3 over random
-schemas, data and joins.
+schemas, data and joins. One known difference: a subquery or view to the
+left of a `USING`/`NATURAL` join is not flattened here, where SQLite would.
 `ORDER BY` is satisfied from rowid or index order where possible (in either
 direction, stopping early for `LIMIT`); otherwise `ORDER BY … LIMIT` keeps
 only the best rows. Only referenced columns are decoded; `count(*)` comes
@@ -380,7 +385,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 |---|---|
 | `test/run-tests.sh` (also `(asdf:test-system "sqlite-pure")`) | the Lisp API tests (`test/api.lisp`), and the **differential suite**: `test/cases/*.test` are SQL scripts; `test/gen-expected.py` records SQLite's rows or error for every statement; each is replayed here and compared, error messages included |
 | `test/run-qfuzz.sh FIRST N Q` | **query fuzzer**: random expressions, joins, subqueries, compounds, windows and CTEs over random mixed-type data, compared statement by statement |
-| `python3 test/planfuzz.py SQLITE3 bin/sqlp FIRST N [Q]` | **planner fuzzer**: random schemas (indexes, WITHOUT ROWID, INTEGER PRIMARY KEY), data and joins; `EXPLAIN QUERY PLAN` output and rows (in order) must match sqlite3. FROM-subqueries (with joins, `*`, `ORDER BY`/`LIMIT`, `DISTINCT`, aggregates, views) and `OR` terms of many shapes are included; `PLANFUZZ_NO_SUBQ=1` / `PLANFUZZ_NO_OR=1` leave them out |
+| `python3 test/planfuzz.py SQLITE3 bin/sqlp FIRST N [Q]` | **planner fuzzer**: random schemas (indexes, WITHOUT ROWID, INTEGER PRIMARY KEY), data and joins; `EXPLAIN QUERY PLAN` output and rows (in order) must match sqlite3. FROM-subqueries (with joins, `*`, `ORDER BY`/`LIMIT`, `DISTINCT`, aggregates, views), `OR` terms of many shapes and `RIGHT`/`FULL` joins (by `ON` or `USING`) are included; `PLANFUZZ_NO_SUBQ=1` / `PLANFUZZ_NO_OR=1` / `PLANFUZZ_NO_RIGHT=1` leave them out |
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
@@ -403,9 +408,9 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 
 Current results (SQLite 3.40.1 as reference): **sqllogictest** — every
 record of all 622 files passes (two records listed as 3.40-versus-corpus
-differences), `select5.test`'s 18-way joins included.  **SQLite's TCL suite** — of the 628 files
-that use no testfixture-only C hooks, 144 880 of 156 948 tests pass (92.3%);
-over all 1042 files that run to the end, 188 220 of 215 098.
+differences), `select5.test`'s 18-way joins included.  **SQLite's TCL suite** — of the 627 files
+that use no testfixture-only C hooks, 145 237 of 156 905 tests pass (92.6%);
+over all 1045 files that run to the end, 188 761 of 215 158.
 
 ## Layout
 

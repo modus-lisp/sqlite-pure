@@ -35,6 +35,7 @@
 (defconstant +eqp-materialize+ 0)
 (defconstant +eqp-loop+ 1)
 (defconstant +eqp-group+ 3)
+(defconstant +eqp-right-join+ 7/2)   ; sqlite3WhereEnd's RIGHT-JOIN passes: after the GROUP BY sorter note
 (defconstant +eqp-distinct+ 5)
 (defconstant +eqp-order+ 6)
 

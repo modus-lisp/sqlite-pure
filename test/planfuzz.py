@@ -5,7 +5,7 @@ rows of every query must match.  Row ORDER matters too, even without ORDER
 BY: it is what the plan decides.
 
 usage: planfuzz.py SQLITE3 SQLP FIRST-SEED N [QUERIES-PER-SEED]"""
-import random, subprocess, sys, tempfile, os
+import random, re, subprocess, sys, tempfile, os
 
 TYPES = ["INTEGER", "INT", "TEXT", "REAL", "", "VARCHAR(10)", "NUMERIC", "BLOB"]
 
@@ -158,8 +158,21 @@ def gen_query(r, tables):
             conds.append(gen_or(r, col))
     # FROM with joins
     frm = "%s AS %s" % (srcs[0][0], srcs[0][1])
-    for s in srcs[1:]:
+    using = False
+    for n, s in enumerate(srcs[1:], 1):
         jt = r.random()
+        if jt >= 0.93 and not os.environ.get("PLANFUZZ_NO_RIGHT"):
+            # RIGHT/FULL JOIN, by ON or (between two tables that have c0) USING.
+            # USING only with a table on its left: a subquery or view there
+            # is not flattened here (a known difference from SQLite)
+            kw = r.choice(["RIGHT", "FULL"])
+            if (n == 1 and "c0" in s[2] and "c0" in srcs[0][2] and r.random() < 0.4
+                    and re.fullmatch(r"t\d+", srcs[0][0])):
+                frm += " %s JOIN %s AS %s USING(c0)" % (kw, s[0], s[1])
+                using = True
+            else:
+                frm += " %s JOIN %s AS %s ON %s = %s" % (kw, s[0], s[1], "%s.%s" % (s[1], r.choice(s[2])), col(0))
+            continue
         if jt < 0.6:
             frm += ", %s AS %s" % (s[0], s[1])
         elif jt < 0.8:
@@ -183,6 +196,10 @@ def gen_query(r, tables):
             q += " WHERE " + " AND ".join(conds)
         if r.random() < 0.4:
             q += " ORDER BY " + ", ".join(col() + r.choice(["", " DESC"]) for _ in range(r.randint(1, 2)))
+            if using:
+                q += ", c0"
+        elif using and r.random() < 0.5:
+            q += " ORDER BY c0" + r.choice(["", " DESC"])
         if r.random() < 0.15:
             q += " LIMIT %d" % r.randint(1, 5)
     return q
