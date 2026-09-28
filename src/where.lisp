@@ -18,6 +18,10 @@
 
 (in-package #:sqlite-pure)
 
+(defvar *or-branch-plan* nil
+  "Planning one disjunct of a MULTI-INDEX OR (WHERE_OR_SUBCLAUSE): no
+automatic indexes.")
+
 (defvar *where-trace* (sb-ext:posix-getenv "SQLP_WHERETRACE")
   "Print every WhereLoop, like SQLite's .wheretrace (for comparing costs).")
 
@@ -51,6 +55,7 @@
 (defconstant +where-indexed+      #x200)
 (defconstant +where-virtualtable+ #x400)
 (defconstant +where-onerow+       #x1000)
+(defconstant +where-multi-or+     #x2000)
 (defconstant +where-auto-index+   #x4000)
 (defconstant +where-unq-wanted+   #x10000)
 (defconstant +where-partialidx+   #x20000)
@@ -227,6 +232,9 @@ table.  Returns the set of fixed column nodes."
           (labels ((col-aff (e) (expr-affinity e scope))
                    (insert (col value e)
                      (unless (or (fixed-col-p col)
+                                 ;; constInsert: a value with an affinity -- and
+                                 ;; any column has one -- is not propagated
+                                 (member (car (skip-collate value)) '(:col :srccol))
                                  (expr-affinity value scope)
                                  (not (eq (binary-collation (third e) (fourth e) scope) :binary)))
                        (multiple-value-bind (s c) (column-ref col scope)
@@ -298,11 +306,17 @@ table.  Returns the set of fixed column nodes."
   heurtruth
   outer-on inner-on  ; FROM position of the join whose ON clause this is from
   constraint-mask ; the tables a folded x IS NULL still mentions
-  base)           ; one of the original (non-virtual) conjuncts
+  base            ; one of the original (non-virtual) conjuncts
+  copied          ; TERM_COPIED: col = col with a commuted virtual copy
+  or-wc           ; an OR term: its disjuncts, a WCLAUSE (WhereOrInfo)
+  (indexable 0)   ; ... and the tables every disjunct can index
+  and-wc)         ; a disjunct of several ANDed terms: them (WhereAndInfo)
 
 (defstruct (wclause (:conc-name wc-))
   (terms (make-array 0 :adjustable t :fill-pointer t))
-  scope nsrc)
+  scope nsrc
+  outer           ; pOuter: the clause an OR disjunct's terms are nested in
+  (op :and))      ; :or for an OR term's disjuncts
 
 (defun skip-collate (e)
   (loop while (and (consp e) (member (car e) '(:collate :icollate))) do (setf e (second e)))
@@ -522,6 +536,7 @@ virtual children."
                                                              :inner-on (wt-inner-on term)))
                                    term)))
                       (when equiv (setf (wt-equiv term) t))
+                      (unless (eq new term) (setf (wt-copied term) t))
                       (setf (wt-src new) rsrc (wt-col new) rcol
                             (wt-op new) (and ok (commute-op op))
                             (wt-rhs new) lhs
@@ -535,10 +550,13 @@ virtual children."
                          (not (column-can-be-null-p (wt-src term) (wt-col term) scope)))
                 (setf (wt-op term) nil (wt-prereq-all term) 0))))))
       (cond
-        ;; BETWEEN: two virtual range terms
-        ((and (eq kind :between) (not (fifth e)))
+        ;; BETWEEN: two virtual range terms (in an AND clause)
+        ((and (eq kind :between) (not (fifth e)) (eq (wc-op wc) :and))
          (make-child-term wc (list :binary :ge (second e) (third e)) term)
          (make-child-term wc (list :binary :le (second e) (fourth e)) term))
+        ;; x OR y OR ...: WhereOrInfo, and perhaps x IN (...) or x>=A
+        ((and (eq kind :binary) (eq (second e) :or) (eq (wc-op wc) :and))
+         (analyze-or-term wc term))
         ;; x IS NOT NULL: a virtual x>NULL (TERM_VNULL) an index can use
         ((and (eq kind :isnull) (third e) (not outer-on))
          (multiple-value-bind (src col) (column-ref (second e) scope)
@@ -599,11 +617,13 @@ pairs in SQLite's order."
                   idx-coll (svref (wx-colls wx) j))))
         (when (wx-auto wx) (setf idx-coll nil))))
     (when (consp col) (return-from where-scan nil))  ; indexes on expressions: not yet
-    (let ((terms (wc-terms *wc*)) (i-equiv 0))
+    (let ((i-equiv 0))
       (loop
         (when (>= i-equiv (length equivs)) (return))
         (destructuring-bind (cur . c) (nth i-equiv equivs)
-          (loop for term across terms
+          (loop for wc = *wc* then (wc-outer wc)
+                while wc
+                do (loop for term across (wc-terms wc)
                 do (when (and (eql (wt-src term) cur) (eql (wt-col term) c)
                               (or (zerop i-equiv) (not (wt-outer-on term))))
                      (when (and (wt-equiv term) (< (length equivs) 11))
@@ -623,7 +643,7 @@ pairs in SQLite's order."
                                (multiple-value-bind (s c) (column-ref rhs (wc-scope *wc*))
                                  (when (and s (equal (cons s c) (first equivs)))
                                    (return-from check))))))
-                         (push (cons term (plusp i-equiv)) out))))))
+                         (push (cons term (plusp i-equiv)) out)))))))
         (incf i-equiv)))
     (nreverse out)))
 
@@ -661,7 +681,9 @@ pairs in SQLite's order."
                     ; table and index, and this field is only set on some paths
   order-by          ; list of OBTERM (ORDER BY, GROUP BY or DISTINCT list), or NIL
   (flags 0)         ; wctrlFlags
-  limit)            ; iLimit (LogEst) for WHERE_USE_LIMIT
+  limit             ; iLimit (LogEst) for WHERE_USE_LIMIT
+  or-set            ; pOrSet: (vector of (prereq r-run n-out)), in an OR sub-build
+  main)             ; ... and the builder whose loops the sub-build adjusts against
 
 (defun loop-cheaper-proper-subset-p (x y)
   "whereLoopCheaperProperSubset."
@@ -705,6 +727,15 @@ NIL (append)."
 
 (defun loop-insert (b tmpl)
   "whereLoopInsert."
+  (when (wb-or-set b)
+    ;; an OR disjunct's sub-build keeps only the costs (whereOrInsert)
+    (loop-adjust-cost (wb-loops (wb-main b)) tmpl)
+    (when (wl-lterms tmpl)
+      (when *where-trace*
+        (format *error-output* "~&       or: ")
+        (trace-loop tmpl))
+      (or-set-insert b (wl-prereq tmpl) (wl-r-run tmpl) (wl-n-out tmpl)))
+    (return-from loop-insert nil))
   (loop-adjust-cost (wb-loops b) tmpl)
   (let ((p (loop-find-lesser (wb-loops b) tmpl)))
     (when *where-trace*
@@ -968,8 +999,8 @@ an == term on a column, of a cursor the subquery does not have."
   (let* ((r-size (ws-row-est ws))
          (sz-tab (ws-sz-row ws))
          (mask (ws-mask ws)))
-    ;; automatic indexes
-    (when (and (ws-auto-ok ws)
+    ;; automatic indexes (never for an OR disjunct)
+    (when (and (ws-auto-ok ws) (null (wb-or-set b)) (not *or-branch-plan*)
                (not (ws-indexed-by ws)) (not (ws-not-indexed ws))
                (ws-rowid-table-p ws)
                (not (member (ws-join ws) '(:right :full))))
@@ -1023,7 +1054,8 @@ an == term on a column, of a cursor the subquery does not have."
                             (wl-r-run lp) (+ r-size 1 (floor (* 15 (wx-sz-row wx)) sz-tab)))
                       (unless covering
                         (let ((n-lookup (+ r-size 16)))
-                          (loop for term across (wc-terms *wc*)
+                          ;; pWInfo->sWC: the whole WHERE clause, even in an OR sub-build
+                          (loop for term across (wc-terms (root-wc *wc*))
                                 do (unless (term-covered-by-index-p term ws wx) (return))
                                    (if (<= (wt-truth term) 0)
                                        (incf n-lookup (wt-truth term))
@@ -1060,7 +1092,8 @@ an == term on a column, of a cursor the subquery does not have."
              (let ((m-prereq (logior m-prereq (ws-extra-prereq ws))))
                (if (eq (ws-kind ws) :vtab)
                    (add-vtab-loops b ws m-prereq)
-                   (add-btree-loops b ws m-prereq)))
+                   (progn (add-btree-loops b ws m-prereq)
+                          (add-or-loops b ws m-prereq))))
              (setf m-prior (logior m-prior (ws-mask ws))))))
 
 ;;; ------------------------------------------------------------------
@@ -1293,20 +1326,23 @@ PATH-LOOPS (N-LOOP of them) followed by LAST deliver in order.  Returns
   sorted          ; GROUP BY delivered sorted (WHERE_SORTBYGROUP)
   wc wsrcs)
 
-(defun short-cut (b)
-  "whereShortCut: one table, looked up by rowid or a whole unique key."
-  (let* ((ws (svref *wsrcs* 0))
-         (table (ws-table ws)))
+(defun short-cut (b &optional (ws (svref *wsrcs* 0)) (ready 0))
+  "whereShortCut: one table, looked up by rowid or a whole unique key.
+READY: tables a term may read and still count as constant (the outer
+loops of an OR disjunct's sub-plan)."
+  (declare (ignorable b))
+  (let* ((table (ws-table ws))
+         (si (ws-i ws)) (mask (ws-mask ws)))
     (when (or (not (eq (ws-kind ws) :btree)) (ws-indexed-by ws) (ws-not-indexed ws))
       (return-from short-cut nil))
     (flet ((const-term (src col ops &optional wx j)
              (loop for (term . via) in (where-scan src col ops wx j)
-                   when (zerop (wt-prereq-right term)) return (values term via))))
+                   when (zerop (logandc2 (wt-prereq-right term) ready)) return (values term via))))
       (let ((lp nil))
         (unless (table-without-rowid table)
-          (multiple-value-bind (term via) (const-term 0 :rowid '(:eq :is))
+          (multiple-value-bind (term via) (const-term si :rowid '(:eq :is))
             (when term
-              (setf lp (make-wloop :src 0 :mask 1 :wx (first (ws-probes ws))
+              (setf lp (make-wloop :src si :mask mask :wx (first (ws-probes ws))
                                    :flags (logior +where-column-eq+ +where-ipk+ +where-onerow+
                                                   (if via +where-transcons+ 0))
                                    :lterms (list term) :n-eq 1 :r-run 33)))))
@@ -1316,10 +1352,10 @@ PATH-LOOPS (N-LOOP of them) followed by LAST deliver in order.  Returns
               (let ((ops (if (wx-uniq-not-null wx) '(:eq :is) '(:eq)))
                     (terms '()) (via-any nil))
                 (when (loop for j below (wx-n-key wx)
-                            always (multiple-value-bind (term via) (const-term 0 nil ops wx j)
+                            always (multiple-value-bind (term via) (const-term si nil ops wx j)
                                      (when term (push term terms) (when via (setf via-any t)))
                                      term))
-                  (setf lp (make-wloop :src 0 :mask 1 :wx wx
+                  (setf lp (make-wloop :src si :mask mask :wx wx
                                        :flags (logior +where-column-eq+ +where-onerow+ +where-indexed+
                                                       (if (widx-covers-p ws wx) +where-idx-only+ 0)
                                                       (if via-any +where-transcons+ 0))
@@ -1962,6 +1998,10 @@ DISTINCT.  The reverse-scan bits stay where they were, as in SQLite."
                               (vtab-plan-access fs i (mapcar #'substitute-fixed
                                                              (cond (right nil) (left match-asts) (t filter-asts)))
                                                 scope))
+                             ((flag-p (wl-flags lp) +where-multi-or+)
+                              (explain-multi-or lp ws (source-display-name fs) bound)
+                              (setf (fsrc-scan-index fs) (lambda () nil))
+                              (multi-or-iterate lp ws scope bound))
                              (t
                               (let ((node (eqp-table-note (explain-loop lp ws (source-display-name fs)
                                                                         (or (getf req :flags) 0)))))

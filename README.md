@@ -234,7 +234,11 @@ and views in `FROM` are flattened into the query that uses them under
 SQLite's rules (including the right side of a `LEFT JOIN`, and moving a
 subquery's `ORDER BY` / `LIMIT` outward); those that stay subqueries get
 copies of the outer `WHERE` terms that constrain only them (push-down), and
-`HAVING` terms that read only `GROUP BY` columns move to `WHERE`. A lone
+`HAVING` terms that read only `GROUP BY` columns move to `WHERE`. `OR`
+terms get SQLite's treatment: `x=1 OR x=2` also works as `x IN (1,2)`,
+`x=A OR x>A` as `x>=A`, and when every disjunct can use an index the table
+may be read as a `MULTI-INDEX OR` loop — one indexed lookup per disjunct,
+each planned as its own sub-query, duplicates skipped. A lone
 `min()`/`max()` reads one end of an index; `count(*)` counts the smallest
 index; `INDEXED BY` and `NOT INDEXED` are honoured. A differential fuzzer
 (`test/planfuzz.py`) compares plans and rows with sqlite3 over random
@@ -348,8 +352,8 @@ SQLite numbers them), compound parts, `SCAN n CONSTANT ROWS`, R-tree and
 table-valued `VIRTUAL TABLE INDEX` lines, and the `USE TEMP B-TREE FOR
 GROUP BY / DISTINCT / ORDER BY` steps. Where the two planners choose alike
 (most single-table and `FROM`-ordered queries) the output is identical;
-where they differ (the `OR` multi-index optimization, `LIKE` prefixes,
-`sqlite_stat1` statistics) it describes what this library does. Plain `EXPLAIN` (VDBE bytecode) has no
+where they differ (`LIKE` prefixes, `sqlite_stat1` statistics) it
+describes what this library does. Plain `EXPLAIN` (VDBE bytecode) has no
 equivalent here.
 
 ## Not implemented
@@ -357,8 +361,8 @@ equivalent here.
 R-tree `MATCH` geometry callbacks, the ICU tokenizer, FTS5's
 `*`-prefixed diagnostic queries, plain `EXPLAIN` (bytecode listings),
 `ANALYZE` (accepted, writes no `sqlite_stat1`), and in the planner: the
-`OR` (multi-index) and `LIKE` optimizations, skip-scans, Bloom filters,
-and flattening of compound (`UNION ALL`) subqueries.  `fsync` and file
+`LIKE` optimization, skip-scans, Bloom filters, and flattening of compound
+(`UNION ALL`) subqueries.  `fsync` and file
 locks need SBCL (elsewhere `finish-output` is the barrier and locks are
 no-ops, with cache validation still applied).
 
@@ -376,7 +380,7 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 |---|---|
 | `test/run-tests.sh` (also `(asdf:test-system "sqlite-pure")`) | the Lisp API tests (`test/api.lisp`), and the **differential suite**: `test/cases/*.test` are SQL scripts; `test/gen-expected.py` records SQLite's rows or error for every statement; each is replayed here and compared, error messages included |
 | `test/run-qfuzz.sh FIRST N Q` | **query fuzzer**: random expressions, joins, subqueries, compounds, windows and CTEs over random mixed-type data, compared statement by statement |
-| `python3 test/planfuzz.py SQLITE3 bin/sqlp FIRST N [Q]` | **planner fuzzer**: random schemas (indexes, WITHOUT ROWID, INTEGER PRIMARY KEY), data and joins; `EXPLAIN QUERY PLAN` output and rows (in order) must match sqlite3. `PLANFUZZ_NO_SUBQ=1` / `PLANFUZZ_NO_OR=1` leave out FROM-subqueries and `OR` terms |
+| `python3 test/planfuzz.py SQLITE3 bin/sqlp FIRST N [Q]` | **planner fuzzer**: random schemas (indexes, WITHOUT ROWID, INTEGER PRIMARY KEY), data and joins; `EXPLAIN QUERY PLAN` output and rows (in order) must match sqlite3. FROM-subqueries (with joins, `*`, `ORDER BY`/`LIMIT`, `DISTINCT`, aggregates, views) and `OR` terms of many shapes are included; `PLANFUZZ_NO_SUBQ=1` / `PLANFUZZ_NO_OR=1` leave them out |
 | `test/run-fuzz.sh FIRST N` | **file-format fuzzer**: random workloads (values up to 70 KB, index churn, `REPLACE`, rolled-back transactions, `WITHOUT ROWID`, `AUTOINCREMENT`) run by both engines into separate files; SQLite must pass `integrity_check` on the file written here, the contents must match, and this library must read SQLite's file identically |
 | `test/run-formats.sh` | SQLite-made files in other shapes (page sizes, UTF-16LE/BE, WAL, auto_vacuum, heavy freelists) read here and modified here, plus crash recovery in both directions |
 | `test/run-floats.sh SEED` | decimal → double and double → text, bit for bit, on random values |
@@ -420,6 +424,7 @@ src/
   expr       expression compiler (closures)
   select     query engine: sources, joins, aggregates, sorting, compounds, CTEs
   where      the query planner (a port of SQLite's where.c) and the loops it runs
+  where-or   OR terms: the IN rewrite, combined ranges, MULTI-INDEX OR loops
   flatten    subquery flattening, WHERE-term push-down, HAVING-to-WHERE
   window     window functions
   functions, printf, math, datetime, json    built-in functions

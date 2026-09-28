@@ -100,6 +100,30 @@ def gen_subquery(r, name, cols, tables, depth=0):
             tail += " LIMIT %d" % r.randint(1, 20)
     return "(SELECT %s FROM %s%s)" % (", ".join(exprs), frm, tail), names
 
+def gen_or(r, col):
+    """An OR term: the shapes the OR optimizations look for."""
+    def atom():
+        k = r.random()
+        if k < 0.45:
+            return "%s = %s" % (col(), rand_value(r))
+        if k < 0.65:
+            return "%s %s %s" % (col(), r.choice(["<", "<=", ">", ">="]), rand_value(r))
+        if k < 0.75:
+            return "%s IS NULL" % col()
+        if k < 0.85:
+            return "%s BETWEEN %d AND %d" % (col(), r.randint(0, 3), r.randint(3, 8))
+        if k < 0.93:
+            return "(%s = %s AND %s = %s)" % (col(), rand_value(r), col(), rand_value(r))
+        return "%s IN (%s, %s)" % (col(), rand_value(r), rand_value(r))
+    k = r.random()
+    if k < 0.3:
+        c = col()      # one column: may become IN (...)
+        return "(" + " OR ".join("%s = %s" % (c, rand_value(r)) for _ in range(r.randint(2, 3))) + ")"
+    if k < 0.4:
+        c = col(); v = rand_value(r)
+        return "(%s = %s OR %s %s %s)" % (c, v, c, r.choice(["<", ">", "<=", ">="]), v)
+    return "(" + " OR ".join(atom() for _ in range(r.randint(2, 3))) + ")"
+
 def gen_query(r, tables):
     k = r.randint(1, min(3, len(tables)))
     picked = r.sample(tables, k)
@@ -131,7 +155,7 @@ def gen_query(r, tables):
         elif kind < 0.9:
             conds.append("%s BETWEEN %s AND %s" % (col(), r.randint(0, 3), r.randint(3, 8)))
         elif not os.environ.get("PLANFUZZ_NO_OR"):
-            conds.append("(%s = %s OR %s > %s)" % (col(), rand_value(r), col(), rand_value(r)))
+            conds.append(gen_or(r, col))
     # FROM with joins
     frm = "%s AS %s" % (srcs[0][0], srcs[0][1])
     for s in srcs[1:]:

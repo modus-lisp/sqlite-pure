@@ -118,7 +118,7 @@ whole of it the literal 0."
     ((:lit :param) t)
     (:unary (parse-constant-p (third e)))
     (:binary (and (parse-constant-p (third e)) (parse-constant-p (fourth e))))
-    ((:collate :cast) (parse-constant-p (second e)))
+    ((:collate :cast :icollate) (parse-constant-p (second e)))
     (:case (and (or (null (second e)) (parse-constant-p (second e)))
                 (every (lambda (wt) (and (parse-constant-p (first wt)) (parse-constant-p (second wt))))
                        (third e))
