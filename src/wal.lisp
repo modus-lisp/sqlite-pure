@@ -452,7 +452,16 @@ log and the index."
   (let ((w (db-wal db)))
     (unless (wal-read-lock w)
       (if (wal-shm w)
-          (busy-wait (lambda () (wal-try-begin-read db)))
+          ;; A few immediate attempts before the busy handler, as
+          ;; walBeginReadTransaction's retry loop does: an attempt that
+          ;; finds the wal-index header :INVALID recovers it and asks to be
+          ;; retried, which is not contention.  Under a busy timeout of 0
+          ;; (cl-sqlite's default) BUSY-WAIT gives that retry only when the
+          ;; clock has not yet ticked past its zero-length deadline -- so
+          ;; the first PRAGMA journal_mode=WAL on a fresh database reported
+          ;; "database is locked" on a slower implementation (modus).
+          (or (loop repeat 5 thereis (wal-try-begin-read db))
+              (busy-wait (lambda () (wal-try-begin-read db))))
           (wal-legacy-begin-read db)))))
 
 (defun wal-try-begin-read (db)
