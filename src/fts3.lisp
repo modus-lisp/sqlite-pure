@@ -745,7 +745,7 @@ for all), or at EOF."
       (when (and depth s (src-table s) (fts3-p (table-vtab (src-table s))) (integerp ci))
         (values (src-table s) ci depth si)))))
 
-(defvar *fts3-unusable-matches* (make-hash-table :test #'eq :weakness :key))
+(defvar *fts3-unusable-matches* (make-hash-table :test #'eq :weakness :key #+sbcl :synchronized #+sbcl t))
 
 (defun compile-fts3-match (x q scope &optional e)
   (multiple-value-bind (table ci depth si) (fts3-column-target x scope)

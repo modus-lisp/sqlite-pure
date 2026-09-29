@@ -33,7 +33,7 @@
 
 (defun src-label (s) (or (src-display s) (src-name s)))
 
-(defvar *null-rows* (make-hash-table :test #'eq :weakness :key)
+(defvar *null-rows* (make-hash-table :test #'eq :weakness :key #+sbcl :synchronized #+sbcl t)
   "The rows a LEFT JOIN stands in for an unmatched right table.")
 
 (defun make-null-row (n)

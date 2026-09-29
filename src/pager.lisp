@@ -34,6 +34,8 @@
 (defstruct (db (:constructor %make-db))
   (path nil)
   (stream nil)
+  (inode nil)                ; the file's INODE: locks shared with this process's other connections
+  (mutex #+sbcl (sb-thread:make-mutex :name "sqlite-pure connection") #-sbcl nil)
   (readonly nil)
   (page-size +default-page-size+)
   (usable-size +default-page-size+)
@@ -67,6 +69,7 @@
   (recursive-triggers nil)   ; PRAGMA recursive_triggers (on the connection)
   (writable-schema nil)      ; PRAGMA writable_schema: sqlite_ names may be created
   (case-sensitive-like nil)  ; PRAGMA case_sensitive_like: NIL (never set), :ON or :OFF
+  (busy-timeout nil)         ; seconds to wait for a lock (on the connection); NIL: *BUSY-TIMEOUT*
   ;; user-defined SQL functions, aggregates and collations (on the connection)
   (user-functions (make-hash-table :test #'equal))   ; name -> (min max fn)
   (user-aggregates (make-hash-table :test #'equal))  ; name -> (min max ctor)
@@ -258,10 +261,13 @@ there is)."
     ps))
 
 (defun open-file-stream (path readonly)
-  (if readonly
-      (open path :element-type '(unsigned-byte 8) :direction :input)
-      (open path :element-type '(unsigned-byte 8) :direction :io
-                 :if-exists :overwrite :if-does-not-exist :create)))
+  (handler-case
+      (if readonly
+          (open path :element-type '(unsigned-byte 8) :direction :input)
+          (open path :element-type '(unsigned-byte 8) :direction :io
+                     :if-exists :overwrite :if-does-not-exist :create))
+    (file-error ()
+      (error 'sqlite-error :code :cantopen :message "unable to open database file"))))
 
 (defun journal-path (db) (concatenate 'string (db-path db) "-journal"))
 
@@ -297,18 +303,23 @@ there is)."
           (when (and readonly (not (probe-file path)))
             (sql-error "unable to open database file ~a" path))
           (setf (db-stream db) (open-file-stream path readonly))
+          (attach-inode db)
           (handler-bind ((error (lambda (c) (declare (ignore c))
-                                  (close (db-stream db)))))
+                                  (unlock-to db :none)
+                                  (detach-inode db))))
             (load-database db))
           db))))
 
 (defun close-database (db)
+  (with-connection-mutex (db) (%close-database db)))
+
+(defun %close-database (db)
   (unless (db-closed db)
-    (dolist (a (db-attached db)) (close-database (cdr a)))
+    (dolist (a (db-attached db)) (%close-database (cdr a)))
     (when (db-txn db) (rollback-write db))
     (when (db-wal db) (wal-close db))
     (unlock-to db :none)
-    (when (db-stream db) (close (db-stream db)))
+    (when (db-stream db) (detach-inode db))
     (setf (db-closed db) t))
   nil)
 

@@ -26,6 +26,12 @@
 (defun sql-error (fmt &rest args)
   (error 'sqlite-error :message (apply #'format nil fmt args)))
 
+(defmacro with-connection-mutex ((db) &body body)
+  "Run BODY holding DB's connection's lock: a connection is used by one
+thread at a time (SQLite's serialized threading mode)."
+  #+sbcl `(sb-thread:with-recursive-lock ((db-mutex (conn ,db))) ,@body)
+  #-sbcl `(progn ,db ,@body))
+
 (defvar *executing-sql* nil "The SQL text of the statement(s) being run.")
 
 (defun sql-error-at (name fmt &rest args)

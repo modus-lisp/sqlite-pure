@@ -152,6 +152,9 @@ EndTable write it: a placeholder first, then the real record."
           (return-from exec-create-table nil)
           (sql-error "table ~a already exists" name)))
     (check-new-name name :table)
+    (when *prepare-only*
+      (when as-select (compile-select as-select (make-scope)))
+      (prepared-here))
     (if as-select
         (multiple-value-bind (fn cols) (compile-select as-select (make-scope))
           (let* ((rows (funcall fn nil))
@@ -337,6 +340,7 @@ then each table or view in sqlite_schema rowid order."
           (return-from exec-create-index nil)
           (sql-error "index ~a already exists" name)))
     (check-new-name name :index)
+    (prepared-here)
     (let ((tb (find-table-in *db* table)))
       (when (table-view-select tb) (sql-error "views may not be indexed"))
       (when (table-vtab tb) (sql-error "virtual tables may not be indexed"))
@@ -364,6 +368,7 @@ then each table or view in sqlite_schema rowid order."
     (check-new-name name :view)
     ;; validate the body now, as SQLite does
     (compile-select select (make-scope))
+    (prepared-here)
     (add-table-schema-row "view" name name 0 (stored-create-sql text "VIEW"))
     (bump-schema-cookie)
     nil)))
@@ -377,6 +382,7 @@ then each table or view in sqlite_schema rowid order."
       (if if-not-exists
           (return-from exec-create-trigger nil)
           (sql-error "trigger ~a already exists" name)))
+    (prepared-here)
     (progn
       ;; sqlite3FinishTrigger: the text ends at END
       (add-schema-row "trigger" name (table-name tb) 0
@@ -417,6 +423,7 @@ then each table or view in sqlite_schema rowid order."
          (when (= (table-root tb) 1) (sql-error "table ~a may not be dropped" name))
          (when (and (eq kind :table) (name= name "sqlite_sequence"))
            (sql-error "table sqlite_sequence may not be dropped"))
+         (prepared-here)
          ;; sqlite3CodeDropTable: the triggers' rows, the sqlite_sequence row,
          ;; the other schema rows, then the b-trees (largest root first)
          (dolist (r (reverse (schema-rows-where (lambda (r) (and (equal (second r) "trigger") (stringp (fourth r))
@@ -441,12 +448,14 @@ then each table or view in sqlite_schema rowid order."
            (if if-exists (return-from exec-drop nil) (sql-error "no such index: ~a" name)))
          (when (index-auto idx)
            (sql-error "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"))
+         (prepared-here)
          (delete-schema-rows (lambda (r) (and (equal (second r) "index") (name= (third r) name))))
          (drop-btrees (list (index-root idx)))
          (bump-schema-cookie)))
       (:trigger
        (unless (gethash (schema-key name) (schema-triggers (db-schema* *db*)))
          (if if-exists (return-from exec-drop nil) (sql-error "no such trigger: ~a" name)))
+       (prepared-here)
        (delete-schema-rows (lambda (r) (and (equal (second r) "trigger") (name= (third r) name))))
        (bump-schema-cookie))))
     nil))

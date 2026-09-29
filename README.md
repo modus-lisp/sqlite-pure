@@ -97,6 +97,44 @@ integer, **REAL** ↔ `double-float`, **TEXT** ↔ string, **BLOB** ↔
 constraint, parse and corruption errors) carrying SQLite's own message.
 `sqlp::*busy-timeout*` (seconds, default 5) bounds waiting for a lock.
 
+## cl-sqlite compatibility
+
+The system `sqlite-pure/cl-sqlite` is a drop-in replacement for
+[cl-sqlite](https://github.com/TeMPOraL/cl-sqlite) (the Quicklisp system
+`sqlite`): the same `SQLITE` package with the same exported API, over this
+library instead of libsqlite3.  Load it in place of `sqlite`; the two
+define the same package, so an image has one or the other.
+
+```lisp
+(asdf:load-system "sqlite-pure/cl-sqlite")
+
+(sqlite:with-open-database (db "/tmp/demo.db" :busy-timeout 1000)
+  (sqlite:execute-non-query db "create table if not exists users (id integer primary key, name text)")
+  (sqlite:execute-non-query/named db "insert into users (name) values (:name)" ":name" "joe")
+  (sqlite:execute-to-list db "select id, name from users where name = ?" "joe"))
+```
+
+Everything cl-sqlite exports is there — `connect` / `disconnect` /
+`with-open-database` / `set-busy-timeout`, the `execute-*` family (and
+`/named`), `prepare-statement`, `bind-parameter`, `step-statement`,
+`statement-column-value`, `statement-column-names`,
+`statement-bind-parameter-names`, `reset-statement`,
+`clear-statement-bindings`, `finalize-statement` (with cl-sqlite's statement
+cache), `last-insert-rowid`, `with-transaction`, the conditions
+`sqlite-error` / `sqlite-constraint-error` and their readers, and the
+`iterate` drivers `in-sqlite-query`, `in-sqlite-query/named` and
+`on-sqlite-statement`.  Behaviour follows cl-sqlite over SQLite: NULL is
+`nil`; the same bind types (and errors for others); errors reported when a
+statement is prepared (a missing table or column, a name already in use)
+or when it steps, with the same codes, messages and printed reports; a
+statement stepped past its end starts over; binding a statement not reset
+is `:misuse`.  A statement runs when first stepped and hands its rows out
+one step at a time.
+
+`test/run-cl-sqlite-compat.sh` runs a transcript of about two hundred cases
+through the real cl-sqlite (on SQLite 3.40.1) and through this, and they
+must print the same; then it runs cl-sqlite's own test suite here.
+
 ## The shell: `bin/sqlp`
 
 `bin/sqlp` is a command-line shell that behaves like SQLite's own `sqlite3`
@@ -167,7 +205,16 @@ every commit, and `PRAGMA incremental_vacuum(N)` releases free pages on demand.
 RESERVED / PENDING / EXCLUSIVE, via `sb-posix` on SBCL), a busy timeout,
 hot-journal recovery only under the lock, and page-cache validation against
 the header change counter at every read transaction — so SQLite processes
-and this library can use a file concurrently.
+and this library can use a file concurrently.  Connections inside one Lisp
+image exclude each other just as well: fcntl locks belong to the process,
+so, as SQLite does (`unixInodeInfo`), the process keeps one lock per file,
+arbitrates between its connections, and closes a connection's descriptor
+only once no lock of the process depends on it.  A writing statement takes
+its lock before it reads; waiting for it releases the read lock in between,
+and inside a transaction that has already read, "database is locked" comes
+at once rather than a deadlock — SQLite's rules.  `BEGIN IMMEDIATE` and
+`BEGIN EXCLUSIVE` take their locks.  Threads: each connection is used by one
+thread at a time (SQLite's serialized mode), so a connection may be shared.
 
 **WAL databases** are shared with SQLite processes the way SQLite shares
 them among its own connections: through the wal-index in `-shm`, spoken
@@ -179,8 +226,9 @@ wal_checkpoint`, passive) never pass a reader's mark; a wholly checkpointed
 log is restarted instead of growing; a missing or damaged index is rebuilt
 from the log; a crash leaves a log either side recovers; and the last
 connection to close checkpoints and removes `-wal` and `-shm`.  Leaving WAL
-mode needs the database to ourselves.  (fcntl locks belong to a process, so
-two connections inside one Lisp do not exclude each other.)
+mode needs the database to ourselves.  Inside one Lisp image the wal-index
+is shared by the process's connections, one descriptor with each
+connection's locks kept apart (`unixShmLock`).
 
 **SQL.** `SELECT` with every join type (inner, `LEFT`, `RIGHT`, `FULL`,
 cross, `USING`, `NATURAL`), `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY` (`NULLS
@@ -397,6 +445,8 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 | `test/run-fts3fuzz.sh` | random documents (short and long, negative docids) and random FTS3/4 queries (every operator, NEAR/n, prefixes, `^`, column filters, malformed queries) on six table configurations against SQLite: docids, `snippet()`, `offsets()`, `matchinfo()` |
 | `test/run-fts3-tokens.sh` | the `simple`, `porter` and `unicode61` tokenizers (with arguments) against SQLite's `fts3tokenize`: tokens, byte offsets, positions |
 | `test/run-fts5-interop.sh` | FTS5 indexes shared through the file: SQLite-built multi-segment indexes (small pages, doclist indexes, unfinished merges) queried and modified here, ours queried and modified by SQLite, every step checked by SQLite's `integrity-check` |
+| `test/run-threads.sh` | connections and threads of one process on one file: SQLite's answers when two connections meet (RESERVED against a writer, SHARED against a commit, BUSY at once from a read transaction, EXCLUSIVE against readers), a connection closed beside a writer keeping its lock (checked by a SQLite process), one connection shared by eight threads, and six writer threads with readers that must only ever see whole transactions, in rollback and WAL mode |
+| `test/run-cl-sqlite-compat.sh` | the `sqlite-pure/cl-sqlite` drop-in against the real cl-sqlite over SQLite 3.40.1: a transcript of every API, bind type, name, error (class, code, message, report) and iterate driver must match; then cl-sqlite's own test suite runs here |
 | `test/run-fts5fuzz.sh` | random documents and random FTS5 queries (every operator, column filters, NEAR, prefixes, detail modes) against SQLite: rowids, `bm25()`, `highlight()`, `snippet()` |
 | `test/run-fts5-tokens.sh` | every tokenizer configuration against SQLite's, token for token, over random text and a stemming word list |
 | `test/run-geopoly.sh` | geopoly against SQLite 3.40.1 built with GEOPOLY (`test/build-oracle.sh` builds it from the amalgamation): 2000 random rows of every function compared bit for bit, and a table built by each side read and modified by the other; also regenerates `test/cases-ext` (run by `run-tests.sh` from the committed `test/expected-ext.sexp`) |
@@ -413,8 +463,8 @@ Everything is checked against real SQLite (Python's `sqlite3`, SQLite 3.40):
 Current results (SQLite 3.40.1 as reference): **sqllogictest** — every
 record of all 622 files passes (two records listed as 3.40-versus-corpus
 differences), `select5.test`'s 18-way joins included.  **SQLite's TCL suite** — of the 627 files
-that use no testfixture-only C hooks, 145 241 of 156 905 tests pass (92.6%);
-over all 1045 files that run to the end, 188 791 of 215 158.
+that use no testfixture-only C hooks, 145 246 of 156 905 tests pass (92.6%);
+over all 1045 files that run to the end, 188 826 of 215 158.
 
 ## Layout
 
@@ -455,6 +505,7 @@ src/
   api        public API, statements, transactions, ATTACH, PRAGMAs
   vacuum     VACUUM
 shell/       bin/sqlp, the sqlite3-compatible shell (system sqlite-pure/shell)
+compat/      cl-sqlite's API (system sqlite-pure/cl-sqlite)
 test/tcl/    the [sqlite3] Tcl command and testfixture for SQLite's TCL suite
 bin/         sqlp launcher and build-sqlp.sh
 test/        see above

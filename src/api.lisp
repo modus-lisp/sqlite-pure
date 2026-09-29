@@ -20,6 +20,37 @@
                           :test #'name=)))
     (t nil)))
 
+(defun statement-write-dbs (db st)
+  "The databases the writing statement ST writes (its OP_Transaction): an
+INSERT, UPDATE, DELETE, ALTER or DROP TABLE its table's; a CREATE the one
+it names (main by default, temp for TEMP); anything unresolved, every
+database.  Every database in WAL mode besides, as before."
+  (let* ((all (conn-dbs db))
+         (args (cdr st))
+         (schema (getf args :schema))
+         (target
+           (let ((*db* db))
+             (ignore-errors
+              (case (car st)
+                ((:insert :update :delete :alter)
+                 (table-owner (lookup-table db (getf args :table) nil schema)))
+                (:drop
+                 (if (member (getf args :kind) '(:table :view))
+                     (let ((tb (lookup-table db (getf args :name) nil schema)))
+                       (if tb (table-owner tb) (and schema (schema-db db schema nil))))
+                     (object-db (getf args :kind) (getf args :name) schema)))
+                ((:create-table :create-view :create-trigger :create-index :create-virtual)
+                 (cond ((getf args :temp) (temp-db db t))
+                       (schema (schema-db db schema nil))
+                       ((eq (car st) :create-index)
+                        (table-owner (lookup-table db (getf args :table) nil nil)))
+                       ((eq (car st) :create-trigger)
+                        (table-owner (lookup-table db (getf args :table) nil nil)))
+                       (t (conn db)))))))))
+    (if target
+        (remove-duplicates (cons target (remove-if-not #'db-wal all)))
+        all)))
+
 (defun commit-all (db) (dolist (d (conn-dbs db)) (commit-write d)))
 (defun rollback-all (db)
   (setf (db-fk-deferred (conn db)) nil)
@@ -66,6 +97,16 @@
          (values (funcall fn nil) (mapcar #'first cols))))
       (:begin
        (when (db-explicit db) (sql-error "cannot start a transaction within a transaction"))
+       ;; IMMEDIATE and EXCLUSIVE lock every database now
+       (let ((kind (second st)))
+         (unless (eq kind :deferred)
+           (handler-bind ((error (lambda (c) (declare (ignore c))
+                                   (dolist (d (conn-dbs db))
+                                     (unless (db-txn d) (unlock-to d :none))))))
+             (dolist (d (conn-dbs db))
+               (write-lock d)
+               (when (and (eq kind :exclusive) (not (db-wal d)) (not (db-readonly d)))
+                 (lock-exclusive d))))))
        (setf (db-explicit db) t)
        (values nil nil))
       (:commit
@@ -163,29 +204,180 @@
 (defun run-sql (db sql params)
   "Run every statement in SQL; return the rows and column names of the last."
   (check-open db)
+  (multiple-value-bind (stmts nparam names) (parse-sql-cached db sql)
+    (run-parsed db sql stmts (bind-params params nparam) names)))
+
+(defun run-parsed (db sql stmts params names)
+  "Run the parsed STMTS of SQL with PARAMS (a vector of SQL values) and
+named parameters NAMES; return the rows and column names of the last."
+  (with-connection-mutex (db) (%run-parsed db sql stmts params names)))
+
+(defun %run-parsed (db sql stmts params names)
+  (check-open db)
   (with-sql-floats
-    (multiple-value-bind (stmts nparam names) (parse-sql-cached db sql)
-      (let ((*params* (bind-params params nparam))
+    (progn
+      (let ((*params* params)
             (*param-names* names)
             (*executing-sql* sql)
+            (*busy-timeout* (or (db-busy-timeout (conn db)) *busy-timeout*))
             (rows nil) (cols nil))
         (dolist (s stmts)
-          (clrhash *fts5-cursors*)
-          (let ((*json-values* (make-hash-table :test #'eq)))
+          (let ((*json-values* (make-hash-table :test #'eq))
+                (*fts5-cursors* (make-hash-table))
+                (*read-before-statement*
+                  (and (db-explicit db) (remove-if-not #'read-transaction-p (conn-dbs db)))))
             (unwind-protect
                  (progn
-                   (dolist (d (conn-dbs db)) (lock-shared d))
-                   ;; WAL: a writing statement takes the write lock before it
-                   ;; reads, so its snapshot cannot go stale underneath it
+                   ;; (BEGIN, SAVEPOINT and the rest take no read lock)
+                   (unless (member (car (car s)) '(:begin :commit :rollback :savepoint
+                                                  :release :rollback-to))
+                     (dolist (d (conn-dbs db)) (lock-shared d)))
+                   ;; a writing statement takes the write lock before it
+                   ;; reads (OP_Transaction), so what it reads cannot go
+                   ;; stale underneath it
                    (when (write-statement-p (car s))
-                     (dolist (d (conn-dbs db))
-                       (when (and (db-wal d) (not (db-readonly d))) (lock-reserved d))))
+                     (dolist (d (statement-write-dbs db (car s)))
+                       (write-lock d)))
                    (multiple-value-setq (rows cols) (exec-ast db (car s) (cdr s))))
               ;; outside a transaction every statement is its own read transaction
               (unless (db-explicit db)
                 (dolist (d (conn-dbs db))
                   (unless (db-txn d) (unlock-to d :none)))))))
         (values rows cols)))))
+
+;; generated from SQLite 3.40.1 src/pragma.h: name, NoColumns flags, result column names
+(defparameter +pragma-columns+
+  '(("activate_extensions" () ("activate_extensions"))
+    ("analysis_limit" () ("analysis_limit"))
+    ("application_id" (:nocolumns1) ("application_id"))
+    ("auto_vacuum" (:nocolumns1) ("auto_vacuum"))
+    ("automatic_index" (:nocolumns1) ("automatic_index"))
+    ("busy_timeout" () ("timeout"))
+    ("cache_size" (:nocolumns1) ("cache_size"))
+    ("cache_spill" (:nocolumns1) ("cache_spill"))
+    ("case_sensitive_like" (:nocolumns) ("case_sensitive_like"))
+    ("cell_size_check" (:nocolumns1) ("cell_size_check"))
+    ("checkpoint_fullfsync" (:nocolumns1) ("checkpoint_fullfsync"))
+    ("collation_list" () ("seq" "name"))
+    ("compile_options" () ("compile_options"))
+    ("count_changes" (:nocolumns1) ("count_changes"))
+    ("data_store_directory" (:nocolumns1) ("data_store_directory"))
+    ("data_version" () ("data_version"))
+    ("database_list" () ("seq" "name" "file"))
+    ("default_cache_size" (:nocolumns1) ("cache_size"))
+    ("defer_foreign_keys" (:nocolumns1) ("defer_foreign_keys"))
+    ("empty_result_callbacks" (:nocolumns1) ("empty_result_callbacks"))
+    ("encoding" (:nocolumns1) ("encoding"))
+    ("foreign_key_check" () ("table" "rowid" "parent" "fkid"))
+    ("foreign_key_list" () ("id" "seq" "table" "from" "to" "on_update" "on_delete" "match"))
+    ("foreign_keys" (:nocolumns1) ("foreign_keys"))
+    ("freelist_count" () ("freelist_count"))
+    ("full_column_names" (:nocolumns1) ("full_column_names"))
+    ("fullfsync" (:nocolumns1) ("fullfsync"))
+    ("function_list" () ("name" "builtin" "type" "enc" "narg" "flags"))
+    ("hard_heap_limit" () ("hard_heap_limit"))
+    ("ignore_check_constraints" (:nocolumns1) ("ignore_check_constraints"))
+    ("incremental_vacuum" (:nocolumns) ("incremental_vacuum"))
+    ("index_info" () ("seqno" "cid" "name"))
+    ("index_list" () ("seq" "name" "unique" "origin" "partial"))
+    ("index_xinfo" () ("seqno" "cid" "name" "desc" "coll" "key"))
+    ("integrity_check" () ("integrity_check"))
+    ("journal_mode" () ("journal_mode"))
+    ("journal_size_limit" () ("journal_size_limit"))
+    ("legacy_alter_table" (:nocolumns1) ("legacy_alter_table"))
+    ("lock_proxy_file" (:nocolumns1) ("lock_proxy_file"))
+    ("lock_status" () ("database" "status"))
+    ("locking_mode" () ("locking_mode"))
+    ("max_page_count" () ("max_page_count"))
+    ("mmap_size" () ("mmap_size"))
+    ("module_list" () ("name"))
+    ("optimize" () ("optimize"))
+    ("page_count" () ("page_count"))
+    ("page_size" (:nocolumns1) ("page_size"))
+    ("parser_trace" (:nocolumns1) ("parser_trace"))
+    ("pragma_list" () ("name"))
+    ("query_only" (:nocolumns1) ("query_only"))
+    ("quick_check" () ("quick_check"))
+    ("read_uncommitted" (:nocolumns1) ("read_uncommitted"))
+    ("recursive_triggers" (:nocolumns1) ("recursive_triggers"))
+    ("reverse_unordered_selects" (:nocolumns1) ("reverse_unordered_selects"))
+    ("schema_version" (:nocolumns1) ("schema_version"))
+    ("secure_delete" () ("secure_delete"))
+    ("short_column_names" (:nocolumns1) ("short_column_names"))
+    ("shrink_memory" (:nocolumns) ("shrink_memory"))
+    ("soft_heap_limit" () ("soft_heap_limit"))
+    ("sql_trace" (:nocolumns1) ("sql_trace"))
+    ("stats" () ("tbl" "idx" "wdth" "hght" "flgs"))
+    ("synchronous" (:nocolumns1) ("synchronous"))
+    ("table_info" () ("cid" "name" "type" "notnull" "dflt_value" "pk"))
+    ("table_list" () ("schema" "name" "type" "ncol" "wr" "strict"))
+    ("table_xinfo" () ("cid" "name" "type" "notnull" "dflt_value" "pk" "hidden"))
+    ("temp_store" (:nocolumns1) ("temp_store"))
+    ("temp_store_directory" (:nocolumns1) ("temp_store_directory"))
+    ("threads" () ("threads"))
+    ("trusted_schema" (:nocolumns1) ("trusted_schema"))
+    ("user_version" (:nocolumns1) ("user_version"))
+    ("vdbe_addoptrace" (:nocolumns1) ("vdbe_addoptrace"))
+    ("vdbe_debug" (:nocolumns1) ("vdbe_debug"))
+    ("vdbe_eqp" (:nocolumns1) ("vdbe_eqp"))
+    ("vdbe_listing" (:nocolumns1) ("vdbe_listing"))
+    ("vdbe_trace" (:nocolumns1) ("vdbe_trace"))
+    ("wal_autocheckpoint" () ("wal_autocheckpoint"))
+    ("wal_checkpoint" () ("busy" "log" "checkpointed"))
+    ("writable_schema" (:nocolumns1) ("writable_schema"))))
+
+(defun pragma-result-columns (name value)
+  "The columns sqlite3Pragma names when it prepares PRAGMA NAME (with VALUE,
+or none): none for a pragma that returns nothing, or that returns nothing
+when given a value; else its result columns (or its own name)."
+  (let ((e (assoc (string-downcase-ascii name) +pragma-columns+ :test #'string=)))
+    (when (and e
+               (not (member :nocolumns (second e)))
+               (not (and value (member :nocolumns1 (second e)))))
+      (third e))))
+
+(defun statement-columns (db st text)
+  "Prepare the parsed statement ST (of TEXT) as sqlite3_prepare would,
+without running it: a query is compiled and a writing statement makes its
+checks (a missing table or column, a name already taken ... is reported
+now), and the result column names are returned -- a query's, a RETURNING
+list's, EXPLAIN QUERY PLAN's four; NIL for other statements."
+  (with-connection-mutex (db) (%statement-columns db st text)))
+
+(defun %statement-columns (db st text)
+  (check-open db)
+  (let ((exec (case (car st)
+                (:insert #'exec-insert) (:update #'exec-update) (:delete #'exec-delete)
+                (:create-table (lambda (st) (exec-create-table st text)))
+                (:create-index (lambda (st) (exec-create-index st text)))
+                (:create-view (lambda (st) (exec-create-view st text)))
+                (:create-trigger (lambda (st) (exec-create-trigger st text)))
+                (:drop #'exec-drop))))
+    (case (car st)
+      (:explain-qp (list "id" "parent" "notused" "detail"))
+      (:pragma (destructuring-bind (&key name value &allow-other-keys) (cdr st)
+                 (pragma-result-columns name value)))
+      ((:select :insert :update :delete :create-table :create-index :create-view
+        :create-trigger :drop)
+       (with-sql-floats
+         (let ((*db* db) (*encoding* (db-encoding db)) (*params* #()) (*param-names* nil)
+               (*executing-sql* text)
+               (*busy-timeout* (or (db-busy-timeout (conn db)) *busy-timeout*))
+               (*prepare-only* t) (*index-expr-cache* nil) (*fts5-touched* '()))
+           (unwind-protect
+                (progn
+                  (dolist (d (conn-dbs db)) (lock-shared d))
+                  (if (eq (car st) :select)
+                      (multiple-value-bind (fn cols) (compile-select (second st) (make-scope))
+                        (declare (ignore fn))
+                        (mapcar #'first cols))
+                      ;; each stops at PREPARED-HERE, before it writes; one
+                      ;; that returns first had nothing to do (IF [NOT] EXISTS)
+                      (let ((r (catch :prepared (funcall exec st) :ran)))
+                        (if (eq r :ran) nil r))))
+             (unless (db-explicit db)
+               (dolist (d (conn-dbs db))
+                 (unless (db-txn d) (unlock-to d :none)))))))))))
 
 (defun execute (db sql &rest params)
   "Execute SQL (one or more statements) with positional PARAMS.  Returns

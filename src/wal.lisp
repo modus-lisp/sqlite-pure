@@ -49,6 +49,7 @@
 (defstruct (wal (:conc-name wal-))
   path stream            ; the -wal file (opened on demand)
   shm                    ; the -shm stream (NIL: read-only, no shared index)
+  node                   ; its SHM-NODE, shared with this process's other connections
   hdr                    ; our snapshot: the 48-octet index header
   read-lock              ; NIL, a read-mark slot 0..4, or :legacy
   write-lock
@@ -114,22 +115,72 @@
                 (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) len))
   #-sbcl (declare (ignore stream len)))
 
+;;; The -shm file's locks, like the database file's, belong to the process:
+;;; its connections share one SHM-NODE -- one descriptor, and for each lock
+;;; slot the connections holding it shared or exclusive -- and fcntl is
+;;; called only when the process's own hold changes (unixShmLock).
+
+(defstruct (shm-node (:constructor make-shm-node (key stream)) (:include lock-queue))
+  key stream     ; (its queue: connections waiting for the WRITE lock)
+  (refs 0)
+  (shared (make-array 8 :initial-element '()))   ; slot -> the WALs holding it SHARED
+  (excl (make-array 8 :initial-element nil)))    ; slot -> the WAL holding it EXCLUSIVE
+
+(defvar *shm-nodes* (make-hash-table :test 'equal))
+
 (defun shm-lock (w type slot &optional (n 1))
-  (fd-lock (wal-shm w) type (+ +shm-lock-base+ slot) n))
+  "Take (TYPE +RD+ or +WR+) or release (+UN+) lock slots SLOT..SLOT+N-1 of
+the index for W's connection; true on success, NIL if another connection
+of this process or another holds them."
+  (with-lock-mutex
+    (let* ((node (wal-node w))
+           (shared (shm-node-shared node))
+           (excl (shm-node-excl node))
+           (slots (loop for i from slot below (+ slot n) collect i))
+           (stream (shm-node-stream node))
+           (start (+ +shm-lock-base+ slot)))
+      (cond
+        ((eql type +un+)
+         ;; the process lets go unless another connection still reads them
+         (unless (some (lambda (i) (remove w (aref shared i))) slots)
+           (fd-lock stream +un+ start n))
+         (when (and (= slot +lk-write+) (eq (aref excl slot) w))
+           (hand-off node))
+         (dolist (i slots)
+           (setf (aref shared i) (remove w (aref shared i)))
+           (when (eq (aref excl i) w) (setf (aref excl i) nil)))
+         t)
+        ((eql type +rd+)
+         (cond ((some (lambda (i) (aref excl i)) slots) nil)
+               ((and (notany (lambda (i) (aref shared i)) slots)
+                     (not (fd-lock stream +rd+ start n)))
+                nil)
+               (t (dolist (i slots) (pushnew w (aref shared i))) t)))
+        (t
+         (cond ((some (lambda (i) (or (aref excl i) (aref shared i))) slots) nil)
+               ((and (= slot +lk-write+) (turned-away-p node)) nil)
+               ((fd-lock stream +wr+ start n)
+                (dolist (i slots) (setf (aref excl i) w))
+                (when (= slot +lk-write+) (setf (shm-node-handoff node) nil))
+                t)
+               (t nil)))))))
 
 (defun shm-read (w off len)
-  "LEN octets of -shm at OFF (zeros past its end)."
-  (let* ((s (wal-shm w)) (b (make-octets len)) (flen (file-length s)))
-    (when (< off flen)
-      (file-position s off)
-      (read-sequence b s :end (min len (- flen off))))
-    b))
+  "LEN octets of -shm at OFF (zeros past its end).  (The stream is the
+process's, shared by its connections: one at a time.)"
+  (with-lock-mutex
+    (let* ((s (wal-shm w)) (b (make-octets len)) (flen (file-length s)))
+      (when (< off flen)
+        (file-position s off)
+        (read-sequence b s :end (min len (- flen off))))
+      b)))
 
 (defun shm-write (w off octets)
-  (let ((s (wal-shm w)))
-    (file-position s off)
-    (write-sequence octets s)
-    (finish-output s)))
+  (with-lock-mutex
+    (let ((s (wal-shm w)))
+      (file-position s off)
+      (write-sequence octets s)
+      (finish-output s))))
 
 (defun shm-write-u32 (w off v)
   (let ((b (make-octets 4))) (nput-u32 b 0 v) (shm-write w off b)))
@@ -332,23 +383,36 @@ another connection is busy; retry)."
   (let ((w (make-wal :path (wal-file-path db))))
     (setf (db-wal db) w)
     (unless (db-readonly db)
-      (let ((shm (open (shm-file-path db) :element-type '(unsigned-byte 8) :direction :io
-                                          :if-exists :overwrite :if-does-not-exist :create))
-            (s (db-stream db)))
-        (handler-bind ((error (lambda (c) (declare (ignore c)) (close shm))))
-          ;; the dead-man switch: alone, we reset the index; then read-lock it
-          (busy-wait (lambda ()
-                       (or (and (fd-lock shm +wr+ +wal-shm-dms+ 1)
-                                (progn (stream-truncate shm 0) t)
-                                (fd-lock shm +rd+ +wal-shm-dms+ 1))
-                           (fd-lock shm +rd+ +wal-shm-dms+ 1))))
-          ;; and a SHARED lock on the database for as long as we are open
-          (busy-wait (lambda ()
-                       (and (fd-lock s +rd+ +pending-byte+ 1)
-                            (prog1 (fd-lock s +rd+ +shared-first+ +shared-size+)
-                              (fd-lock s +un+ +pending-byte+ 1))))))
-        (setf (wal-shm w) shm)))
+      (with-lock-mutex
+        (let* ((key (inode-key (db-inode db)))
+               (node (gethash key *shm-nodes*)))
+          (unless node
+            ;; the first connection of this process opens the index
+            (let ((shm (open (shm-file-path db) :element-type '(unsigned-byte 8) :direction :io
+                                                :if-exists :overwrite :if-does-not-exist :create)))
+              (handler-bind ((error (lambda (c) (declare (ignore c)) (close shm))))
+                ;; the dead-man switch: alone, we reset the index; then read-lock it
+                (busy-wait (lambda ()
+                             (or (and (fd-lock shm +wr+ +wal-shm-dms+ 1)
+                                      (progn (stream-truncate shm 0) t)
+                                      (fd-lock shm +rd+ +wal-shm-dms+ 1))
+                                 (fd-lock shm +rd+ +wal-shm-dms+ 1)))))
+              (setf node (make-shm-node key shm)
+                    (gethash key *shm-nodes*) node)))
+          (incf (shm-node-refs node))
+          (setf (wal-node w) node (wal-shm w) (shm-node-stream node))))
+      ;; and a SHARED lock on the database for as long as we are open
+      (busy-wait (lambda () (%lock db :shared))))
     w))
+
+(defun release-shm-node (w)
+  "W's connection leaves the index: the process's last closes it."
+  (with-lock-mutex
+    (let ((node (wal-node w)))
+      (when (zerop (decf (shm-node-refs node)))
+        (close (shm-node-stream node))
+        (remhash (shm-node-key node) *shm-nodes*))
+      (setf (wal-node w) nil (wal-shm w) nil))))
 
 (defun wal-close (db)
   "Leave the index.  The last connection out checkpoints and removes the
@@ -357,18 +421,15 @@ log and the index."
     (when w
       (when (wal-shm w)
         (wal-unlock db :none)
-        (let ((s (db-stream db)))
-          (when (and (fd-lock s +wr+ +pending-byte+ 1)
-                     (fd-lock s +wr+ +shared-first+ +shared-size+))
-            ;; nobody else has the database open
-            (multiple-value-bind (busy log done) (wal-checkpoint db)
-              (when (and (eql busy 0) (eql log done))
-                (when (wal-stream w) (close (wal-stream w)) (setf (wal-stream w) nil))
-                (let ((p (probe-file (wal-path w)))) (when p (delete-file p)))
-                (let ((p (probe-file (shm-file-path db)))) (when p (delete-file p))))))
-          (close (wal-shm w))
-          (setf (wal-shm w) nil)
-          (fd-lock s +un+ +pending-byte+ (+ 2 +shared-size+))))
+        (when (%lock db :exclusive)
+          ;; nobody else, in this process or another, has the database open
+          (multiple-value-bind (busy log done) (wal-checkpoint db)
+            (when (and (eql busy 0) (eql log done))
+              (when (wal-stream w) (close (wal-stream w)) (setf (wal-stream w) nil))
+              (let ((p (probe-file (wal-path w)))) (when p (delete-file p)))
+              (let ((p (probe-file (shm-file-path db)))) (when p (delete-file p))))))
+        (release-shm-node w)
+        (%unlock db :none))
       (setf (wal-read-lock w) nil)
       (when (wal-stream w) (close (wal-stream w)) (setf (wal-stream w) nil)))))
 
@@ -495,7 +556,7 @@ log and the index."
       (error 'sqlite-error :code :readonly :message "attempt to write a readonly database"))
     (wal-begin-read db)
     (unless (wal-write-lock w)
-      (busy-wait (lambda () (shm-lock w +wr+ +lk-write+)))
+      (busy-wait (lambda () (shm-lock w +wr+ +lk-write+)) (wal-node w))
       (setf (wal-write-lock w) t)
       (multiple-value-bind (hdr status) (shm-try-header w)
         (unless (eq status :ok)
@@ -695,12 +756,9 @@ needs.  Returns (values busy log-frames checkpointed-frames)."
          (error 'sqlite-error :code :readonly :message "attempt to write a readonly database"))
        ;; only a connection alone with the database may leave WAL mode
        (wal-unlock db :none)
-       (let ((s (db-stream db)))
-         (unless (and (fd-lock s +wr+ +pending-byte+ 1)
-                      (fd-lock s +wr+ +shared-first+ +shared-size+))
-           (fd-lock s +rd+ +shared-first+ +shared-size+)
-           (fd-lock s +un+ +pending-byte+ 1)
-           (error 'sqlite-error :code :busy :message "database is locked")))
+       (unless (%lock db :exclusive)
+         (%unlock db :shared)
+         (error 'sqlite-error :code :busy :message "database is locked"))
        (wal-close db)
        (setf (db-wal db) nil (db-lock db) :none)
        (clrhash (db-cache db))

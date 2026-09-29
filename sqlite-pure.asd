@@ -68,6 +68,12 @@
   :components ((:module "test" :components ((:file "differential"))))
   :perform (test-op (o c) (uiop:symbol-call :sqlite-pure.test :run)))
 
+(defsystem "sqlite-pure/cl-sqlite"
+  :description "cl-sqlite's API (the SQLITE package) over sqlite-pure: a drop-in
+                replacement for the \"sqlite\" system, with no libsqlite3"
+  :depends-on ("sqlite-pure" "iterate")
+  :components ((:module "compat" :components ((:file "cl-sqlite")))))
+
 (defsystem "sqlite-pure/shell"
   :description "sqlp: an sqlite3-compatible command-line shell for sqlite-pure"
   :depends-on ("sqlite-pure" "sb-posix")

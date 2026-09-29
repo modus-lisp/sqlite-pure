@@ -28,7 +28,7 @@
   order      ; list of (expr desc collate nulls)
   limit offset)
 
-(defvar *keyword-literals* (make-hash-table :test #'eq :weakness :key)
+(defvar *keyword-literals* (make-hash-table :test #'eq :weakness :key #+sbcl :synchronized #+sbcl t)
   "The (:lit 1) / (:lit 0) nodes written TRUE / FALSE: identifiers until
 SQLite resolves them, so not yet always-false while parsing.")
 
@@ -284,7 +284,12 @@ whole of it the literal 0."
        (next-tok p)
        (let ((v (tok-value tok)))
          (cond ((null v) (list :param (incf (ps-nparam p))))
-               ((integerp v) (setf (ps-nparam p) (max (ps-nparam p) v)) (list :param v))
+               ((integerp v)
+                ;; ?NNN is named as written when it is new (sqlite3ExprAssignVarNumber)
+                (when (or (> v (ps-nparam p)) (null (rassoc v (ps-names p))))
+                  (push (cons (subseq (ps-sql p) (tok-pos tok) (tok-end tok)) v) (ps-names p)))
+                (setf (ps-nparam p) (max (ps-nparam p) v))
+                (list :param v))
                (t (let ((hit (assoc v (ps-names p) :test #'string=)))
                     (list :param
                           (if hit
@@ -346,7 +351,7 @@ whole of it the literal 0."
          (t (parse-column-ref p))))
       (t (perr p "syntax error")))))
 
-(defvar *ident-positions* (make-hash-table :test #'eq :weakness :key)
+(defvar *ident-positions* (make-hash-table :test #'eq :weakness :key #+sbcl :synchronized #+sbcl t)
   "Column-name string (by identity, one per token) -> (sql . offset) of the
 reference it names, for sqlite3_error_offset.")
 
@@ -1041,9 +1046,12 @@ reference it names, for sqlite3_error_offset.")
     ((kw-p p "ALTER") (parse-alter p))
     ((kw-p p "PRAGMA") (parse-pragma p))
     ((accept-kw p "BEGIN")
-     (or (accept-kw p "DEFERRED") (accept-kw p "IMMEDIATE") (accept-kw p "EXCLUSIVE"))
-     (accept-kw p "TRANSACTION")
-     (list :begin))
+     (let ((kind (cond ((accept-kw p "DEFERRED") :deferred)
+                       ((accept-kw p "IMMEDIATE") :immediate)
+                       ((accept-kw p "EXCLUSIVE") :exclusive)
+                       (t :deferred))))
+       (accept-kw p "TRANSACTION")
+       (list :begin kind)))
     ((or (accept-kw p "COMMIT") (accept-kw p "END"))
      (accept-kw p "TRANSACTION")
      (list :commit))
@@ -1076,7 +1084,7 @@ reference it names, for sqlite3_error_offset.")
     ((accept-kw p "EXPLAIN") (perr p "EXPLAIN is not supported (EXPLAIN QUERY PLAN is)"))
     (t (perr p "syntax error"))))
 
-(defvar *statement-texts* (make-hash-table :test #'eq :weakness :key)
+(defvar *statement-texts* (make-hash-table :test #'eq :weakness :key #+sbcl :synchronized #+sbcl t)
   "Parsed statement -> (raw . tight): its source text through whatever
 precedes the terminating ; (or the end of input), and through its last token.
 SQLite stores some CREATE statements one way and some the other.")

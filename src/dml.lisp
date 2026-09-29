@@ -598,6 +598,16 @@ iIdxNoSeek), whose entry goes after the row."
                (view-column-info table)))
     copy))
 
+(defvar *prepare-only* nil
+  "True while a statement is only being prepared (STATEMENT-COLUMNS): each
+writing statement stops, by PREPARED-HERE, once it has made the checks
+sqlite3_prepare makes -- before it evaluates a row or writes anything.")
+
+(defun prepared-here (&optional result-names)
+  "When only preparing, stop here: RESULT-NAMES are the statement's result
+columns (its RETURNING list)."
+  (when *prepare-only* (throw :prepared result-names)))
+
 (defun writable-table (name &optional event schema)
   (let ((table (or (and (name= name "dbstat") (null (lookup-table *db* name nil schema))
                         (sql-error "table dbstat may not be modified"))
@@ -655,15 +665,15 @@ iIdxNoSeek), whose entry goes after the row."
                               unless (or (column-generated (aref (table-columns tb) i))
                                          (column-hidden (aref (table-columns tb) i)))
                                 collect i)))
-           (rows (cond ((eq source :default) (list '()))
-                       (t (let ((sel source))
-                            (multiple-value-bind (fn cols) (compile-select sel (root-scope))
-                              (unless (= (length cols) (length targets))
-                                (if columns
-                                    (sql-error "~d values for ~d columns" (length cols) (length targets))
-                                    (sql-error "table ~a has ~d columns but ~d values were supplied"
-                                               table (length targets) (length cols))))
-                              (funcall fn *outer-env*)))))))
+           (rows-fn (cond ((eq source :default) (lambda () (list '())))
+                          (t (let ((sel source))
+                               (multiple-value-bind (fn cols) (compile-select sel (root-scope))
+                                 (unless (= (length cols) (length targets))
+                                   (if columns
+                                       (sql-error "~d values for ~d columns" (length cols) (length targets))
+                                       (sql-error "table ~a has ~d columns but ~d values were supplied"
+                                                  table (length targets) (length cols))))
+                                 (lambda () (funcall fn *outer-env*))))))))
       ;; sqlite3UpsertAnalyzeTarget: every target must name a PRIMARY KEY
       ;; or UNIQUE constraint, checked before anything is written
       (unless view
@@ -675,7 +685,8 @@ iIdxNoSeek), whose entry goes after the row."
                                 (table-indexes tb)))
                 (sql-error "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"))))))
       (multiple-value-bind (ctx rnames) (make-ctx-for tb conflict returning alias upsert)
-        (dolist (vals rows)
+        (prepared-here rnames)
+        (dolist (vals (funcall rows-fn))
           (let ((row (make-array (1+ ncols) :initial-element :unset)))
             (setf (svref row ncols) :null)
             (loop for v in vals
@@ -755,6 +766,7 @@ iIdxNoSeek), whose entry goes after the row."
 (defun exec-update (st)
   (destructuring-bind (&key with conflict table schema alias sets from where returning) (cdr st)
     (when from
+      (prepared-here)                  ; (not checked before it runs)
       (return-from exec-update (exec-update-from st)))
     (let* ((*ctes* *ctes*)
            (tb (progn (when with (register-ctes (make-sel :with (first with) :recursive (second with))))
@@ -777,7 +789,11 @@ iIdxNoSeek), whose entry goes after the row."
                                                     ci))
                                                 cols)
                                         (compile-expr e scope))))
-           (rows (scan-table-rows tb alias where)))
+           (rows (progn
+                   (when *prepare-only*
+                     (when where (compile-expr where scope))
+                     (prepared-here (nth-value 1 (make-ctx-for tb conflict returning alias))))
+                   (scan-table-rows tb alias where))))
       (multiple-value-bind (ctx rnames) (make-ctx-for tb conflict returning alias)
         (dolist (old rows)
           (let ((new (copy-seq old))
@@ -867,6 +883,9 @@ row once, from the last joined row that matched it."
                           (sql-error "DELETE RETURNING is not available on virtual tables"))
                         (table-view-select tb)))
            (triggers (let ((h (table-has-triggers-p tb))) (when h (check-trigger-programs tb :delete)) h)))
+      (when *prepare-only*
+        (when where (compile-expr where (table-scope tb alias)))
+        (prepared-here (nth-value 1 (make-ctx-for tb nil returning alias))))
       (multiple-value-bind (ctx rnames) (make-ctx-for tb nil returning alias)
         (if (and (null where) (null returning) (not triggers) (not view) (not (table-vtab tb))
                  (not (and (fk-enabled-p) (referencing-keys tb))))

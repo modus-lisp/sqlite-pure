@@ -1644,6 +1644,9 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
                   (loop for c in (select-core-cols core)
                         when (and (eq (car c) :expr) (third c))
                           collect (cons (third c) (second c)))))
+         (_ga (loop for g in (select-core-group core) for k from 1
+                    do (when (contains-aggregate-p (ignore-errors (resolve-group-term g rcols k)))
+                         (sql-error "aggregate functions are not allowed in the GROUP BY clause"))))
          (_hw (when *flatten* (setf core (having-to-where core rcols cscope))))
          (*result-aliases* (loop for c in (select-core-cols core)
                                  when (and (eq (car c) :expr) (third c)) collect (third c)))
@@ -1652,7 +1655,7 @@ list of (name affinity collation), fn (lambda (parent-env)) -> rows."
          (agg-p (or group having
                     (some (lambda (rc) (contains-aggregate-p (first rc))) rcols)
                     (some (lambda (o) (contains-aggregate-p (first o))) order))))
-    (declare (ignore _ _0 _hw))
+    (declare (ignore _ _0 _ga _hw))
     (when (and having (not group) (not agg-p))
       (sql-error "a GROUP BY clause is required before HAVING"))
     (multiple-value-bind (levels finals order-done plan-info)
