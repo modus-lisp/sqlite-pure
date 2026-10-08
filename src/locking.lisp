@@ -75,7 +75,9 @@ straight back to the connection that let go of it."
     (unwind-protect
          (let ((*lock-waiting* t))
            (loop
-             (when (> (get-internal-real-time) deadline)
+             ;; >=: a zero timeout is one attempt, as SQLite with no busy
+             ;; handler -- not a second one whenever the clock has not ticked
+             (when (>= (get-internal-real-time) deadline)
                (error 'sqlite-error :code :busy :message "database is locked"))
              (sleep 0.005)
              (when (funcall thunk) (return t))))

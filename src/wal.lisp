@@ -40,7 +40,7 @@
 (defconstant +readmark-not-used+ #xffffffff)
 ;; lock slots, relative to +shm-lock-base+
 (defconstant +lk-write+ 0)
-(defconstant +lk-ckpt+ 1)
+(defconstant +lk-ckpt+ 1)                         ; +lk-ckpt+ + 1: RECOVER
 (defun lk-read (i) (+ 3 i))
 
 (defparameter *native-big* (not (member :little-endian *features*))
@@ -452,16 +452,40 @@ log and the index."
   (let ((w (db-wal db)))
     (unless (wal-read-lock w)
       (if (wal-shm w)
-          (busy-wait (lambda () (wal-try-begin-read db)))
+          (busy-wait (lambda () (wal-begin-read-retrying db)))
           (wal-legacy-begin-read db)))))
 
+(defun wal-begin-read-retrying (db)
+  "sqlite3WalBeginReadTransaction's loop: true once a snapshot is held, NIL
+if busy (for the busy handler).  A retry -- the index just recovered, a
+header torn, a read mark taken by another connection -- is part of the
+protocol, not a lock to wait for, so it is retried here, as SQLite
+retries WAL_RETRY, and not through the busy handler: with no busy timeout
+the first statement on a database just switched to WAL (whose index is
+built by its first read) must not fail."
+  (loop for cnt from 1
+        do (let ((r (wal-try-begin-read db)))
+             (cond ((eq r :busy) (return nil))
+                   (r (return t))))
+           (when (> cnt 100)
+             (error 'sqlite-error :code :protocol :message "locking protocol"))
+           ;; walTryBeginRead's back-off: none at first, then growing
+           (when (> cnt 5)
+             (sleep (if (> cnt 9) (* 39e-6 (expt (- cnt 9) 2)) 1e-6)))))
+
 (defun wal-try-begin-read (db)
-  "One attempt at walTryBeginRead; NIL means retry."
+  "One attempt at walTryBeginRead: true on success, NIL to retry (WAL_RETRY),
+:BUSY if another connection is rebuilding the index (SQLITE_BUSY_RECOVERY)."
   (let ((w (db-wal db)))
     (multiple-value-bind (hdr status) (shm-try-header w)
       (case status
         (:torn (return-from wal-try-begin-read nil))
-        (:invalid (wal-recover db) (return-from wal-try-begin-read nil)))
+        (:invalid
+         (return-from wal-try-begin-read
+           (cond ((wal-recover db) nil)
+                 ;; recovery is not ours to run: retry unless it is running
+                 ((shm-lock w +rd+ (1+ +lk-ckpt+)) (shm-lock w +un+ (1+ +lk-ckpt+)) nil)
+                 (t :busy)))))
       (flet ((unchanged-p () (equalp (shm-try-header w) hdr)))
         (let* ((info (shm-info w)) (mx (hdr-mx hdr)))
           ;; everything is in the database file: read it alone (mark 0)
