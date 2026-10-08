@@ -215,6 +215,8 @@ and inside a transaction that has already read, "database is locked" comes
 at once rather than a deadlock — SQLite's rules.  `BEGIN IMMEDIATE` and
 `BEGIN EXCLUSIVE` take their locks.  Threads: each connection is used by one
 thread at a time (SQLite's serialized mode), so a connection may be shared.
+All of this is on SBCL; elsewhere the file locks, mutexes, `fsync` and
+`ftruncate` fall back to no-ops — see [PORTABILITY.md](PORTABILITY.md).
 
 **WAL databases** are shared with SQLite processes the way SQLite shares
 them among its own connections: through the wal-index in `-shm`, spoken
